@@ -31,12 +31,17 @@ function toast(msg, err = false) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch('/api/' + path, {
-    method: opts.method || (opts.body ? 'POST' : 'GET'),
-    headers: opts.body ? { 'content-type': 'application/json' } : {},
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-    credentials: 'same-origin',
-  });
+  let res;
+  try {
+    res = await fetch('/api/' + path, {
+      method: opts.method || (opts.body ? 'POST' : 'GET'),
+      headers: opts.body ? { 'content-type': 'application/json' } : {},
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      credentials: 'same-origin',
+    });
+  } catch {
+    throw new Error('No hay conexión con el servidor. Comprueba internet y vuelve a intentarlo.');
+  }
   let data = null;
   try { data = await res.json(); } catch { /* sin cuerpo */ }
   if (res.status === 401 && !opts.noRedirect) { S.user = null; renderLogin(); throw new Error('Sesión caducada'); }
@@ -144,8 +149,18 @@ const confirmModal = (msg, ok = 'Sí, continuar') =>
 
 // ---------------- arranque, login ----------------
 async function boot() {
+  let st;
   try {
-    const st = await api('setup-status', { noRedirect: true });
+    st = await api('setup-status', { noRedirect: true });
+  } catch {
+    // sin servidor no se puede entrar: mejor decirlo que mostrar un login que nunca funcionará
+    $('#app').innerHTML = `<div class="login"><div class="card"><h1>No se puede conectar con el servidor</h1>
+      <p>Las pantallas se han publicado, pero la parte de servidor (<code>/api</code>) no responde, así que no se puede entrar ni crear usuarios.</p>
+      <p class="small muted">Suele deberse a que Cloudflare no ha leído <code>wrangler.toml</code> (nombre mal escrito, carpetas <code>src</code> y <code>public</code> fuera de su sitio) o a que se ha subido solo la carpeta <code>public</code>. Revisa el apartado de publicación de la guía.</p>
+      <button class="primary" onclick="location.reload()">Reintentar</button></div></div>`;
+    return;
+  }
+  try {
     if (st.needsSetup) return renderSetup();
     await reload();
     renderShell();
