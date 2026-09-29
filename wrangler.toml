@@ -1,0 +1,20 @@
+name = "restaurante-gestion"
+main = "src/worker.js"
+compatibility_date = "2026-06-01"
+
+# Pantallas de la aplicación
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Base de datos
+[[d1_databases]]
+binding = "DB"
+database_name = "restaurante-gestion"
+# Sustituye por el ID de tu base de datos D1 (Cloudflare > Storage & Databases > D1)
+database_id = "02f0f318-ebdb-4c1f-8e9a-765aa788f488"
+
+# IA incluida en Cloudflare para leer albaranes con el móvil.
+# Plan gratuito: 10.000 "neuronas" al día sin coste (unos 40 albaranes). Si se agota, se bloquea hasta el día siguiente: no cobra.
+[ai]
+binding = "AI"
