@@ -200,9 +200,28 @@ wrangler d1 export restaurante-gestion --remote --output=copia.sql
 
 ---
 
-## Si ya habías creado la base de datos con la primera versión
+## Importación masiva
 
-Ejecuta una vez `migrations/002_formatos.sql` en la consola de D1, igual que hiciste con `schema.sql`. Si la creas ahora desde cero con `schema.sql`, no hace falta.
+- **Proveedores → Importar Excel**: nombre, CIF, contacto, teléfono, email, días de pedido y notas. Si ya existe uno con el mismo CIF (o, sin CIF, con el mismo nombre), se actualiza; si no, se crea.
+- **Productos → Importar Excel**: nombre, unidad, precio, categoría, proveedor, stock mínimo y formato (Caja 24, 24 unidades, 14,40 €). Si el proveedor no existe, se crea.
+- En los dos casos hay un botón **Descargar plantilla**. También sirve tu propio Excel: la app pregunta qué columna es cada dato. Las columnas vacías no borran lo que ya había.
+
+---
+
+## Recepción: albarán o factura
+
+Al recibir mercancía se elige si el documento es un **albarán** o una **factura**. El escáner lo detecta solo. Registra una factura solo si la mercancía entra con ella: si la factura agrupa albaranes que ya registraste, no la metas, porque duplicarías el stock.
+
+---
+
+## Actualizar una base de datos ya creada
+
+Cuando una versión nueva añade columnas, hay que ejecutar su archivo de `migrations` en la consola de D1 **antes** de subir el código nuevo. Cada archivo se ejecuta una sola vez.
+
+- `002_formatos.sql`: solo si creaste la base de datos con la primera versión (sin formatos ni permisos).
+- `003_factura.sql`: para todas las bases creadas antes de poder elegir albarán o factura.
+
+Si creas la base de datos ahora desde cero con `schema-consola.sql`, no hace falta ninguno.
 
 ---
 
@@ -213,6 +232,6 @@ src/worker.js                Entrada en Cloudflare Workers
 src/api.js                   Servidor (login, permisos, toda la lógica)
 public/                      Interfaz (HTML, CSS y JS sin compilación)
 schema.sql                   Tablas de la base de datos
-migrations/                  Cambios para bases de datos creadas con versiones anteriores
+migrations/                  Cambios para bases de datos creadas con versiones anteriores (se ejecutan en orden)
 wrangler.toml                Configuración de Cloudflare
 ```

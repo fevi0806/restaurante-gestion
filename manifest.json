@@ -1,0 +1,9 @@
+{
+  "name": "Gestión del restaurante",
+  "short_name": "Gestión",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f4ef",
+  "theme_color": "#1f3a2e",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

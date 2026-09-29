@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS receipts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   supplier_id INTEGER NOT NULL,
   order_id INTEGER,
-  delivery_note TEXT,          -- nº de albarán
+  doc_type TEXT NOT NULL DEFAULT 'albaran',  -- 'albaran' o 'factura'
+  delivery_note TEXT,          -- nº de albarán o factura
   receipt_date TEXT NOT NULL,
   total REAL NOT NULL DEFAULT 0,
   notes TEXT,
