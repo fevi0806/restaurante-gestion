@@ -401,6 +401,7 @@ async function route(parts, method, request, env, url) {
 
   // --- maestros ---
   if (a === 'products' && b === 'bulk' && method === 'POST') return productsBulk(request, env, user);
+  if (a === 'suppliers' && b === 'bulk' && method === 'POST') return suppliersBulk(request, env, user);
   if (a === 'products' && (method === 'POST' || method === 'PUT')) {
     const d = await request.clone().json().catch(() => ({}));
     if (d.unit && !['kg', 'l', 'ud'].includes(d.unit)) throw new HttpError(400, 'La unidad base debe ser kg, l o ud. Las cajas, botellas o sacos se añaden como formatos.');
@@ -531,12 +532,14 @@ async function route(parts, method, request, env, url) {
       const lines = (d.lines || []).filter((l) => l.product_id && Number(l.qty) > 0);
       if (!d.supplier_id || !lines.length) throw new HttpError(400, 'Falta proveedor o productos');
       const date = isDate(d.receipt_date) ? d.receipt_date : todayStr();
+      const docType = d.doc_type === 'factura' ? 'factura' : 'albaran';
       const { pmap, fmap } = await unitCtx(env, lines.map((l) => l.product_id));
       for (const l of lines) if (!pmap[l.product_id]) throw new HttpError(400, 'Producto no encontrado');
       const total = lines.reduce((s, l) => s + Number(l.qty) * Number(l.price || 0), 0); // cantidad × precio en la unidad escrita
       const rec = await env.DB.prepare(
-        `INSERT INTO receipts (supplier_id, order_id, delivery_note, receipt_date, total, notes, user_id) VALUES (?,?,?,?,?,?,?) RETURNING id`
-      ).bind(d.supplier_id, d.order_id || null, d.delivery_note || null, date, r2(total), d.notes || null, user.id).first();
+        `INSERT INTO receipts (supplier_id, order_id, doc_type, delivery_note, receipt_date, total, notes, user_id) VALUES (?,?,?,?,?,?,?,?) RETURNING id`
+      ).bind(d.supplier_id, d.order_id || null, docType, d.delivery_note || null, date, r2(total), d.notes || null, user.id).first();
+      const docLabel = `${docType === 'factura' ? 'Factura' : 'Albarán'} ${d.delivery_note || '#' + rec.id}`;
 
       const stmts = [], priceChanges = [], seen = new Set();
       for (const l of lines) {
@@ -550,11 +553,11 @@ async function route(parts, method, request, env, url) {
         if (u.format && inPrice > 0) stmts.push(env.DB.prepare('UPDATE product_formats SET price = ? WHERE id = ?').bind(inPrice, u.format.id));
         if (seen.has(p.id)) { stmts.push(env.DB.prepare(
           `INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`
-        ).bind(p.id, 'entrada', qty, price, `Albarán ${d.delivery_note || '#' + rec.id}`, grp, 'albaran', rec.id, user.id, date)); continue; }
+        ).bind(p.id, 'entrada', qty, price, docLabel, grp, 'albaran', rec.id, user.id, date)); continue; }
         seen.add(p.id);
         stmts.push(env.DB.prepare(
           `INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`
-        ).bind(p.id, 'entrada', qty, price, `Albarán ${d.delivery_note || '#' + rec.id}`, grp, 'albaran', rec.id, user.id, date));
+        ).bind(p.id, 'entrada', qty, price, docLabel, grp, 'albaran', rec.id, user.id, date));
         if (price > 0 && Math.abs(price - Number(p.price)) > 0.0005) {
           priceChanges.push({ name: p.name, unit: p.unit, old: p.price, new: price, pct: p.price ? ((price - p.price) / p.price) * 100 : null,
             label: u.label, old_in: p.price * u.factor, new_in: inPrice });
@@ -828,6 +831,42 @@ async function route(parts, method, request, env, url) {
 }
 
 // ---------- importaciones ----------
+// Proveedores desde Excel: si coincide el CIF (o, sin CIF, el nombre) se actualiza; si no, se crea
+async function suppliersBulk(request, env, user) {
+  need(user, 'productos.editar');
+  const d = await body(request);
+  const clean = (x) => String(x ?? '').trim();
+  const cifKey = (x) => clean(x).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const items = (d.items || []).filter((i) => clean(i.name));
+  const { results: sups } = await env.DB.prepare('SELECT id, name, cif FROM suppliers WHERE active = 1').all();
+  const byCif = Object.fromEntries(sups.filter((x) => x.cif).map((x) => [cifKey(x.cif), x.id]));
+  const byName = Object.fromEntries(sups.map((x) => [clean(x.name).toLowerCase(), x.id]));
+  const F = ['name', 'cif', 'contact', 'phone', 'email', 'order_days', 'notes'];
+  let created = 0, updated = 0;
+  const stmts = [];
+  for (const i of items) {
+    const v = Object.fromEntries(F.map((k) => [k, clean(i[k]) || null]));
+    if (v.cif) v.cif = v.cif.toUpperCase().replace(/[\s.-]/g, '');
+    const id = (v.cif && byCif[cifKey(v.cif)]) || byName[v.name.toLowerCase()];
+    if (id === -1) continue; // repetido dentro del mismo archivo
+    if (id) {
+      const keys = F.filter((k) => v[k] != null); // no borra lo que ya había si la columna viene vacía
+      stmts.push(env.DB.prepare(`UPDATE suppliers SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).bind(...keys.map((k) => v[k]), id));
+      updated++;
+    } else {
+      stmts.push(env.DB.prepare(`INSERT INTO suppliers (${F.join(',')}) VALUES (${F.map(() => '?').join(',')})`).bind(...F.map((k) => v[k])));
+      byName[v.name.toLowerCase()] = -1; // evita duplicados dentro del mismo archivo
+      if (v.cif) byCif[cifKey(v.cif)] = -1;
+      created++;
+    }
+  }
+  await runBatch(env, stmts.filter(Boolean));
+  return json({ ok: true, created, updated });
+}
+
+// en importaciones, una columna vacía no cambia lo que ya había
+const unitIn = (u) => (String(u ?? '').trim() ? normUnit(u) : null);
+const minIn = (m) => { const n = Number(String(m ?? '').replace(',', '.')); return String(m ?? '').trim() && !isNaN(n) ? n : null; };
 function normUnit(u) {
   const x = String(u || '').trim().toLowerCase();
   if (['kg', 'kilo', 'kilos', 'kgs', 'g', 'gr', 'gramos'].includes(x)) return 'kg';
@@ -850,11 +889,13 @@ async function productsBulk(request, env, user) {
   const stmts = items.map((i) => {
     const sid = i.supplier_name ? smap[String(i.supplier_name).trim().toLowerCase()] : null;
     return env.DB.prepare(
-      `INSERT INTO products (name, category, unit, price, supplier_id) VALUES (?,?,?,?,?)
-       ON CONFLICT(name) DO UPDATE SET category = COALESCE(excluded.category, category), unit = excluded.unit,
+      `INSERT INTO products (name, category, unit, price, supplier_id, min_stock) VALUES (?, ?, COALESCE(?, 'ud'), ?, ?, COALESCE(?, 0))
+       ON CONFLICT(name) DO UPDATE SET category = COALESCE(excluded.category, category),
+         unit = CASE WHEN ? IS NOT NULL THEN excluded.unit ELSE unit END,
          price = CASE WHEN excluded.price > 0 THEN excluded.price ELSE price END,
+         min_stock = CASE WHEN ? IS NOT NULL THEN excluded.min_stock ELSE min_stock END,
          supplier_id = COALESCE(excluded.supplier_id, supplier_id), active = 1`
-    ).bind(String(i.name).trim(), i.category || null, normUnit(i.unit), Number(String(i.price ?? 0).replace(',', '.')) || 0, sid || null);
+    ).bind(String(i.name).trim(), i.category || null, unitIn(i.unit), Number(String(i.price ?? 0).replace(',', '.')) || 0, sid || null, minIn(i.min_stock), unitIn(i.unit), minIn(i.min_stock));
   });
   await runBatch(env, stmts);
   // formatos opcionales de la tarifa (p. ej. "Caja 24" con 24 ud a 12 €)
@@ -1210,8 +1251,8 @@ async function report(env, url, type, user) {
       { concepto: 'Compras registradas (albaranes)', importe: r.purchases, pct: p(r.purchases) },
     ];
   } else if (type === 'compras_proveedor') {
-    columns = [C('receipt_date', 'Fecha', 'date'), C('supplier', 'Proveedor'), C('delivery_note', 'Albarán'), C('lines', 'Líneas', 'num'), C('user', 'Recibió'), C('total', 'Total', 'eur')];
-    rows = await q(`SELECT r.receipt_date, s.name AS supplier, r.delivery_note, (SELECT COUNT(*) FROM receipt_lines WHERE receipt_id = r.id) AS lines, u.name AS user, r.total
+    columns = [C('receipt_date', 'Fecha', 'date'), C('supplier', 'Proveedor'), C('doc', 'Documento'), C('lines', 'Líneas', 'num'), C('user', 'Recibió'), C('total', 'Total', 'eur')];
+    rows = await q(`SELECT r.receipt_date, s.name AS supplier, (CASE WHEN r.doc_type = 'factura' THEN 'Factura ' ELSE 'Albarán ' END) || COALESCE(r.delivery_note, '#' || r.id) AS doc, (SELECT COUNT(*) FROM receipt_lines WHERE receipt_id = r.id) AS lines, u.name AS user, r.total
       FROM receipts r JOIN suppliers s ON s.id = r.supplier_id LEFT JOIN users u ON u.id = r.user_id WHERE r.receipt_date BETWEEN ? AND ? ORDER BY s.name, r.receipt_date`, from, to);
     total = { total: rows.reduce((x, r) => x + r.total, 0) };
   } else if (type === 'compras_producto') {
@@ -1285,6 +1326,7 @@ const OCR_SCHEMA = {
   properties: {
     supplier_name: { type: 'string', description: 'Nombre comercial o razón social del proveedor que emite el documento' },
     supplier_cif: { type: 'string', description: 'CIF/NIF del proveedor (no el del cliente)' },
+    document_type: { type: 'string', enum: ['albaran', 'factura'], description: 'albaran si es un albarán o nota de entrega; factura si es una factura' },
     document_number: { type: 'string', description: 'Número de albarán o factura' },
     date: { type: 'string', description: 'Fecha del documento en formato AAAA-MM-DD' },
     lines: {
@@ -1306,7 +1348,7 @@ const OCR_SCHEMA = {
     total_without_vat: { type: 'number', description: 'Base imponible total' },
     total_with_vat: { type: 'number', description: 'Total con IVA' },
   },
-  required: ['supplier_name', 'supplier_cif', 'document_number', 'date', 'lines', 'total_without_vat', 'total_with_vat'],
+  required: ['supplier_name', 'supplier_cif', 'document_type', 'document_number', 'date', 'lines', 'total_without_vat', 'total_with_vat'],
   additionalProperties: false,
 };
 const OCR_PROMPT = `Eres un asistente de un restaurante en España. Lee este albarán o factura de proveedor y extrae sus datos.
@@ -1422,6 +1464,7 @@ async function ocrScan(request, env, user) {
   return json({
     ocr_id: scan.id, provider,
     supplier_id: supplier?.id || null, supplier_name: raw.supplier_name || '', supplier_cif: raw.supplier_cif || '',
+    doc_type: /factura/i.test(raw.document_type || '') ? 'factura' : 'albaran',
     delivery_note: raw.document_number || '', date: isDate(raw.date) ? raw.date : null,
     total_without_vat: raw.total_without_vat || null, total_with_vat: raw.total_with_vat || null, lines,
   });
