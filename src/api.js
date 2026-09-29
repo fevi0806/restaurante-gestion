@@ -42,15 +42,24 @@ const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
 const toHex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
 const fromHex = (h) => new Uint8Array(h.match(/.{2}/g).map((x) => parseInt(x, 16)));
 
-async function hashPass(pass, saltHex) {
+// Las iteraciones se guardan con el hash. 10.000 cabe holgado en el límite de 10 ms de CPU del plan gratuito de Workers.
+const PBKDF2_ITER = 10000;
+async function hashPass(pass, saltHex, iterations = PBKDF2_ITER) {
   const salt = saltHex ? fromHex(saltHex) : crypto.getRandomValues(new Uint8Array(16));
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, key, 256);
-  return toHex(salt) + ':' + toHex(bits);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256);
+  return `pbkdf2$${iterations}$${toHex(salt)}$${toHex(bits)}`;
 }
 async function checkPass(pass, stored) {
-  const [salt] = String(stored).split(':');
-  return (await hashPass(pass, salt)) === stored;
+  const s = String(stored);
+  if (s.startsWith('pbkdf2$')) {
+    const [, iter, salt] = s.split('$');
+    return (await hashPass(pass, salt, Number(iter))) === s;
+  }
+  // formato de la primera versión (salt:hash, 100.000 iteraciones)
+  const [salt, hash] = s.split(':');
+  const again = await hashPass(pass, salt, 100000);
+  return again.split('$')[3] === hash;
 }
 async function sha256(s) {
   return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)));
