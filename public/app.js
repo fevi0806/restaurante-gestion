@@ -443,8 +443,8 @@ VIEWS.recepcion = async (v, id, q) => {
   const pend = orders.filter((o) => o.status === 'enviado');
   v.innerHTML = `<div class="row between"><h1>Recepción de mercancía</h1><a class="btn primary" href="#/recepcion/nueva">+ Recibir sin pedido</a></div>
     ${pend.length ? `<div class="card"><h3>Pedidos pendientes de recibir</h3><div class="table-wrap"><table><tbody>${pend.map((o) => `<tr class="click" data-h="#/recepcion/nueva?pedido=${o.id}"><td>#${o.id}</td><td>${esc(o.supplier_name)}</td><td>${fdate(o.order_date)}</td><td class="num"><span class="btn sm primary">Recibir →</span></td></tr>`).join('')}</tbody></table></div></div>` : ''}
-    <div class="card"><h3>Albaranes registrados</h3>${list.length ? `<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Proveedor</th><th>Albarán</th><th>Recibió</th><th class="num">Total</th></tr></thead><tbody>
-    ${list.map((r) => `<tr class="click" data-h="#/recepcion/${r.id}"><td>${fdate(r.receipt_date)}</td><td>${esc(r.supplier_name)}</td><td>${esc(r.delivery_note || '—')}</td><td>${esc(r.user_name || '')}</td><td class="num">${eur(r.total)}</td></tr>`).join('')}
+    <div class="card"><h3>Albaranes y facturas registrados</h3>${list.length ? `<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Proveedor</th><th>Documento</th><th>Recibió</th><th class="num">Total</th></tr></thead><tbody>
+    ${list.map((r) => `<tr class="click" data-h="#/recepcion/${r.id}"><td>${fdate(r.receipt_date)}</td><td>${esc(r.supplier_name)}</td><td>${r.doc_type === 'factura' ? 'Factura' : 'Albarán'} ${esc(r.delivery_note || '')}</td><td>${esc(r.user_name || '')}</td><td class="num">${eur(r.total)}</td></tr>`).join('')}
     </tbody></table></div>` : '<div class="empty">Sin albaranes todavía.</div>'}</div>`;
   bindRowLinks(v);
 };
@@ -459,17 +459,19 @@ async function recepcionNueva(v, orderId, prefill) {
   v.innerHTML = `<h1>Recibir mercancía${order ? ` · pedido #${order.id}` : ''}</h1><div class="card">
     <div class="row">
       <div class="field"><label>Proveedor</label>${order ? `<input value="${esc(order.supplier_name)}" disabled>` : `<select id="sup"><option value="">Elige proveedor…</option>${S.suppliers.map((s) => `<option value="${s.id}" ${prefill?.supplier_id === s.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>`}</div>
-      <div class="field"><label>Nº de albarán</label><input id="dn" value="${esc(prefill?.delivery_note || '')}"></div>
+      <div class="field" style="flex:0 1 150px"><label>Documento</label><select id="doctype"><option value="albaran" ${prefill?.doc_type === 'factura' ? '' : 'selected'}>Albarán</option><option value="factura" ${prefill?.doc_type === 'factura' ? 'selected' : ''}>Factura</option></select></div>
+      <div class="field"><label>Nº de documento</label><input id="dn" value="${esc(prefill?.delivery_note || '')}" placeholder="Nº de albarán o factura"></div>
       <div class="field"><label>Fecha</label><input type="date" id="date" value="${esc(prefill?.date || today())}"></div>
     </div>
     ${prefill?.ocr_id ? `<div class="card scanned"><b>📷 Leído del documento.</b> Revisa cada línea antes de registrar.
       ${!prefill.supplier_id && prefill.supplier_name ? `<div style="margin-top:6px">Proveedor leído: <b>${esc(prefill.supplier_name)}</b>${prefill.supplier_cif ? ' · ' + esc(prefill.supplier_cif) : ''}. Elígelo arriba o <button type="button" class="sm" id="newsup">Crear proveedor</button></div>` : ''}
       ${prefill.total_read ? `<div id="totcheck" style="margin-top:6px"></div>` : ''}
       ${prefill.lines.some((l) => !l.product_id) ? '<div class="txt-warn" style="margin-top:6px">Hay líneas sin producto: asígnalas o quítalas (por ejemplo, material que no controlas).</div>' : ''}</div>` : ''}
+    <div id="facnote" class="small txt-warn hidden" style="margin-bottom:8px">Registra aquí la factura solo si la mercancía entra ahora con ella. Si la factura agrupa albaranes que ya registraste, no la metas: duplicarías el stock.</div>
     <div id="ocrslot"></div>
-    <p class="small muted">Comprueba cantidades y precios con el albarán. Puedes anotar en el formato en que llega (cajas, sacos, botellas…): la app lo pasa a su unidad de control. Las diferencias con lo pedido o con el último precio se resaltan.</p>
+    <p class="small muted">Comprueba cantidades y precios con el albarán o la factura. Puedes anotar en el formato en que llega (cajas, sacos, botellas…): la app lo pasa a su unidad de control. Las diferencias con lo pedido o con el último precio se resaltan.</p>
     <div id="lines"></div>
-    <div class="row" style="margin:10px 0"><input list="dl-prod" id="extra" placeholder="Añadir producto al albarán…" style="flex:1"><button id="addx">Añadir</button></div>
+    <div class="row" style="margin:10px 0"><input list="dl-prod" id="extra" placeholder="Añadir producto…" style="flex:1"><button id="addx">Añadir</button></div>
     <div class="field"><label>Incidencias / notas</label><textarea id="notes" placeholder="Producto en mal estado, faltas, devoluciones…">${esc(prefill?.notes || '')}</textarea></div>
     <div class="sticky-foot row between"><b id="tot"></b><button class="primary" id="save">Registrar entrada</button></div></div>`;
   const draw = () => {
@@ -484,7 +486,7 @@ async function recepcionNueva(v, orderId, prefill) {
         <td>${unitSelect(p, l.unit, `data-i="${i}" data-k="unit"`)}</td>
         <td class="num"><input class="qty" type="number" step="any" inputmode="decimal" data-i="${i}" data-k="price" value="${Math.round(l.price * 10000) / 10000}"></td>
         <td class="num">${eur(l.qty * l.price)}</td><td><button class="sm" data-del="${i}" aria-label="Quitar">✕</button></td></tr>`; }).join('')}
-      </tbody></table></div>` : '<div class="empty small">Añade los productos del albarán o escanéalo.</div>';
+      </tbody></table></div>` : '<div class="empty small">Añade los productos del documento o escanéalo.</div>';
     $$('#lines [data-k]').forEach((inp) => (inp.onchange = () => {
       const l = lines[inp.dataset.i], p = prodById(l.product_id);
       if (inp.dataset.k === 'unit') { l.unit = inp.value; l.price = unitPrice(p, l.unit); } else l[inp.dataset.k] = Number(inp.value) || 0;
@@ -504,7 +506,7 @@ async function recepcionNueva(v, orderId, prefill) {
     const supplier_id = order ? order.supplier_id : Number($('#sup').value);
     if (!supplier_id) throw new Error('Elige el proveedor');
     if (lines.some((l) => !l.product_id)) throw new Error('Asigna un producto a cada línea o quita las que no controlas');
-    const payload = { supplier_id, order_id: order?.id, delivery_note: $('#dn').value, receipt_date: $('#date').value, notes: $('#notes').value, ocr_id: prefill?.ocr_id, supplier_cif: prefill?.supplier_cif,
+    const payload = { supplier_id, order_id: order?.id, doc_type: $('#doctype').value, delivery_note: $('#dn').value, receipt_date: $('#date').value, notes: $('#notes').value, ocr_id: prefill?.ocr_id, supplier_cif: prefill?.supplier_cif,
       lines: lines.map((l) => ({ product_id: l.product_id, qty: l.qty, unit: l.unit, price: l.price, ordered_qty: l.ordered_qty, source: l.source })) };
     const r = await api('receipts', { body: payload });
     await reload();
@@ -519,21 +521,23 @@ async function recepcionNueva(v, orderId, prefill) {
     const r = await api('suppliers', { body: { name: prefill.supplier_name, cif: prefill.supplier_cif } });
     await reload(); prefill.supplier_id = r.id; recepcionNueva(v, null, prefill);
   });
+  const docSync = () => $('#facnote').classList.toggle('hidden', $('#doctype').value !== 'factura');
+  $('#doctype').onchange = docSync; docSync();
   if (!order && window.ocrSlot) window.ocrSlot(v, (data) => recepcionNueva(v, null, data));
   draw();
 }
 
 async function recepcionDetalle(v, id) {
   const r = await api('receipts/' + id);
-  v.innerHTML = `<h1>Albarán ${esc(r.delivery_note || '#' + r.id)} · ${esc(r.supplier_name)}</h1><div class="card">
+  v.innerHTML = `<h1>${r.doc_type === 'factura' ? 'Factura' : 'Albarán'} ${esc(r.delivery_note || '#' + r.id)} · ${esc(r.supplier_name)}</h1><div class="card">
     <div class="small muted">${fdate(r.receipt_date)}${r.order_id ? ` · pedido <a href="#/pedidos/${r.order_id}">#${r.order_id}</a>` : ''}</div>
     <div class="table-wrap"><table><thead><tr><th>Producto</th><th class="num">Pedido</th><th class="num">Recibido</th><th class="num">Precio</th><th class="num">Importe</th></tr></thead><tbody>
     ${r.lines.map((l) => { const lab = l.unit_label || l.unit; const iq = l.input_qty ?? l.qty; const ip = l.input_price ?? l.price; return `<tr><td>${esc(l.name)}</td><td class="num">${l.ordered_qty != null ? num(l.ordered_qty, 3) : '—'}</td><td class="num">${num(iq, 3)} ${esc(lab)}${lab !== l.unit ? `<div class="small muted">${num(l.qty, 3)} ${esc(l.unit)}</div>` : ''}</td><td class="num">${eur(ip)}</td><td class="num">${eur(l.qty * l.price)}</td></tr>`; }).join('')}
     </tbody><tfoot><tr><th colspan="4">Total</th><th class="num">${eur(r.total)}</th></tr></tfoot></table></div>
     ${r.notes ? `<p><b>Incidencias:</b> ${esc(r.notes)}</p>` : ''}
-    ${can('recepcion.anular') ? '<button class="danger" id="del">Anular albarán</button>' : ''}</div>`;
+    ${can('recepcion.anular') ? '<button class="danger" id="del">Anular documento</button>' : ''}</div>`;
   if ($('#del')) $('#del').onclick = (e) => act(e.target, async () => {
-    if (!(await confirmModal('Se anulará el albarán y se quitará su mercancía del stock. Los precios actualizados no se revierten.', 'Anular'))) return;
+    if (!(await confirmModal('Se anulará el documento y se quitará su mercancía del stock. Los precios actualizados no se revierten.', 'Anular'))) return;
     await api('receipts/' + id, { method: 'DELETE' }); await reload(); toast('Albarán anulado'); go('#/recepcion');
   });
 }
@@ -811,21 +815,31 @@ function guessCol(headers, words) {
 const COL_GUESS = {
   name: ['producto', 'articulo', 'nombre', 'plato', 'descripcion', 'concepto'], pvp: ['pvp', 'precio'], price: ['precio', 'coste', 'importe'],
   category: ['categoria', 'familia', 'grupo', 'seccion'], units: ['unidades', 'cantidad', 'uds', 'cant', 'vendid'], revenue: ['total', 'importe', 'venta', 'facturado'],
-  unit: ['unidad', 'medida', 'formato'], supplier_name: ['proveedor'],
+  unit: ['unidad', 'medida'], supplier_name: ['proveedor'],
+  cif: ['cif', 'nif', 'dni'], contact: ['contacto', 'persona', 'comercial'], phone: ['telefono', 'tlf', 'tel', 'movil', 'whatsapp'],
+  email: ['email', 'e-mail', 'correo', 'mail'], order_days: ['dias', 'reparto', 'pedido'], notes: ['notas', 'observaciones', 'comentarios'],
+  min_stock: ['minimo', 'min'], format_name: ['formato', 'envase', 'presentacion'], format_factor: ['unidades por', 'uds por', 'contiene', 'factor'], format_price: ['precio formato', 'precio caja', 'precio envase'],
 };
 
 // Asistente genérico: subir archivo -> elegir columnas -> enviar
-async function importWizard({ title, help, cols, send }) {
+function downloadCSV(name, rows) {
+  const cell = (x) => (typeof x === 'number' ? String(x).replace('.', ',') : `"${String(x ?? '').replace(/"/g, '""')}"`);
+  const blob = new Blob(['\uFEFF' + rows.map((r) => r.map(cell).join(';')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+async function importWizard({ title, help, cols, send, template }) {
   const r = await modal(`<h2>${esc(title)}</h2><p class="small muted">${esc(help)}</p>
+    ${template ? `<p class="small"><button type="button" class="sm" id="tpl">⬇ Descargar plantilla</button> Rellénala en Excel y súbela. Puedes usar también tu propio archivo: te preguntaré qué columna es cada dato.</p>` : ''}
     <div class="field"><label>Archivo Excel o CSV</label><input type="file" id="file" accept=".xlsx,.xls,.csv,.txt"></div>
     <div id="map"></div><div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok" id="go" disabled>Importar</button></div>`, {
     onOpen: (f) => {
+      if (template) $('#tpl', f).onclick = () => downloadCSV(template[0], template[1]);
       $('#file', f).onchange = async () => {
         try {
           const sh = await readSheet($('#file', f).files[0]);
           f._sheet = sh;
-          $('#map', f).innerHTML = `<p class="small">${sh.data.length} filas. Indica qué columna es cada dato:</p>` + cols.map(([k, t, req]) => {
-            const g = guessCol(sh.headers, COL_GUESS[k] || [k]);
+          $('#map', f).innerHTML = `<p class="small">${sh.data.length} filas. Indica qué columna es cada dato:</p>` + cols.map(([k, t, req, words]) => {
+            const g = guessCol(sh.headers, words || COL_GUESS[k] || [k]);
             return `<div class="field"><label>${esc(t)}${req ? '' : ' (opcional)'}</label><select data-col="${k}">${req ? '' : '<option value="-1">— no tengo —</option>'}${sh.headers.map((hd, i) => `<option value="${i}" ${i === g ? 'selected' : ''}>${esc(hd)}</option>`).join('')}</select></div>`;
           }).join('');
           $('#go', f).disabled = false;
@@ -1030,7 +1044,9 @@ VIEWS.productos = async (v, id) => {
   $('#imp').onclick = () => importWizard({
     title: 'Importar productos',
     help: 'Sube un Excel o CSV con tus productos (por ejemplo, la tarifa de un proveedor). Los que ya existan con el mismo nombre se actualizan. Si la tarifa trae formato (Caja 24, Saco 25 kg…) indícalo y se crea el formato.',
-    cols: [['name', 'Nombre del producto', true], ['unit', 'Unidad de control (kg, l, ud)', false], ['price', 'Precio por unidad sin IVA', false], ['category', 'Categoría', false], ['supplier_name', 'Proveedor', false], ['format_name', 'Nombre del formato (Caja 24…)', false], ['format_factor', 'Unidades que trae el formato', false], ['format_price', 'Precio del formato sin IVA', false]],
+    cols: [['name', 'Nombre del producto', true, ['producto', 'articulo', 'nombre', 'descripcion']], ['unit', 'Unidad de control (kg, l, ud)', false], ['price', 'Precio por unidad sin IVA', false, ['precio unidad', 'precio ud', 'precio kg', 'precio']], ['category', 'Categoría', false], ['supplier_name', 'Proveedor', false], ['min_stock', 'Stock mínimo', false], ['format_name', 'Nombre del formato (Caja 24…)', false], ['format_factor', 'Unidades que trae el formato', false], ['format_price', 'Precio del formato sin IVA', false]],
+    template: ['plantilla_productos.csv', [['Producto', 'Unidad', 'Precio unidad', 'Categoría', 'Proveedor', 'Mínimo', 'Formato', 'Unidades por formato', 'Precio formato'],
+      ['Coca-Cola 35cl', 'ud', '', 'Bebida', 'Bebidas SL', 48, 'Caja 24', 24, 14.4], ['Harina de trigo', 'kg', '', 'Seco', 'Distribuciones Sur', 10, 'Saco 25 kg', 25, 22.5], ['Calamar', 'kg', 11.5, 'Pescado', 'Pescados Mar', 2, '', '', '']]],
     send: async (items) => { const r = await api('products/bulk', { body: { items: items.map((i) => ({ ...i, price: parseNum(i.price) || 0 })) } }); await reload(); return `${r.count} productos importados`; },
   }).then(() => route());
 };
@@ -1094,15 +1110,24 @@ async function productoEdit(v, id) {
 VIEWS.proveedores = async (v) => {
   await reload();
   const F = [
-    { name: 'name', label: 'Nombre', required: true }, { name: 'contact', label: 'Persona de contacto' },
+    { name: 'name', label: 'Nombre', required: true }, { name: 'cif', label: 'CIF / NIF', help: 'Sirve para reconocer al proveedor al escanear sus albaranes y facturas' }, { name: 'contact', label: 'Persona de contacto' },
     { name: 'phone', label: 'Teléfono / WhatsApp', type: 'tel' }, { name: 'email', label: 'Email', type: 'email' },
     { name: 'order_days', label: 'Días de pedido y reparto', help: 'Ej.: pedir lunes y jueves antes de las 12; reparte al día siguiente' },
     { name: 'notes', label: 'Notas', type: 'textarea' },
   ];
-  v.innerHTML = `<div class="row between"><h1>Proveedores</h1><button class="primary" id="add">+ Nuevo proveedor</button></div>
-    <div class="card"><div class="table-wrap"><table><thead><tr><th>Proveedor</th><th>Contacto</th><th>Teléfono</th><th>Días de pedido</th><th class="num">Productos</th></tr></thead><tbody>
-    ${S.suppliers.map((s) => `<tr class="click" data-id="${s.id}"><td>${esc(s.name)}</td><td>${esc(s.contact || '')}</td><td>${esc(s.phone || '')}</td><td>${esc(s.order_days || '')}</td><td class="num">${S.products.filter((p) => p.supplier_id === s.id).length}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">Sin proveedores.</td></tr>'}
+  v.innerHTML = `<div class="row between"><h1>Proveedores</h1><div class="row"><button id="imp">Importar Excel</button><button class="primary" id="add">+ Nuevo proveedor</button></div></div>
+    <div class="card"><div class="field"><input id="search" placeholder="Buscar por nombre o CIF…"></div><div class="table-wrap"><table><thead><tr><th>Proveedor</th><th>CIF</th><th>Contacto</th><th>Teléfono</th><th>Días de pedido</th><th class="num">Productos</th></tr></thead><tbody>
+    ${S.suppliers.map((s) => `<tr class="click" data-id="${s.id}" data-n="${esc(norm(s.name + ' ' + (s.cif || '')))}"><td>${esc(s.name)}</td><td>${s.cif ? esc(s.cif) : '<span class="muted small">falta</span>'}</td><td>${esc(s.contact || '')}</td><td>${esc(s.phone || '')}</td><td>${esc(s.order_days || '')}</td><td class="num">${S.products.filter((p) => p.supplier_id === s.id).length}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Sin proveedores. Impórtalos desde Excel o créalos uno a uno.</td></tr>'}
     </tbody></table></div></div>`;
+  $('#search').oninput = () => { const q2 = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', q2 && !tr.dataset.n.includes(q2))); };
+  $('#imp').onclick = () => importWizard({
+    title: 'Importar proveedores',
+    help: 'Sube un Excel o CSV con tus proveedores. Si ya existe uno con el mismo CIF (o, si no hay CIF, con el mismo nombre), se actualizan sus datos; si no, se crea. Las columnas vacías no borran lo que ya había.',
+    cols: [['name', 'Nombre o razón social', true, ['proveedor', 'razon social', 'nombre', 'empresa']], ['cif', 'CIF / NIF', false], ['contact', 'Persona de contacto', false], ['phone', 'Teléfono', false], ['email', 'Email', false], ['order_days', 'Días de pedido y reparto', false], ['notes', 'Notas', false]],
+    template: ['plantilla_proveedores.csv', [['Proveedor', 'CIF', 'Contacto', 'Teléfono', 'Email', 'Días de pedido', 'Notas'],
+      ['Pescados Mar SL', 'B12345678', 'Juan', '600111222', 'pedidos@pescadosmar.es', 'Pedir L-X-V antes de 12h', ''], ['Bebidas SL', 'B87654321', 'Ana', '600333444', '', 'Martes', 'Envases retornables']]],
+    send: async (items) => { const r = await api('suppliers/bulk', { body: { items } }); await reload(); return `Proveedores: ${r.created} nuevos, ${r.updated} actualizados`; },
+  }).then(() => route());
   $('#add').onclick = async () => { const d = await formModal('Nuevo proveedor', F); if (d) act(null, async () => { await api('suppliers', { body: d }); await reload(); route(); }); };
   $$('tr[data-id]', v).forEach((tr) => (tr.onclick = async () => {
     const s = S.suppliers.find((x) => x.id === Number(tr.dataset.id));
@@ -1467,7 +1492,7 @@ window.ocrSlot = async (v, restart) => {
       if (r.failed) { toast(r.message, true); window.ocrSlot(v, restart); $('#extra', v)?.focus(); return; }
       await reload();
       const lines = r.lines.map((l) => ({ product_id: l.product_id, qty: l.qty, unit: l.unit, price: l.price, source: l.source, printed_unit: l.printed_unit, confidence: l.confidence, warn: l.confidence === 'revisar' || !l.product_id, ordered_qty: null }));
-      await restart({ supplier_id: r.supplier_id, supplier_name: r.supplier_name, supplier_cif: r.supplier_cif, delivery_note: r.delivery_note, date: r.date, ocr_id: r.ocr_id, total_read: r.total_without_vat,
+      await restart({ supplier_id: r.supplier_id, supplier_name: r.supplier_name, supplier_cif: r.supplier_cif, doc_type: r.doc_type, delivery_note: r.delivery_note, date: r.date, ocr_id: r.ocr_id, total_read: r.total_without_vat,
         notes: '', lines });
     } catch (e) { toast(e.message, true); window.ocrSlot(v, restart); }
   });
