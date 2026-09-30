@@ -933,7 +933,7 @@ VIEWS.escandallos = async (v, id, q) => {
   $('#search').oninput = filt; $('#fcat').onchange = filt;
   if ($('#exp')) $('#exp').onclick = (e) => act(e.target, exportCartaQamarero);
   if ($('#imp')) $('#imp').onclick = () => importWizard({
-    title: 'Importar carta (platos y precios)',
+    title: 'Importar carta (platos y precios)', sheetHint: ['carta', 'plato'],
     help: 'Sube el Excel o CSV de la carta exportado de Qamarero. Se crean los platos que no existan y se actualiza el PVP de los que sí. La app guarda las columnas del archivo para poder exportar la carta después en el mismo formato.',
     cols: [['name', 'Nombre del plato', true, ['nombre', 'producto', 'articulo', 'plato', 'descripcion']], ['pvp', 'Precio de venta (con IVA)', false, ['pvp', 'precio']], ['category', 'Categoría / familia', false]],
     keepRaw: true,
@@ -1228,8 +1228,9 @@ function parseCSV(text) {
   if (cell || row.length) { row.push(cell); rows.push(row); }
   return rows;
 }
-async function readSheet(file) {
-  let rows;
+// Lee un CSV o una hoja de un Excel. Con varias hojas: la pedida por nombre o la primera que tenga datos.
+async function readSheet(file, sheetName) {
+  let rows, sheetNames = [], name = null;
   if (/\.(csv|txt)$/i.test(file.name)) {
     const buf = await file.arrayBuffer();
     let text = new TextDecoder('utf-8').decode(buf);
@@ -1237,13 +1238,17 @@ async function readSheet(file) {
     rows = parseCSV(text);
   } else {
     await loadXLSX();
-    const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
-    rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true, defval: '' });
+    const wb = file._wb || (file._wb = XLSX.read(await file.arrayBuffer(), { type: 'array' }));
+    sheetNames = wb.SheetNames;
+    const rowsOf = (n) => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' });
+    const hasTable = (rs) => rs.some((r) => r.filter((c) => String(c).trim() !== '').length >= 2);
+    name = sheetName && sheetNames.includes(sheetName) ? sheetName : sheetNames.find((n) => hasTable(rowsOf(n))) || sheetNames[0];
+    rows = rowsOf(name);
   }
   const h = rows.findIndex((r) => r.filter((c) => String(c).trim() !== '').length >= 2);
   if (h < 0) throw new Error('El archivo parece vacío');
   const headers = rows[h].map((c, i) => String(c).trim() || `Columna ${i + 1}`);
-  return { headers, data: rows.slice(h + 1).filter((r) => r.some((c) => String(c).trim() !== '')) };
+  return { headers, data: rows.slice(h + 1).filter((r) => r.some((c) => String(c).trim() !== '')), sheetNames, sheetName: name };
 }
 // primero coincidencia exacta ("Ud" = ud), después parcial; nunca una columna ya asignada a otro dato
 function guessCol(headers, words, taken = new Set()) {
@@ -1266,7 +1271,7 @@ const COL_GUESS = {
 // Inventario (o stock inicial) desde Excel, con vista previa antes de guardar
 function inventarioImport(date) {
   return importWizard({
-    title: 'Importar inventario desde Excel',
+    title: 'Importar inventario desde Excel', sheetHint: ['recuento', 'inventario', 'stock'],
     help: 'Una fila por artículo con su cantidad. Si el mismo artículo sale en varias filas (p. ej. de varias facturas) podrás sumarlas. La unidad puede ser kg, g, l, ml, cl, ud o el nombre de un formato del artículo (caja, saco…).',
     template: ['plantilla-inventario.csv', [['Artículo', 'Cantidad', 'Unidad', 'Precio', 'Categoría', 'Proveedor'], ['Harina de fuerza', 12.5, 'kg', 0.92, 'Secos', 'Harinas del Sur'], ['Coca-Cola 35 cl', 48, 'ud', 0.65, 'Bebidas', 'Bebidas Cádiz'], ['Aceite de oliva virgen extra', 10, 'l', 6.8, 'Aceites', '']]],
     cols: [['name', 'Artículo', true], ['qty', 'Cantidad', true, ['cantidad', 'stock', 'existencias', 'recuento', 'uds', 'unidades', 'cant']], ['unit', 'Unidad (kg, g, l, ud, caja…)', false, ['ud', 'u', 'um', 'unid', 'unidad', 'unidad de medida', 'medida', 'formato']],
@@ -1276,7 +1281,7 @@ function inventarioImport(date) {
       let pv = { ...(await api('inventory/import', { body: { items, dry: true } })), no_unit: noUnit };
       const table = (rows) => `<div class="table-wrap"><table><thead><tr><th>Artículo</th><th class="num">Cantidad</th><th class="num">Precio</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.name)}${r.is_new ? ' <span class="pill warn">nuevo</span>' : ''}${r.unit_note && r.unit_note !== r.unit ? `<div class="small muted">leído en ${esc(r.unit_note)}</div>` : ''}</td><td class="num">${num(r.qty, 3)} ${esc(r.unit)}</td><td class="num">${r.price ? eur(r.price) + '/' + esc(r.unit) : '—'}</td></tr>`).join('')}</tbody></table></div>`;
       const body = (p) => `<h2>Revisa antes de guardar</h2>
-        <div class="grid k">${kpi('Filas leídas', num(p.rows, 0), p.bad.length ? `${p.bad.length} descartadas` : '')}${kpi('Artículos', num(p.articles, 0), `${p.matched} ya existían`)}${kpi('Nuevos', num(p.new_items.length, 0), p.can_create ? 'se darán de alta' : 'no tienes permiso para crearlos', p.new_items.length && !p.can_create ? 'bad' : '')}${kpi('Valor', eur(p.value), p.price_changes ? `${p.price_changes} precios cambian` : '')}</div>
+        <div class="grid k">${kpi('Filas leídas', num(p.rows, 0), [p.blank ? `${p.blank} sin contar (no se tocan)` : '', p.bad.length ? `${p.bad.length} con error` : ''].filter(Boolean).join(' · '))}${kpi('Artículos', num(p.articles, 0), `${p.matched} ya existían`)}${kpi('Nuevos', num(p.new_items.length, 0), p.can_create ? 'se darán de alta' : 'no tienes permiso para crearlos', p.new_items.length && !p.can_create ? 'bad' : '')}${kpi('Valor', eur(p.value), p.price_changes ? `${p.price_changes} precios cambian` : '')}</div>
         ${p.dups ? `<div class="field"><label>${p.dups} filas repiten un artículo que ya salía antes</label><select id="dup"><option value="sum">Sumar las cantidades</option><option value="last">Quedarme con la última fila</option></select></div>` : ''}
         ${p.no_unit ? '<p class="small txt-warn">⚠ No has indicado columna de unidad: todas las cantidades se toman en la unidad de cada artículo (kg, l o ud). Si tu Excel mezcla kilos y gramos, vuelve atrás y elige la columna.</p>' : ''}
         ${p.unknown_units.length ? `<p class="small txt-warn">Unidades que no conozco: ${p.unknown_units.map(esc).join(', ')}. En artículos nuevos se tomarán como «ud»; en los que ya existen, crea antes el formato (Existencias → artículo → formatos) para que se conviertan solas.</p>` : ''}
@@ -1307,25 +1312,40 @@ function downloadCSV(name, rows) {
   const blob = new Blob(['\uFEFF' + rows.map((r) => r.map(cell).join(';')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
-async function importWizard({ title, help, cols, send, template, keepRaw }) {
+async function importWizard({ title, help, cols, send, template, keepRaw, sheetHint = [] }) {
   const r = await modal(`<h2>${esc(title)}</h2><p class="small muted">${esc(help)}</p>
     ${template ? `<p class="small"><button type="button" class="sm" id="tpl">⬇ Descargar plantilla</button> Rellénala en Excel y súbela. Puedes usar también tu propio archivo: te preguntaré qué columna es cada dato.</p>` : ''}
     <div class="field"><label>Archivo Excel o CSV</label><input type="file" id="file" accept=".xlsx,.xls,.csv,.txt"></div>
     <div id="map"></div><div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok" id="go" disabled>Importar</button></div>`, {
     onOpen: (f) => {
       if (template) $('#tpl', f).onclick = () => downloadCSV(template[0], template[1]);
-      $('#file', f).onchange = async () => {
+      // con varias hojas se elige la que mejor encaja con los datos que se piden
+      const score = (sh) => { const taken = new Set(); return (sheetHint.some((w) => norm(sh.sheetName || '').includes(w)) ? 10 : 0) + cols.reduce((t, [k, , req, words]) => t + (guessCol(sh.headers, words || COL_GUESS[k] || [k], taken) >= 0 ? (req ? 3 : 1) : 0), 0) + Math.min(sh.data.length, 1); };
+      const load = async (sheetName) => {
+        const file = $('#file', f).files[0];
+        let sh = await readSheet(file, sheetName);
+        if (!sheetName && sh.sheetNames.length > 1) {
+          let best = sh, bs = score(sh);
+          for (const n of sh.sheetNames) { const x = await readSheet(file, n).catch(() => null); if (x && score(x) > bs) { best = x; bs = score(x); } }
+          sh = best;
+        }
+        return sh;
+      };
+      const draw = async (sheetName) => {
         try {
-          const sh = await readSheet($('#file', f).files[0]);
+          const sh = await load(sheetName);
           f._sheet = sh;
           const taken = new Set();
-          $('#map', f).innerHTML = `<p class="small">${sh.data.length} filas. Indica qué columna es cada dato:</p>` + cols.map(([k, t, req, words]) => {
+          $('#map', f).innerHTML = (sh.sheetNames.length > 1 ? `<div class="field"><label>Hoja del Excel</label><select id="sheet">${sh.sheetNames.map((n) => `<option ${n === sh.sheetName ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select></div>` : '')
+            + `<p class="small">${sh.data.length} filas. Indica qué columna es cada dato:</p>` + cols.map(([k, t, req, words]) => {
             const g = guessCol(sh.headers, words || COL_GUESS[k] || [k], taken);
             return `<div class="field"><label>${esc(t)}${req ? '' : ' (opcional)'}</label><select data-col="${k}">${req ? '' : '<option value="-1">— no tengo —</option>'}${sh.headers.map((hd, i) => `<option value="${i}" ${i === g ? 'selected' : ''}>${esc(hd)}</option>`).join('')}</select></div>`;
           }).join('');
+          if ($('#sheet', f)) $('#sheet', f).onchange = () => draw($('#sheet', f).value);
           $('#go', f).disabled = false;
         } catch (e) { toast(e.message, true); }
       };
+      $('#file', f).onchange = () => draw();
     },
   });
   if (!r) return;
@@ -1526,7 +1546,7 @@ VIEWS.productos = async (v, id) => {
   bindRowLinks(v);
   $('#search').oninput = () => { const s2 = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', s2 && !tr.dataset.n.includes(s2))); };
   $('#imp').onclick = () => importWizard({
-    title: 'Importar existencias',
+    title: 'Importar existencias', sheetHint: ['articul', 'existencia', 'producto', 'catalogo'],
     help: 'Sube un Excel o CSV con tus artículos (por ejemplo, la tarifa de un proveedor). Los que ya existan con el mismo nombre se actualizan. Si la tarifa trae formato (Caja 24, Saco 25 kg…) indícalo y se crea el formato.',
     cols: [['name', 'Nombre del artículo', true, ['producto', 'articulo', 'nombre', 'descripcion']], ['unit', 'Unidad de control (kg, l, ud)', false], ['price', 'Precio por unidad sin IVA', false, ['precio unidad', 'precio ud', 'precio kg', 'precio']], ['category', 'Categoría', false], ['supplier_name', 'Proveedor', false], ['min_stock', 'Stock mínimo', false], ['format_name', 'Nombre del formato (Caja 24…)', false], ['format_factor', 'Unidades que trae el formato', false], ['format_price', 'Precio del formato sin IVA', false]],
     template: ['plantilla_existencias.csv', [['Artículo', 'Unidad', 'Precio unidad', 'Categoría', 'Proveedor', 'Mínimo', 'Formato', 'Unidades por formato', 'Precio formato'],
@@ -1688,7 +1708,7 @@ VIEWS.proveedores = async (v) => {
     </tbody></table></div></div>`;
   $('#search').oninput = () => { const q2 = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', q2 && !tr.dataset.n.includes(q2))); };
   $('#imp').onclick = () => importWizard({
-    title: 'Importar proveedores',
+    title: 'Importar proveedores', sheetHint: ['proveedor'],
     help: 'Sube un Excel o CSV con tus proveedores. Si ya existe uno con el mismo CIF (o, si no hay CIF, con el mismo nombre), se actualizan sus datos; si no, se crea. Las columnas vacías no borran lo que ya había.',
     cols: [['name', 'Nombre o razón social', true, ['proveedor', 'razon social', 'nombre', 'empresa']], ['cif', 'CIF / NIF', false], ['contact', 'Persona de contacto', false], ['phone', 'Teléfono', false], ['email', 'Email', false], ['order_days', 'Días de pedido y reparto', false], ['notes', 'Notas', false]],
     template: ['plantilla_proveedores.csv', [['Proveedor', 'CIF', 'Contacto', 'Teléfono', 'Email', 'Días de pedido', 'Notas'],
