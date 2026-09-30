@@ -231,3 +231,63 @@ details summary { cursor: pointer; }
 .alert.bad { border-left-color: var(--bad); background: var(--bad-bg); }
 .alert.warn { border-left-color: var(--accent); background: var(--warn-bg); }
 .side a .badge-count { margin-left: auto; }
+
+/* casilla con texto al lado */
+label.chk { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; font-weight: 400; margin: 10px 0; cursor: pointer; }
+label.chk input { width: 18px; height: 18px; margin: 2px 0 0; flex: none; }
+
+/* ---------- turnos ---------- */
+.btn.sm { min-height: 32px; padding: 4px 10px; font-size: .85rem; }
+.weeknav { gap: 8px; align-items: center; }
+.weeknav b { min-width: 150px; text-align: center; }
+.sched-wrap { padding: 8px; }
+table.sched { border-collapse: separate; border-spacing: 0; width: 100%; min-width: 820px; }
+table.sched th, table.sched td { border-bottom: 1px solid var(--line); padding: 6px; vertical-align: top; }
+table.sched thead th { font-size: .8rem; text-align: center; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+table.sched thead th.today { color: var(--brand); }
+table.sched .who-c { text-align: left; font-weight: 400; min-width: 130px; position: sticky; left: 0; background: var(--surface); z-index: 1; }
+table.sched tr.dep th { text-align: left; background: var(--surface-2); font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 6px 8px; position: sticky; left: 0; }
+table.sched td.cell { text-align: center; min-width: 92px; font-size: .85rem; font-variant-numeric: tabular-nums; }
+table.sched td.cell.edit { cursor: pointer; }
+table.sched td.cell.edit:hover { background: var(--surface-2); }
+table.sched td.today { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+table.sched td.warnc { box-shadow: inset 0 0 0 2px var(--bad); border-radius: 6px; }
+table.sched .tseg { white-space: nowrap; font-weight: 600; }
+table.sched tr.cov td { font-size: .78rem; color: var(--muted); text-align: center; border-bottom: 0; padding: 3px 6px; }
+table.sched tr.cov td:first-child { text-align: left; }
+table.sched tr.cov td.lack { color: var(--bad); font-weight: 700; }
+.kpill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: .75rem; font-weight: 600; background: var(--surface-2); color: var(--muted); }
+.kpill.k-vac { background: #e3ecfa; color: #2a5aa0; }
+.kpill.k-baja { background: var(--bad-bg); color: var(--bad); }
+.kpill.k-fest { background: var(--warn-bg); color: var(--warn); }
+@media (prefers-color-scheme: dark) { .kpill.k-vac { background: #1b2a40; color: #8fb6ec; } }
+.kinds { display: flex; flex-wrap: wrap; gap: 6px; }
+.chipb { border: 1px solid var(--line); background: var(--surface); border-radius: 99px; padding: 6px 12px; font-size: .88rem; cursor: pointer; min-height: 36px; display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.chipb.on { background: var(--brand); color: var(--brand-ink); border-color: var(--brand); }
+.chipb.on .muted { color: inherit; opacity: .75; }
+.segrow input[type=time] { flex: 1; min-width: 0; }
+.mydays { display: grid; gap: 6px; margin-top: 10px; }
+.myday { display: grid; grid-template-columns: 70px 1fr; align-items: center; padding: 8px 10px; border-radius: 9px; background: var(--surface-2); }
+.myday.today { outline: 2px solid var(--accent); }
+.myday.off { opacity: .75; }
+.myday .dn { color: var(--muted); }
+.myday .tseg { font-weight: 700; font-size: 1.05rem; margin-right: 10px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.push-card { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; border-color: var(--accent); }
+.public { max-width: 1100px; margin: 0 auto; padding: 16px; }
+.pub-head { display: flex; flex-direction: column; margin-bottom: 14px; font-size: 1.15rem; }
+@media print {
+  table.sched { min-width: 0; font-size: 9pt; }
+  table.sched td.today, table.sched thead th.today { background: none; }
+  table.sched td.warnc { box-shadow: none; }
+  table.sched tr.cov { display: none; }
+}
+
+.dayview { display: none; }
+@media (max-width: 700px) {
+  .dayview { display: block; margin-bottom: 6px; }
+  .wide-only { display: none; }
+  .dayview .kinds { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; }
+  .dayview .chipb { flex: none; }
+  .dayview .myday { margin-top: 6px; grid-template-columns: 90px 1fr; }
+}
+@media print { .dayview { display: none !important; } .wide-only { display: block !important; } }

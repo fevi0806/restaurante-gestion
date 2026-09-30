@@ -153,6 +153,9 @@ const confirmModal = (msg, ok = 'Sí, continuar') =>
 
 // ---------------- arranque, login ----------------
 async function boot() {
+  // enlaces de horario sin contraseña
+  const pub = location.hash.match(/^#\/h\/([a-z0-9]+)/);
+  if (pub) return renderPublic(pub[1]);
   let st;
   try {
     st = await api('setup-status', { noRedirect: true });
@@ -239,7 +242,7 @@ function setAlertBadge(al) {
   const n = al.filter((x) => x.level !== 'info').length;
   if (n) a.insertAdjacentHTML('beforeend', `<span class="badge-count" title="Avisos">${n}</span>`);
 }
-const allowed = (n) => !n.need || !n.need.length || n.need.some((p) => (p === 'super' ? S.user?.is_super : can(p)));
+const allowed = (n) => (!n.when || n.when()) && (!n.need || !n.need.length || n.need.some((p) => (p === 'super' ? S.user?.is_super : can(p))));
 // separadores solo entre grupos con algo visible
 const visibleNav = () => NAV.filter((n, i) => (n.sep ? NAV.slice(i + 1).some((x) => !x.sep && allowed(x)) && NAV.slice(0, i).some((x) => !x.sep && allowed(x)) && !NAV[i + 1]?.sep : allowed(n)));
 
@@ -259,11 +262,16 @@ function renderShell() {
   $('#side').onclick = (e) => { if (e.target.closest('a')) $('#shell').classList.remove('nav-open'); };
   $('#shell').addEventListener('click', (e) => { if (e.target.id === 'shell') $('#shell').classList.remove('nav-open'); });
   api('alerts').then(setAlertBadge).catch(() => {});
-  $('#logout').onclick = async () => { await api('logout', { body: {} }).catch(() => {}); S.user = null; renderLogin(); };
+  $('#logout').onclick = async () => { await unsyncPush(); await api('logout', { body: {} }).catch(() => {}); S.user = null; renderLogin(); };
+  syncPush();
   route();
 }
 
-window.addEventListener('hashchange', () => S.user && route());
+window.addEventListener('hashchange', () => {
+  const pub = location.hash.match(/^#\/h\/([a-z0-9]+)/);
+  if (pub) return renderPublic(pub[1]);
+  if (S.user) { if (!$('#view')) renderShell(); else route(); }
+});
 
 async function route() {
   const [path, qs] = (location.hash.slice(2) || 'inicio').split('?');
@@ -352,6 +360,7 @@ VIEWS.inicio = async (v) => {
     ['mermas.registrar', '#/mermas?tipo=consumo_personal', '🍴', 'Comida de personal'],
     ['caja.registrar', '#/caja', '💶', 'Cerrar caja'],
     ['appcc.registrar', '#/appcc', '🧊', 'Temperaturas y limpieza'],
+    ['turnos.gestionar', '#/turnos', '🗓️', 'Cuadrante de turnos'],
     ['inventario.hacer', '#/stock?tab=inventario', '📋', 'Hacer inventario'],
     ['escandallos.ver', '#/escandallos', '🍽️', 'Fichas técnicas'],
     ['panel.ver', '#/panel', '📈', 'Panel de control'],
@@ -368,10 +377,13 @@ VIEWS.inicio = async (v) => {
   const al = await api('alerts').catch(() => []);
   setAlertBadge(al);
   const alertsCard = al.length ? `<div class="card alerts"><h3>Avisos</h3>${al.map((x) => `<a class="alert ${x.level}" href="${x.link}"><span>${x.icon}</span><span>${esc(x.text)}</span><span class="muted">›</span></a>`).join('')}</div>` : '<div class="card small muted">✓ Sin avisos. Todo en orden.</div>';
-  v.innerHTML = `<h1>Hola, ${esc(S.user.name.split(' ')[0])}</h1>${alertsCard}
+  v.innerHTML = `<h1>Hola, ${esc(S.user.name.split(' ')[0])}</h1>${S.me_staff ? '<div id="today-shift"></div>' : ''}<div id="pushc"></div>${alertsCard}
     ${acts.length ? `<div class="quick">${acts.map(([, h, i, t]) => `<a href="${h}"><span>${i}</span>${esc(t)}</a>`).join('')}</div>` : '<div class="card">Todavía no tienes permisos asignados. Pídeselos al responsable.</div>'}
     ${kp}
     ${low.length ? `<div style="margin-top:16px">${tableCard('Bajo stock mínimo', low, ['Artículo', 'Stock', 'Mínimo'], (r) => [esc(r.name), `<span class="txt-bad">${stockText(r, r.stock)}</span>`, `${num(r.min_stock)} ${esc(r.unit)}`], '')}</div>` : ''}`;
+  if (S.me_staff) todayShiftCard($('#today-shift'));
+  if (S.me_staff || can('pedidos.aprobar') || can('pedidos.crear') || can('turnos.gestionar'))
+    pushCard($('#pushc'), S.me_staff ? 'Tu horario cuando se publique o cambie, recordatorio la tarde antes' + (can('pedidos.aprobar') ? ' y los pedidos por aprobar.' : ' y la respuesta a tus pedidos.') : can('pedidos.aprobar') ? 'Te suena el móvil cuando haya un pedido por aprobar.' : 'Te avisamos cuando aprueben o rechacen tus pedidos.');
 };
 
 // ---------- Pedidos ----------
@@ -795,7 +807,11 @@ VIEWS.stock = async (v, _id, q) => {
 
   if (tab === 'inventario') {
     const invs = await api('inventory');
-    v.innerHTML = `<h1>Stock e inventario</h1>${tabs}<div class="card">
+    v.innerHTML = `<h1>Stock e inventario</h1>${tabs}
+      <div class="card row between" style="${invs.length ? '' : 'border-color:var(--accent)'}"><div><b>${invs.length ? '¿Tienes el recuento en un Excel?' : '¿Arrancas con el stock en un Excel?'}</b>
+        <div class="small muted">Súbelo y la app da de alta los artículos que falten, actualiza precios y carga las cantidades${invs.length ? '' : ' como stock inicial'}.</div></div>
+        <button class="primary" id="impinv">⬆ Importar desde Excel</button></div>
+      <div class="card">
       <p class="small muted">Cuenta lo que hay físicamente y apúntalo. Deja en blanco lo que no cuentes. La app compara con el stock teórico y registra la diferencia como descuadre.</p>
       <div class="row"><div class="field"><label>Fecha del recuento</label><input type="date" id="date" value="${today()}"></div><div class="field" style="flex:2 1 240px"><label>Buscar</label><input id="search" placeholder="Filtrar artículos…"></div></div>
       ${cats.map((c) => `<h3 style="margin-top:14px">${esc(c)}</h3><div class="table-wrap"><table><tbody>${S.products.filter((p) => (p.category || 'Sin categoría') === c).map((p) => {
@@ -808,6 +824,7 @@ VIEWS.stock = async (v, _id, q) => {
       <div class="sticky-foot row between"><span class="small muted" id="cnt">0 contados</span><button class="primary" id="save">Guardar inventario</button></div></div>
       ${tableCard('Inventarios anteriores', invs, ['Fecha', 'Quién', 'Descuadre'], (i) => [fdate(i.inv_date), esc(i.user_name || ''), `<span class="${i.total_diff_value < 0 ? 'txt-bad' : ''}">${eur(i.total_diff_value)}</span>`], 'Aún no se ha hecho ningún inventario')}`;
     $('#search').oninput = () => { const s = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', s && !tr.dataset.n.includes(s))); };
+    $('#impinv').onclick = () => inventarioImport($('#date').value);
     const rowCount = (tr) => {
       const ins = $$('input[data-f]', tr).filter((i) => i.value !== '');
       if (!ins.length) return null;
@@ -1228,8 +1245,13 @@ async function readSheet(file) {
   const headers = rows[h].map((c, i) => String(c).trim() || `Columna ${i + 1}`);
   return { headers, data: rows.slice(h + 1).filter((r) => r.some((c) => String(c).trim() !== '')) };
 }
-function guessCol(headers, words) {
-  const i = headers.findIndex((hd) => words.some((w) => norm(hd).includes(w)));
+// primero coincidencia exacta ("Ud" = ud), después parcial; nunca una columna ya asignada a otro dato
+function guessCol(headers, words, taken = new Set()) {
+  const clean = (x) => norm(x).replace(/[^a-z0-9ñ ]/g, '').trim();
+  const free = (i) => !taken.has(i);
+  let i = headers.findIndex((hd, k) => free(k) && words.some((w) => clean(hd) === clean(w)));
+  if (i < 0) i = headers.findIndex((hd, k) => free(k) && words.some((w) => clean(w).length >= 3 && clean(hd).includes(clean(w))));
+  if (i >= 0) taken.add(i);
   return i;
 }
 const COL_GUESS = {
@@ -1240,6 +1262,44 @@ const COL_GUESS = {
   email: ['email', 'e-mail', 'correo', 'mail'], order_days: ['dias', 'reparto', 'pedido'], notes: ['notas', 'observaciones', 'comentarios'],
   min_stock: ['minimo', 'min'], format_name: ['formato', 'envase', 'presentacion'], format_factor: ['unidades por', 'uds por', 'contiene', 'factor'], format_price: ['precio formato', 'precio caja', 'precio envase'],
 };
+
+// Inventario (o stock inicial) desde Excel, con vista previa antes de guardar
+function inventarioImport(date) {
+  return importWizard({
+    title: 'Importar inventario desde Excel',
+    help: 'Una fila por artículo con su cantidad. Si el mismo artículo sale en varias filas (p. ej. de varias facturas) podrás sumarlas. La unidad puede ser kg, g, l, ml, cl, ud o el nombre de un formato del artículo (caja, saco…).',
+    template: ['plantilla-inventario.csv', [['Artículo', 'Cantidad', 'Unidad', 'Precio', 'Categoría', 'Proveedor'], ['Harina de fuerza', 12.5, 'kg', 0.92, 'Secos', 'Harinas del Sur'], ['Coca-Cola 35 cl', 48, 'ud', 0.65, 'Bebidas', 'Bebidas Cádiz'], ['Aceite de oliva virgen extra', 10, 'l', 6.8, 'Aceites', '']]],
+    cols: [['name', 'Artículo', true], ['qty', 'Cantidad', true, ['cantidad', 'stock', 'existencias', 'recuento', 'uds', 'unidades', 'cant']], ['unit', 'Unidad (kg, g, l, ud, caja…)', false, ['ud', 'u', 'um', 'unid', 'unidad', 'unidad de medida', 'medida', 'formato']],
+      ['price', 'Precio por esa unidad (sin IVA)', false, ['precio', 'coste', 'p. unit', 'pvp compra']], ['category', 'Categoría', false], ['supplier_name', 'Proveedor', false]],
+    send: async (items) => {
+      const noUnit = !items.some((i) => String(i.unit ?? '').trim());
+      let pv = { ...(await api('inventory/import', { body: { items, dry: true } })), no_unit: noUnit };
+      const table = (rows) => `<div class="table-wrap"><table><thead><tr><th>Artículo</th><th class="num">Cantidad</th><th class="num">Precio</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.name)}${r.is_new ? ' <span class="pill warn">nuevo</span>' : ''}${r.unit_note && r.unit_note !== r.unit ? `<div class="small muted">leído en ${esc(r.unit_note)}</div>` : ''}</td><td class="num">${num(r.qty, 3)} ${esc(r.unit)}</td><td class="num">${r.price ? eur(r.price) + '/' + esc(r.unit) : '—'}</td></tr>`).join('')}</tbody></table></div>`;
+      const body = (p) => `<h2>Revisa antes de guardar</h2>
+        <div class="grid k">${kpi('Filas leídas', num(p.rows, 0), p.bad.length ? `${p.bad.length} descartadas` : '')}${kpi('Artículos', num(p.articles, 0), `${p.matched} ya existían`)}${kpi('Nuevos', num(p.new_items.length, 0), p.can_create ? 'se darán de alta' : 'no tienes permiso para crearlos', p.new_items.length && !p.can_create ? 'bad' : '')}${kpi('Valor', eur(p.value), p.price_changes ? `${p.price_changes} precios cambian` : '')}</div>
+        ${p.dups ? `<div class="field"><label>${p.dups} filas repiten un artículo que ya salía antes</label><select id="dup"><option value="sum">Sumar las cantidades</option><option value="last">Quedarme con la última fila</option></select></div>` : ''}
+        ${p.no_unit ? '<p class="small txt-warn">⚠ No has indicado columna de unidad: todas las cantidades se toman en la unidad de cada artículo (kg, l o ud). Si tu Excel mezcla kilos y gramos, vuelve atrás y elige la columna.</p>' : ''}
+        ${p.unknown_units.length ? `<p class="small txt-warn">Unidades que no conozco: ${p.unknown_units.map(esc).join(', ')}. En artículos nuevos se tomarán como «ud»; en los que ya existen, crea antes el formato (Existencias → artículo → formatos) para que se conviertan solas.</p>` : ''}
+        ${p.bad.length ? `<details><summary class="small txt-bad">${p.bad.length} filas sin cantidad válida (no se importan)</summary>${p.bad.slice(0, 30).map((b) => `<div class="small">Fila ${b.row}: ${esc(b.name)} — ${esc(b.why)}</div>`).join('')}</details>` : ''}
+        <h3>Muestra</h3>${table(p.sample)}
+        ${p.new_items.length ? `<details><summary class="small">Ver los ${p.new_items.length} artículos nuevos</summary>${table(p.new_items.map((x) => ({ ...x, is_new: true })))}</details>` : ''}
+        <label class="chk"><input type="checkbox" id="initial" ${p.first_inventory ? 'checked' : ''}><span>Es el <b>stock inicial</b>: entra como existencias y no cuenta como descuadre</span></label>
+        ${p.price_changes ? `<label class="chk"><input type="checkbox" id="prices" checked><span>Actualizar los ${p.price_changes} precios que han cambiado</span></label>` : ''}
+        <p class="small muted">Fecha del recuento: ${fdate(date)}. Los artículos que no estén en el Excel no se tocan.</p>
+        <div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok">Guardar inventario</button></div>`;
+      let opts = {};
+      const r = await modal(body(pv), { onOpen: (f) => {
+        const dup = $('#dup', f);
+        if (dup) dup.onchange = async () => { opts.dup = dup.value; pv = { ...(await api('inventory/import', { body: { items, dry: true, dup: dup.value } })), no_unit: noUnit }; const keep = dup.value; f.innerHTML = body(pv); $('#dup', f).value = keep; $('#dup', f).onchange = dup.onchange; $$('[data-close]', f).forEach((b) => (b.onclick = (e) => { e.preventDefault(); $('#modal').close(); })); };
+      } });
+      if (!r) return 'Importación cancelada';
+      const f = $('#modal-form');
+      const res = await api('inventory/import', { body: { items, date, dup: $('#dup', f)?.value || opts.dup || 'sum', initial: !!$('#initial', f)?.checked, update_prices: $('#prices', f) ? $('#prices', f).checked : true } });
+      await reload(); route();
+      return `Inventario guardado: ${res.counted} artículos${res.created ? `, ${res.created} nuevos` : ''}${res.prices ? `, ${res.prices} precios actualizados` : ''}`;
+    },
+  });
+}
 
 // Asistente genérico: subir archivo -> elegir columnas -> enviar
 function downloadCSV(name, rows) {
@@ -1258,8 +1318,9 @@ async function importWizard({ title, help, cols, send, template, keepRaw }) {
         try {
           const sh = await readSheet($('#file', f).files[0]);
           f._sheet = sh;
+          const taken = new Set();
           $('#map', f).innerHTML = `<p class="small">${sh.data.length} filas. Indica qué columna es cada dato:</p>` + cols.map(([k, t, req, words]) => {
-            const g = guessCol(sh.headers, words || COL_GUESS[k] || [k]);
+            const g = guessCol(sh.headers, words || COL_GUESS[k] || [k], taken);
             return `<div class="field"><label>${esc(t)}${req ? '' : ' (opcional)'}</label><select data-col="${k}">${req ? '' : '<option value="-1">— no tengo —</option>'}${sh.headers.map((hd, i) => `<option value="${i}" ${i === g ? 'selected' : ''}>${esc(hd)}</option>`).join('')}</select></div>`;
           }).join('');
           $('#go', f).disabled = false;
@@ -2242,4 +2303,5 @@ VIEWS.ajustes = async (v) => {
   $('#f').onsubmit = (e) => { e.preventDefault(); act(e.submitter, async () => { await api('settings', { method: 'PUT', body: Object.fromEntries(new FormData(e.target)) }); await reload(); renderShell(); toast('Ajustes guardados'); }); };
 };
 
-boot();
+// se arranca cuando están cargados todos los scripts (turnos.js añade vistas)
+document.addEventListener('DOMContentLoaded', boot);
