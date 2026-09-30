@@ -189,3 +189,45 @@ label.check input { width: 20px; min-height: 20px; margin-top: 1px; flex: none; 
   th, td { padding: 4px 6px; }
   .table-wrap { overflow: visible; margin: 0; padding: 0; }
 }
+
+/* alérgenos */
+.alg { font-size: 1rem; margin-right: 2px; }
+.algs { display: flex; flex-wrap: wrap; gap: 6px; }
+.algc { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 99px; padding: 5px 11px; font-weight: 500; font-size: .85rem; cursor: pointer; margin: 0; background: var(--surface); }
+.algc input { display: none; }
+.algc.on { background: var(--warn-bg); border-color: var(--accent); }
+.algc.lk { cursor: default; }
+.algc.lk::after { content: '·ingrediente'; color: var(--muted); font-size: .72rem; }
+/* edición en lista */
+.bulkbar { background: var(--surface-2); border-radius: 10px; padding: 8px 10px; margin: 10px 0; gap: 14px; }
+.bulkbar input, .bulkbar select, .bulkbar button { min-height: 36px; padding-top: 5px; padding-bottom: 5px; }
+.grid-edit td { padding: 4px 6px; }
+.grid-edit input, .grid-edit select { min-height: 36px; padding: 5px 8px; }
+.grid-edit td:first-child input, .grid-edit th:first-child input { width: 18px; min-height: 18px; }
+.grid-edit input.chg, .grid-edit select.chg { background: var(--warn-bg); border-color: var(--accent); }
+.dishphoto { max-width: 280px; max-height: 220px; border-radius: 10px; display: block; }
+/* ficha técnica impresa */
+.ficha { font-size: 10.5pt; color: #000; }
+.ficha .fh { display: flex; justify-content: space-between; gap: 16px; border-bottom: 2px solid #000; padding-bottom: 8px; margin-bottom: 10px; }
+.ficha .fh h1 { margin: 2px 0; font-size: 18pt; }
+.ficha .fh img { max-height: 120px; max-width: 170px; border-radius: 6px; }
+.ficha table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+.ficha th, .ficha td { border: 1px solid #999; padding: 3px 6px; text-align: left; font-size: 9.5pt; color: #000; }
+.ficha tfoot td { background: #f2f2f2; }
+.ficha .fk td:nth-child(odd) { background: #f7f7f7; font-weight: 600; }
+.ficha h3 { font-size: 11pt; text-transform: none; color: #000; margin: 10px 0 2px; letter-spacing: 0; }
+
+.algs button.algc { min-height: 0; font-weight: 500; }
+.algc.faint { opacity: .45; }
+.btn .badge-count { margin-left: 4px; }
+.algs.small { gap: 4px; }
+.algs.small .algc { padding: 3px 8px; font-size: .76rem; }
+.task { padding: 8px 0; border-bottom: 1px solid var(--line); gap: 10px; }
+.lotrow td { background: var(--surface-2); padding-top: 4px; padding-bottom: 6px; }
+details summary { cursor: pointer; }
+.alerts h3 { margin-bottom: 6px; }
+.alert { display: grid; grid-template-columns: 28px 1fr auto; gap: 8px; align-items: center; padding: 9px 8px; border-radius: 9px; text-decoration: none; border-left: 4px solid var(--line); margin: 4px 0; background: var(--surface-2); }
+.alert:hover { filter: brightness(.97); }
+.alert.bad { border-left-color: var(--bad); background: var(--bad-bg); }
+.alert.warn { border-left-color: var(--accent); background: var(--warn-bg); }
+.side a .badge-count { margin-left: auto; }
