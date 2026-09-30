@@ -3,10 +3,11 @@
 // Todo es repetible: si algo ya existe, se ignora. Así nunca hay que pegar SQL en la consola.
 import { SCHEMA } from './schema.js';
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 // Columnas añadidas después de la primera versión (para bases de datos ya creadas)
 const COLUMNS = [
+  ['sales_imports', 'calc_at TEXT'],
   ['order_lines', 'input_qty REAL'], ['order_lines', 'input_unit TEXT'], ['order_lines', 'unit_label TEXT'],
   ['receipt_lines', 'input_qty REAL'], ['receipt_lines', 'input_unit TEXT'], ['receipt_lines', 'unit_label TEXT'], ['receipt_lines', 'input_price REAL'],
   ['recipe_lines', 'input_qty REAL'], ['recipe_lines', 'input_unit TEXT'],
