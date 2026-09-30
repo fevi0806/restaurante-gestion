@@ -18,3 +18,5 @@ database_id = "02f0f318-ebdb-4c1f-8e9a-765aa788f488"
 # Plan gratuito: 10.000 "neuronas" al día sin coste (unos 40 albaranes). Si se agota, se bloquea hasta el día siguiente: no cobra.
 [ai]
 binding = "AI"
+[triggers]
+crons = ["*/15 * * * *", "0 7 * * 1"]
