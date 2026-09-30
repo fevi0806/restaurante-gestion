@@ -5,7 +5,8 @@ Aplicación web para controlar todo el flujo de consumo:
 - **Pedidos** a proveedores en el formato en que compras (cajas, sacos, barriles…), con texto listo para WhatsApp o email.
 - **Recepción** de mercancía contra albarán, con **escáner**: foto del albarán con el móvil y la app propone las líneas. Si no lo lee bien, se mete a mano.
 - **Stock** teórico en peso, litros o unidades, e **inventarios** contando en cajas + sueltos.
-- **Escandallos** en gramos o mililitros, con coste por ración, food cost y margen recalculados con el último precio de compra.
+- **Existencias**: todo lo que se compra y se guarda en almacén (ingredientes, bebidas, limpieza…), con edición en lista y alérgenos.
+- **Carta y escandallos**: los platos que se venden, con su ficha técnica estándar (bruto/neto, mermas de limpieza y cocción, % de varios, 14 alérgenos, elaboración, emplatado, foto, ficha imprimible), gastos fijos imputados, beneficio neto, edición en lista y exportación compatible con Qamarero.
 - **Mermas** y **consumo de personal**, por producto (en g, kg, ud, cajas…) o por plato.
 - **Caja real del día**: efectivo, tarjeta, Bizum y otros, con descuadre frente al cierre de Qamarero y contador de billetes.
 - **Ventas de Qamarero**: importar Excel/CSV, vincular nombres (incluidas medias raciones) y entrada automática.
@@ -24,6 +25,28 @@ Todo se guarda en una base de datos de Cloudflare (D1). Cada empleado entra con 
 | Dirección | Todos los permisos (sin gestionar usuarios, que es solo del superusuario) |
 
 Se publica en un **subdominio** (por ejemplo `gestion.turestaurante.com`). **No toca la web de WordPress**: el dominio principal sigue igual.
+
+---
+
+## Módulos de control
+
+- **Elaboraciones intermedias** (Carta → Elaboraciones): bechamel, sofrito, alioli, fondos, masas… Se escandallan una vez indicando cuánto producen (p. ej. 5 l) y se usan como ingrediente en los platos. Su coste por kg/l/ud se recalcula solo al cambiar los precios, y heredan los alérgenos. Al **producir** (Carta → Producción) se descuentan sus ingredientes y se suma la elaboración al stock; al vender un plato se descuenta la elaboración.
+- **Descuadre por artículo** (Panel → Descuadres): entre recuentos, compara lo que entró con lo vendido por escandallo, las mermas, el consumo de personal y la producción, y dice cuánto falta de cada artículo, en unidades y en euros. Sugiere qué artículos contar.
+- **APPCC**: temperaturas de cámaras mañana y tarde (fuera de rango exige medida correctora), plan de limpieza diario/semanal/mensual, temperatura y comprobación del género en recepción, lote y caducidad por línea, lista de caducidades próximas e informe imprimible para la inspección. Trae equipos y un plan básico para empezar.
+- **Aprobación de pedidos**: quien tiene el permiso "Aprobar pedidos" (el socio que compra) revisa los pedidos del resto. Cuando alguien guarda un pedido queda **pendiente de aprobar** y la app ofrece avisarle por WhatsApp o email con un toque (con el enlace al pedido); además le sale en sus avisos. El socio puede modificarlo, rechazarlo con un motivo o **aprobarlo y enviarlo al proveedor** por WhatsApp o email. Todo queda en el registro de actividad. El móvil y el email de cada persona se ponen en Usuarios y permisos.
+- **Pedido sugerido** (Pedidos → Nuevo): según el consumo de las últimas 4 semanas (ajustado a los días fuertes de la semana), el stock y el mínimo, propone las cantidades para cubrir N días, redondeadas al formato de compra.
+- **Avisos** (Inicio): falta dinero en caja, caja sin registrar, subidas de precio de más del 5 %, food cost disparado, mermas por encima de lo normal, descuadres de inventario, stock bajo, pedidos sin llegar, temperaturas pendientes o fuera de rango, caducidades, copias, alérgenos sin revisar, ventas sin vincular y platos sin escandallo. Cada persona ve solo los de su trabajo.
+- **Resumen semanal** (Panel → Resumen semanal): la semana de lunes a domingo frente a la anterior, platos más vendidos, mayores descuadres, subidas de precio y cumplimiento del APPCC. Se imprime o se guarda en PDF.
+
+Envío del resumen por email (opcional): Cloudflare solo permite enviar a direcciones verificadas si se activa **Email Routing** en el dominio, y eso **cambia los registros de correo (MX)** del dominio. Si tu correo está en ese dominio con otro proveedor, no lo actives. Si quieres usarlo: activa Email Routing, verifica tu email de destino y añade a `wrangler.toml` `send_email = [{ name = "EMAIL" }]`, `[vars] SUMMARY_TO = "tu@email"`, `SUMMARY_FROM = "resumen@tudominio"` y `[triggers] crons = ["0 7 * * 1"]` (lunes a las 7:00 UTC).
+
+---
+
+## Seguridad y copias
+
+- **Registro de actividad** (solo superusuario): queda anotado quién crea, cambia o borra cada cosa, con el valor anterior (precios, caja, albaranes anulados, mermas borradas…).
+- **Bloqueo de contraseña**: tras 5 intentos fallidos desde el mismo dispositivo, ese usuario queda bloqueado 15 minutos.
+- **Copias de seguridad**: descarga un archivo con todos los datos para guardarlo fuera de Cloudflare, y permite restaurarlo. La app avisa si pasan más de 7 días sin descargar una copia. Los datos no se borran nunca; Cloudflare además permite volver la base de datos a cualquier momento de los últimos 7 días (Time Travel).
 
 ---
 
@@ -208,20 +231,45 @@ wrangler d1 export restaurante-gestion --remote --output=copia.sql
 
 ---
 
+## Ficha técnica y gastos fijos
+
+Cada plato calcula, por ración:
+
+- **Coste de materia prima** = Σ (peso neto ÷ (1 − merma de limpieza) ÷ (1 − merma de cocción) × precio de compra) + **% de varios** (sal, especias, aceite de fritura; por defecto 3 %, se cambia en Ajustes o en cada ficha).
+- **% de coste** sobre el PVP sin IVA, **margen bruto** y **multiplicador**.
+- **Gastos fijos imputados** = PVP sin IVA × (gastos fijos mensuales ÷ facturación mensual). La facturación se toma de Ajustes ("facturación mensual prevista") o, si está vacía, de la media real de ventas de Qamarero (o de caja) de los últimos 90 días, con un mínimo de 14 días de datos.
+- **Beneficio neto** = PVP sin IVA − materia prima − gastos fijos imputados.
+- **PVP recomendado** para el objetivo de coste y **PVP mínimo** sin pérdidas.
+
+Los **alérgenos** se marcan en cada artículo de Existencias y los platos los heredan; en la ficha se añaden los de la elaboración.
+
+**Existencias → Revisar alérgenos** propone los alérgenos de cada artículo: primero con un diccionario de hostelería (harina, gamba, chocos, puntillitas, boquerón, queso, vino…) y, para lo que no reconoce, con la IA gratuita de Cloudflare. Tú confirmas o corriges y se guardan como **revisados**. Los artículos y platos con ingredientes sin revisar se marcan en amarillo. La referencia legal es siempre la etiqueta o ficha técnica del proveedor.
+
+---
+
+## Edición en lista
+
+En **Existencias** y en **Carta** hay un botón **Editar en lista**: una tabla donde se cambian nombre, categoría, precio, proveedor, mínimo o PVP de muchos a la vez, con acciones masivas sobre los marcados (subir o bajar un %, poner categoría, poner proveedor, poner el PVP recomendado). Los cambios se resaltan y se guardan todos juntos.
+
+---
+
+## Exportar la carta a Qamarero
+
+Al importar la carta desde un archivo de Qamarero, la app guarda sus columnas y cada fila. **Carta → Exportar para Qamarero** genera el mismo archivo con los nombres, precios y categorías actuales; los platos nuevos van al final.
+
+---
+
 ## Recepción: albarán o factura
 
 Al recibir mercancía se elige si el documento es un **albarán** o una **factura**. El escáner lo detecta solo. Registra una factura solo si la mercancía entra con ella: si la factura agrupa albaranes que ya registraste, no la metas, porque duplicarías el stock.
 
 ---
 
-## Actualizar una base de datos ya creada
+## Actualizaciones
 
-Cuando una versión nueva añade columnas, hay que ejecutar su archivo de `migrations` en la consola de D1 **antes** de subir el código nuevo. Cada archivo se ejecuta una sola vez.
+La app **actualiza sola la base de datos** al arrancar una versión nueva: crea las tablas que falten y añade las columnas nuevas, sin tocar los datos. Para actualizar basta con subir a GitHub las carpetas `src` y `public` nuevas.
 
-- `002_formatos.sql`: solo si creaste la base de datos con la primera versión (sin formatos ni permisos).
-- `003_factura.sql`: para todas las bases creadas antes de poder elegir albarán o factura.
-
-Si creas la base de datos ahora desde cero con `schema-consola.sql`, no hace falta ninguno.
+Si se crea desde cero, tampoco hace falta ejecutar nada: con la base de datos D1 vacía y conectada, la app crea todas las tablas en el primer arranque. (`schema.sql` y `migrations/` quedan como referencia.)
 
 ---
 
@@ -230,6 +278,9 @@ Si creas la base de datos ahora desde cero con `schema-consola.sql`, no hace fal
 ```
 src/worker.js                Entrada en Cloudflare Workers
 src/api.js                   Servidor (login, permisos, toda la lógica)
+src/migrate.js               Actualización automática de la base de datos
+src/schema.js                Esquema (generado desde schema.sql)
+src/email.js                 Resumen semanal por email (opcional)
 public/                      Interfaz (HTML, CSS y JS sin compilación)
 schema.sql                   Tablas de la base de datos
 migrations/                  Cambios para bases de datos creadas con versiones anteriores (se ejecutan en orden)
