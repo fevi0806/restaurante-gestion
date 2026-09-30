@@ -10,4 +10,10 @@ export default {
     }
     return env.ASSETS.fetch(request);
   },
+  // Resumen semanal por email (opcional; ver la guía): necesita el enlace EMAIL y las variables SUMMARY_TO y SUMMARY_FROM
+  async scheduled(event, env, ctx) {
+    if (!env.EMAIL || !env.SUMMARY_TO || !env.SUMMARY_FROM) return;
+    const { weeklyEmail } = await import('./email.js');
+    ctx.waitUntil(weeklyEmail(env));
+  },
 };

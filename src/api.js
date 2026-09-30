@@ -1,22 +1,75 @@
-// API de la aplicación de gestión del restaurante (Cloudflare Pages Functions + D1)
+// API de la aplicación de gestión del restaurante (Cloudflare Workers + D1)
+import { ensureSchema, SCHEMA_VERSION } from './migrate.js';
 
 const ALL = ['direccion', 'cocina', 'sala'];
+
+// Los 14 alérgenos de declaración obligatoria (Reglamento UE 1169/2011)
+const ALLERGENS = ['gluten', 'crustaceos', 'huevos', 'pescado', 'cacahuetes', 'soja', 'lacteos', 'frutos_cascara', 'apio', 'mostaza', 'sesamo', 'sulfitos', 'altramuces', 'moluscos'];
+
+// Diccionario de hostelería para sugerir alérgenos a partir del nombre del artículo.
+// Es una ayuda: la referencia legal es la etiqueta o ficha técnica del proveedor.
+const ALLERGEN_WORDS = {
+  gluten: ['harina', 'trigo', 'salsa de soja', 'pan', 'panko', 'rebozad', 'empanad', 'pasta', 'espagueti', 'macarron', 'tallarin', 'fideo', 'cebada', 'centeno', 'avena', 'espelta', 'kamut', 'semola', 'cuscus', 'bulgur', 'seitan', 'galleta', 'bizcocho', 'hojaldre', 'masa', 'picatoste', 'cerveza', 'malta', 'croqueta', 'tortillita', 'rosca', 'molleta', 'bollo', 'brioche', 'tostada', 'regaña', 'pizza', 'lasaña', 'canelon', 'gnocchi', 'cuscús', 'bechamel', 'rebozado'],
+  crustaceos: ['gamba', 'langostino', 'cigala', 'bogavante', 'langosta', 'cangrejo', 'buey de mar', 'centolla', 'necora', 'camaron', 'carabinero', 'quisquilla', 'galera', 'santiaguino', 'krill', 'surimi', 'tortillita de camaron'],
+  huevos: ['huevo', 'yema', 'clara', 'mayonesa', 'alioli', 'ali oli', 'tortilla', 'merengue', 'flan', 'natilla', 'tartara', 'rebozad', 'brioche', 'pasta fresca', 'huevas'],
+  pescado: ['pescado', 'merluza', 'bacalao', 'atun', 'bonito', 'boqueron', 'anchoa', 'sardina', 'caballa', 'jurel', 'salmon', 'dorada', 'lubina', 'corvina', 'urta', 'pargo', 'rape', 'rodaballo', 'lenguado', 'acedia', 'pijota', 'pescadilla', 'cazon', 'raya', 'pez espada', 'emperador', 'mero', 'besugo', 'salmonete', 'chopito', 'huevas', 'mojama', 'caldo de pescado', 'fumet', 'surimi', 'tollo', 'bienmesabe', 'japuta', 'palometa', 'breca', 'herrera', 'baila'],
+  cacahuetes: ['cacahuete', 'mani', 'maní'],
+  soja: ['soja', 'tofu', 'edamame', 'miso', 'tempeh', 'salsa de soja', 'lecitina de soja'],
+  lacteos: ['leche', 'queso', 'nata', 'mantequilla', 'yogur', 'kefir', 'requeson', 'mozzarella', 'parmesano', 'burrata', 'mascarpone', 'ricotta', 'cuajada', 'bechamel', 'helado', 'lactosa', 'suero', 'crema de leche', 'ghee', 'payoyo', 'manchego'],
+  frutos_cascara: ['almendra', 'nuez', 'nueces', 'avellana', 'pistacho', 'anacardo', 'castaña', 'pecana', 'macadamia', 'pinon', 'piñon', 'praline', 'turron', 'mazapan', 'frutos secos', 'romesco'],
+  apio: ['apio', 'apionabo'],
+  mostaza: ['mostaza'],
+  sesamo: ['sesamo', 'sésamo', 'ajonjoli', 'tahini', 'tahin', 'hummus'],
+  sulfitos: ['vino', 'vinagre', 'jerez', 'manzanilla', 'fino', 'oloroso', 'amontillado', 'pedro ximenez', 'moscatel', 'cava', 'champan', 'sidra', 'vermut', 'brandy', 'uva pasa', 'pasas', 'orejon', 'fruta desecada', 'mosto', 'sulfito', 'membrillo', 'salchicha', 'chorizo', 'cerveza'],
+  altramuces: ['altramuz', 'altramuces', 'chocho'],
+  moluscos: ['calamar', 'choco', 'sepia', 'pulpo', 'chipiron', 'puntillita', 'almeja', 'chirla', 'coquina', 'berberecho', 'mejillon', 'ostra', 'vieira', 'zamburiña', 'navaja', 'longueiron', 'caracol', 'bigaro', 'burgado', 'lapa', 'bocina', 'cañailla', 'cañadilla', 'volandeira', 'oreja de mar', 'pota'],
+};
+function dictAllergens(name) {
+  const n = ' ' + String(name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ ]+/g, ' ') + ' ';
+  const out = [];
+  for (const [k, words] of Object.entries(ALLERGEN_WORDS)) {
+    if (words.some((w) => n.includes(' ' + w.normalize('NFD').replace(/[\u0300-\u036f]/g, '')))) out.push(k);
+  }
+  // "fino" o "manzanilla" solo cuentan como vino si no son otra cosa evidente
+  if (out.includes('sulfitos') && /\b(manzanilla)\b/.test(n) && /\b(infusion|te|flor)\b/.test(n)) out.splice(out.indexOf('sulfitos'), 1);
+  return out;
+}
+
+async function aiAllergens(env, names) {
+  if (!env.AI || !names.length) return {};
+  const prompt = `Eres técnico de seguridad alimentaria en un restaurante de Cádiz (España). Para cada artículo de almacén, indica qué alérgenos de declaración obligatoria (Reglamento UE 1169/2011) contiene normalmente.
+Claves permitidas: ${ALLERGENS.join(', ')}.
+Responde SOLO con un objeto JSON cuyas claves sean los nombres exactamente como te los doy y cuyos valores sean listas de claves (lista vacía si no contiene ninguno). No añadas explicaciones.
+Artículos:
+${names.map((x) => '- ' + x).join('\n')}`;
+  try {
+    const out = await env.AI.run(env.ALLERGEN_MODEL || env.OCR_CF_MODEL || '@cf/meta/llama-4-scout-17b-16e-instruct', { messages: [{ role: 'user', content: prompt }], max_tokens: 2000 });
+    const obj = out && typeof out.response === 'object' ? out.response : JSON.parse(String(out?.response || '').match(/\{[\s\S]*\}/)?.[0] || '{}');
+    const res = {};
+    for (const [k, v] of Object.entries(obj || {})) if (Array.isArray(v)) res[k.trim().toLowerCase()] = v.map(String).filter((x) => ALLERGENS.includes(x));
+    return res;
+  } catch { return {}; }
+}
+
+// tablas de módulos posteriores que también entran en la copia
+const BACKUP_EXTRA = ['appcc_equipment', 'appcc_temps', 'appcc_tasks', 'appcc_cleaning'];
 
 // ---------- permisos ----------
 // El superusuario lo puede todo y decide con casillas qué puede hacer cada persona.
 const PERMS = [
   'panel.ver', 'informes.ver', 'costes.ver',
   'caja.registrar', 'caja.ver',
-  'pedidos.ver', 'pedidos.crear',
+  'pedidos.ver', 'pedidos.crear', 'pedidos.aprobar',
   'recepcion.ver', 'recepcion.crear', 'recepcion.anular',
   'mermas.registrar', 'mermas.ver_todas', 'mermas.borrar',
   'stock.ver', 'inventario.hacer',
-  'escandallos.ver', 'escandallos.editar',
+  'escandallos.ver', 'escandallos.editar', 'produccion.registrar',
   'productos.editar', 'ventas.gestionar', 'gastos.gestionar',
+  'appcc.registrar', 'appcc.gestionar',
 ];
 const TEMPLATES = {
-  sala: ['caja.registrar', 'mermas.registrar', 'escandallos.ver'],
-  cocina: ['pedidos.ver', 'pedidos.crear', 'recepcion.ver', 'recepcion.crear', 'mermas.registrar', 'mermas.ver_todas', 'stock.ver', 'inventario.hacer', 'escandallos.ver', 'escandallos.editar', 'productos.editar', 'costes.ver'],
+  sala: ['caja.registrar', 'mermas.registrar', 'escandallos.ver', 'appcc.registrar'],
+  cocina: ['pedidos.ver', 'pedidos.crear', 'recepcion.ver', 'recepcion.crear', 'mermas.registrar', 'mermas.ver_todas', 'stock.ver', 'inventario.hacer', 'escandallos.ver', 'escandallos.editar', 'produccion.registrar', 'productos.editar', 'costes.ver', 'appcc.registrar', 'appcc.gestionar'],
   direccion: PERMS,
 };
 const permsOf = (u) => {
@@ -89,20 +142,30 @@ async function body(request) {
 async function settings(env) {
   const { results } = await env.DB.prepare('SELECT key, value FROM settings').all();
   const s = Object.fromEntries(results.map((r) => [r.key, r.value]));
-  return { restaurant_name: s.restaurant_name || 'Mi restaurante', iva_pct: Number(s.iva_pct ?? 10), food_cost_target: Number(s.food_cost_target ?? 30) };
+  return { restaurant_name: s.restaurant_name || 'Mi restaurante', iva_pct: Number(s.iva_pct ?? 10), food_cost_target: Number(s.food_cost_target ?? 30),
+    misc_pct: Number(s.misc_pct ?? 3), last_backup: s.last_backup || null, expected_revenue: s.expected_revenue ? Number(s.expected_revenue) : null, qamarero_cols: s.qamarero_carta_cols ? JSON.parse(s.qamarero_carta_cols) : null };
 }
 
 // ---------- consultas reutilizables ----------
 const PRODUCTS_SQL = `
-  SELECT p.id, p.name, p.category, p.unit, p.price, p.supplier_id, p.min_stock, s.name AS supplier_name,
+  SELECT p.id, p.name, p.category, p.unit, p.price, p.supplier_id, p.min_stock, p.allergens, p.allergens_checked, p.prep_recipe_id, s.name AS supplier_name,
          COALESCE((SELECT SUM(m.qty) FROM movements m WHERE m.product_id = p.id), 0) AS stock
   FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id
   WHERE p.active = 1 ORDER BY p.category, p.name`;
 
+// Rendimiento de una línea: lo que queda tras limpiar y cocinar (máx. 95 % de pérdida en total)
+const YIELD_SQL = `MAX((1 - MIN(rl.waste_pct, 95) / 100.0) * (1 - MIN(COALESCE(rl.cook_loss_pct, 0), 95) / 100.0), 0.05)`;
+const lineYield = (l) => Math.max((1 - Math.min(l.waste_pct || 0, 95) / 100) * (1 - Math.min(l.cook_loss_pct || 0, 95) / 100), 0.05);
+
 const RECIPES_SQL = `
-  SELECT r.id, r.name, r.category, r.pvp, r.portions, r.pos_name, r.notes,
-         COALESCE(SUM(rl.qty / (1 - MIN(rl.waste_pct, 95) / 100.0) * p.price), 0) / NULLIF(r.portions, 0) AS cost,
-         COUNT(rl.id) AS n_lines
+  SELECT r.id, r.name, r.category, r.pvp, r.portions, r.pos_name, r.notes, r.allergens_extra,
+         COALESCE(r.kind, 'plato') AS kind, r.yield_qty, r.yield_unit, r.product_id,
+         COALESCE(SUM(rl.qty / ${YIELD_SQL} * p.price), 0) / NULLIF(r.portions, 0) AS raw_cost,
+         COALESCE(SUM(rl.qty / ${YIELD_SQL} * p.price), 0) / NULLIF(r.portions, 0)
+           * (1 + COALESCE(r.misc_pct, (SELECT CAST(value AS REAL) FROM settings WHERE key = 'misc_pct'), 0) / 100.0) AS cost,
+         COALESCE(r.misc_pct, (SELECT CAST(value AS REAL) FROM settings WHERE key = 'misc_pct'), 0) AS misc_pct,
+         COUNT(rl.id) AS n_lines, GROUP_CONCAT(p.allergens) AS ing_allergens, GROUP_CONCAT(rl.product_id) AS ing_products,
+         SUM(CASE WHEN rl.id IS NOT NULL AND COALESCE(p.allergens_checked, 0) = 0 THEN 1 ELSE 0 END) AS alg_unchecked
   FROM recipes r
   LEFT JOIN recipe_lines rl ON rl.recipe_id = r.id
   LEFT JOIN products p ON p.id = rl.product_id
@@ -113,13 +176,36 @@ async function recipePerPortion(env, recipeId) {
   const r = await env.DB.prepare('SELECT id, name, portions FROM recipes WHERE id = ? AND active = 1').bind(recipeId).first();
   if (!r) throw new HttpError(404, 'Plato no encontrado');
   const { results } = await env.DB.prepare(
-    `SELECT rl.product_id, rl.qty, rl.waste_pct, p.price, p.name, p.unit FROM recipe_lines rl JOIN products p ON p.id = rl.product_id WHERE rl.recipe_id = ?`
+    `SELECT rl.product_id, rl.qty, rl.waste_pct, rl.cook_loss_pct, p.price, p.name, p.unit FROM recipe_lines rl JOIN products p ON p.id = rl.product_id WHERE rl.recipe_id = ?`
   ).bind(recipeId).all();
   const portions = Number(r.portions) || 1;
   return {
     recipe: r,
-    lines: results.map((l) => ({ ...l, gross: l.qty / (1 - Math.min(l.waste_pct || 0, 95) / 100) / portions })),
+    lines: results.map((l) => ({ ...l, gross: l.qty / lineYield(l) / portions })),
   };
+}
+
+// Gastos fijos imputados a los platos en proporción a las ventas:
+// % = gastos fijos mensuales ÷ facturación mensual (sin IVA). A cada plato le toca ese % de su PVP sin IVA.
+async function fixedShare(env, st) {
+  const { results } = await env.DB.prepare('SELECT amount, frequency FROM fixed_costs WHERE active = 1').all();
+  const monthly = results.reduce((t, f) => t + f.amount / (f.frequency === 'anual' ? 12 : f.frequency === 'trimestral' ? 3 : 1), 0);
+  let revenue = st.expected_revenue, source = 'prevista', note = null;
+  if (!revenue) {
+    // media real: ventas (o caja) de los últimos 90 días, repartidas entre los días que cubren los datos
+    const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+    const days = (a, b) => (new Date(b + 'T12:00:00Z') - new Date(a + 'T12:00:00Z')) / 86400000 + 1;
+    const s = await env.DB.prepare(`SELECT SUM(s.revenue) AS v, MIN(si.date_from) AS d0, MAX(si.date_to) AS d1 FROM sales s JOIN sales_imports si ON si.id = s.import_id WHERE s.sale_date >= ?`).bind(since).first();
+    const c = await env.DB.prepare('SELECT SUM(cash + card + bizum + other) AS v, MIN(day) AS d0, MAX(day) AS d1 FROM cash_days WHERE day >= ?').bind(since).first();
+    const pick = (x, div, label) => {
+      if (!(x.v > 0)) return false;
+      const n = days(x.d0 < since ? since : x.d0, x.d1);
+      if (n < 14) { note = `solo hay ${Math.round(n)} días de ${label}; hacen falta al menos 14 o una facturación prevista en Ajustes`; return false; }
+      revenue = (x.v / div / n) * 30.4375; source = `${label} (últimos ${Math.round(n)} días)`; return true;
+    };
+    if (!pick(s, 1, 'ventas Qamarero')) pick(c, 1 + st.iva_pct / 100, 'caja real');
+  }
+  return { monthly, revenue: revenue || null, pct: revenue ? (monthly / revenue) * 100 : null, source: revenue ? source : null, note };
 }
 
 async function runBatch(env, stmts) {
@@ -180,7 +266,7 @@ async function syncFormats(env, productId, formats) {
 // ---------- CRUD genérico de maestros ----------
 const TABLES = {
   suppliers: { cols: ['name', 'contact', 'phone', 'email', 'order_days', 'notes', 'cif'], read: null, write: 'productos.editar', required: ['name'] },
-  products: { cols: ['name', 'category', 'unit', 'price', 'supplier_id', 'min_stock'], read: null, write: 'productos.editar', required: ['name', 'unit'] },
+  products: { cols: ['name', 'category', 'unit', 'price', 'supplier_id', 'min_stock', 'allergens', 'allergens_checked'], read: null, write: 'productos.editar', required: ['name', 'unit'] },
   fixed_costs: { cols: ['concept', 'category', 'amount', 'frequency', 'notes'], read: 'gastos.gestionar', write: 'gastos.gestionar', required: ['concept'] },
 };
 
@@ -190,7 +276,7 @@ function pick(obj, cols) {
   return out;
 }
 
-async function crud(table, id, method, request, env, user) {
+async function crud(table, id, method, request, env, user, ctx = {}) {
   const cfg = TABLES[table];
   if (method === 'GET') {
     if (cfg.read) need(user, cfg.read);
@@ -199,6 +285,9 @@ async function crud(table, id, method, request, env, user) {
   }
   need(user, cfg.write);
   if (method === 'DELETE') {
+    const old = await env.DB.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
+    if (table === 'products' && old?.prep_recipe_id) throw new HttpError(400, 'Este artículo es una elaboración: se gestiona desde Carta → Elaboraciones');
+    if (old) ctx.audit = { action: 'baja', summary: `Baja de ${ENTITY[table]} "${old.name || old.concept}"`, detail: old };
     await env.DB.prepare(`UPDATE ${table} SET active = 0 WHERE id = ?`).bind(id).run();
     return json({ ok: true });
   }
@@ -219,6 +308,11 @@ async function crud(table, id, method, request, env, user) {
   if (method === 'PUT') {
     const keys = Object.keys(data);
     if (!keys.length) return json({ ok: true });
+    const old = await env.DB.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
+    if (old) {
+      const changes = keys.filter((k) => String(old[k] ?? '') !== String(data[k] ?? '')).map((k) => `${k}: ${old[k] ?? '—'} → ${data[k] ?? '—'}`);
+      ctx.audit = { action: 'modificación', summary: `Modificación de ${ENTITY[table]} "${old.name || old.concept}"${changes.length ? ': ' + changes.join('; ').slice(0, 300) : ''}`, detail: old };
+    }
     try {
       await env.DB.prepare(`UPDATE ${table} SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`)
         .bind(...keys.map((k) => data[k]), id).run();
@@ -232,11 +326,28 @@ async function crud(table, id, method, request, env, user) {
 }
 
 // ---------- router ----------
-export async function onRequest({ request, env, params }) {
+export async function onRequest({ request, env, params, ctx: wctx }) {
   const url = new URL(request.url);
   const parts = Array.isArray(params.route) ? params.route : [params.route].filter(Boolean);
   try {
-    return await route(parts, request.method, request, env, url);
+    await ensureSchema(env);
+  } catch (e) {
+    console.error(e);
+    return json({ error: 'No se pudo preparar la base de datos: ' + e.message }, 500);
+  }
+  const ctx = { audit: null, user: null };
+  const mutating = !['GET', 'HEAD'].includes(request.method);
+  // copia del cuerpo para el registro de actividad (sin fotos ni archivos)
+  let raw = null;
+  if (mutating && !['ocr', 'backup'].includes(parts[0])) raw = await request.clone().text().catch(() => null);
+  try {
+    const res = await route(parts, request.method, request, env, url, ctx);
+    if (res.ok && (ctx.afterPrices || (mutating && ['products', 'receipts'].includes(parts[0])))) await refreshPrepCosts(env);
+    if (mutating && res.ok && ctx.user && ctx.audit !== false) {
+      const p = writeAudit(env, ctx, parts, request.method, raw).catch((e) => console.error('auditoría', e));
+      if (wctx?.waitUntil) wctx.waitUntil(p); else await p;
+    }
+    return res;
   } catch (e) {
     if (e instanceof HttpError) return json({ error: e.message }, e.status);
     console.error(e);
@@ -244,7 +355,46 @@ export async function onRequest({ request, env, params }) {
   }
 }
 
-async function route(parts, method, request, env, url) {
+// ---------- registro de actividad ----------
+const ENTITY = { products: 'artículo', suppliers: 'proveedor', fixed_costs: 'gasto fijo', users: 'usuario', orders: 'pedido', receipts: 'recepción',
+  movements: 'merma / consumo', inventory: 'inventario', recipes: 'plato', sales: 'ventas', 'pos-aliases': 'vínculo Qamarero', 'pos-pending': 'ventas pendientes',
+  settings: 'ajustes', cash: 'caja', allergens: 'alérgenos', appcc: 'APPCC', production: 'producción', backup: 'copia de seguridad', integrations: 'integración' };
+function cleanBody(raw) {
+  let d = null;
+  try { d = raw ? JSON.parse(raw) : null; } catch { return null; }
+  if (!d || typeof d !== 'object') return d;
+  const out = {};
+  for (const [k, v] of Object.entries(d)) {
+    if (['password', 'pass', 'photo', 'files'].includes(k)) out[k] = '(oculto)';
+    else if (Array.isArray(v) && v.length > 20) out[k] = `(${v.length} elementos)`;
+    else out[k] = v;
+  }
+  return out;
+}
+function describe(parts, method, d) {
+  const [a, b, c] = parts;
+  const ent = ENTITY[a] || a;
+  const name = d?.name || d?.concept || d?.delivery_note || '';
+  const verb = method === 'DELETE' ? 'baja' : method === 'POST' ? 'alta' : 'modificación';
+  if (b === 'bulk') return ['importación', ent, null, `Importación masiva de ${ent}s (${d?.items?.length ?? '?'} filas)`];
+  if (b === 'bulk-edit') return ['edición en lista', ent, null, `Edición en lista de ${ent}s (${d?.items?.length ?? '?'} cambiados)`];
+  if (a === 'orders' && c === 'status') return ['cambio de estado', ent, b, `Pedido #${b} → ${d?.status}`];
+  if (a === 'users' && method === 'PUT') return ['modificación', ent, b, `Usuario #${b}: ${Object.keys(d || {}).filter((k) => k !== 'password').join(', ')}${d?.password ? ' y contraseña' : ''}`];
+  if (a === 'settings' && b === 'api-key') return ['clave nueva', 'integración', null, 'Nueva clave para el volcado automático de ventas'];
+  if (a === 'login') return ['entrada', 'sesión', null, 'Inicio de sesión'];
+  return [verb, ent, b || null, `${verb[0].toUpperCase() + verb.slice(1)} de ${ent}${b ? ' #' + b : ''}${name ? ` "${name}"` : ''}`];
+}
+async function writeAudit(env, ctx, parts, method, raw) {
+  if (['logout', 'setup'].includes(parts[0])) return;
+  const d = cleanBody(raw);
+  let [action, entity, id, summary] = describe(parts, method, d);
+  const extra = ctx.audit || {};
+  await env.DB.prepare('INSERT INTO audit_log (user_id, user_name, action, entity, entity_id, summary, detail) VALUES (?,?,?,?,?,?,?)')
+    .bind(ctx.user.id, ctx.user.name, extra.action || action, extra.entity || entity, String(extra.id ?? id ?? '') || null, extra.summary || summary,
+      JSON.stringify({ datos: d, ...(extra.detail ? { antes: extra.detail } : {}) }).slice(0, 20000)).run();
+}
+
+async function route(parts, method, request, env, url, ctx = {}) {
   const [a, b, c] = parts;
 
   // --- arranque y sesión ---
@@ -264,8 +414,17 @@ async function route(parts, method, request, env, url) {
   }
   if (a === 'login' && method === 'POST') {
     const d = await body(request);
+    const ip = request.headers.get('cf-connecting-ip') || 'local';
+    const k = `${String(d.username || '').trim().toLowerCase()}|${ip}`;
+    const fails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM login_attempts WHERE k = ? AND at > datetime('now', '-15 minutes')`).bind(k).first();
+    if (fails.n >= 5) throw new HttpError(429, 'Demasiados intentos fallidos. Espera 15 minutos y vuelve a probar.');
     const u = await env.DB.prepare('SELECT * FROM users WHERE username = ? AND active = 1').bind(String(d.username || '').trim()).first();
-    if (!u || !(await checkPass(String(d.password || ''), u.pass))) throw new HttpError(401, 'Usuario o contraseña incorrectos');
+    if (!u || !(await checkPass(String(d.password || ''), u.pass))) {
+      await env.DB.batch([env.DB.prepare('INSERT INTO login_attempts (k) VALUES (?)').bind(k), env.DB.prepare(`DELETE FROM login_attempts WHERE at < datetime('now', '-1 day')`)]);
+      throw new HttpError(401, fails.n >= 3 ? `Usuario o contraseña incorrectos. Te quedan ${4 - fails.n} intento(s) antes de un bloqueo de 15 minutos.` : 'Usuario o contraseña incorrectos');
+    }
+    await env.DB.prepare('DELETE FROM login_attempts WHERE k = ?').bind(k).run();
+    ctx.user = { id: u.id, name: u.name };
     const token = toHex(crypto.getRandomValues(new Uint8Array(32)));
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`),
@@ -299,6 +458,80 @@ async function route(parts, method, request, env, url) {
 
   const user = await getUser(request, env);
   if (!user) throw new HttpError(401, 'Sesión caducada. Vuelve a entrar.');
+  ctx.user = user;
+  // las consultas masivas de lectura no se registran
+  if (a === 'allergens' || (a === 'sales' && b === 'match')) ctx.audit = false;
+
+  // --- registro de actividad ---
+  if (a === 'audit') {
+    need(user, 'super');
+    const q = url.searchParams;
+    const where = [], binds = [];
+    if (q.get('user')) { where.push('user_id = ?'); binds.push(Number(q.get('user'))); }
+    if (q.get('entity')) { where.push('entity = ?'); binds.push(q.get('entity')); }
+    if (isDate(q.get('from'))) { where.push('at >= ?'); binds.push(q.get('from')); }
+    if (isDate(q.get('to'))) { where.push("at < date(?, '+1 day')"); binds.push(q.get('to')); }
+    if (q.get('q')) { where.push('summary LIKE ?'); binds.push('%' + q.get('q') + '%'); }
+    const { results } = await env.DB.prepare(`SELECT id, at, user_id, user_name, action, entity, entity_id, summary FROM audit_log ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT 300`).bind(...binds).all();
+    return json(results);
+  }
+  if (a === 'audit-detail' && b) {
+    need(user, 'super');
+    return json(await env.DB.prepare('SELECT * FROM audit_log WHERE id = ?').bind(b).first());
+  }
+
+  // --- copias de seguridad (por partes, para no pasar el límite de CPU del plan gratuito) ---
+  if (a === 'backup') {
+    need(user, 'super');
+    const TABLES_ORDER = ['settings', 'users', 'suppliers', 'products', 'product_formats', 'price_history', 'orders', 'order_lines', 'receipts', 'receipt_lines',
+      'movements', 'inventories', 'inventory_lines', 'recipes', 'recipe_lines', 'sales_imports', 'sales', 'pos_aliases', 'pos_pending', 'fixed_costs', 'cash_days',
+      'ocr_scans', 'ocr_aliases', 'audit_log', ...BACKUP_EXTRA];
+    const existing = new Set((await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all()).results.map((r) => r.name));
+    const tables = TABLES_ORDER.filter((t) => existing.has(t));
+    if (!b) {
+      const counts = {};
+      for (const t of tables) counts[t] = (await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${t}`).first()).n;
+      ctx.audit = false;
+      return json({ version: SCHEMA_VERSION, tables, counts });
+    }
+    if (b === 'table' && tables.includes(c) && method === 'GET') {
+      ctx.audit = false;
+      const off = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
+      const { results } = await env.DB.prepare(`SELECT * FROM ${c} LIMIT 500 OFFSET ?`).bind(off).all();
+      return json(results);
+    }
+    if (b === 'done' && method === 'POST') {
+      await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('last_backup', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run();
+      ctx.audit = { action: 'descarga', entity: 'copia de seguridad', summary: 'Descarga de copia de seguridad completa' };
+      return json({ ok: true });
+    }
+    if (b === 'restore' && method === 'POST') {
+      const d = await body(request);
+      if (d.confirm !== 'RESTAURAR') throw new HttpError(400, 'Falta la confirmación');
+      if (d.wipe) {
+        // se vacía todo menos las sesiones, para no echar al que restaura
+        const stmts = tables.slice().reverse().filter((t) => t !== 'users').map((t) => env.DB.prepare(`DELETE FROM ${t}`));
+        await runBatch(env, stmts);
+        ctx.audit = { action: 'restauración', entity: 'copia de seguridad', summary: `Restauración de copia de seguridad del ${String(d.created_at || '').slice(0, 16)}` };
+        return json({ ok: true });
+      }
+      if (d.finish) {
+        // usuarios que no estaban en la copia: fuera (salvo quien está restaurando)
+        const ids = (d.user_ids || []).map(Number).filter(Boolean);
+        if (ids.length) await env.DB.prepare(`DELETE FROM users WHERE id NOT IN (${ids.map(() => '?').join(',')}) AND id <> ?`).bind(...ids, user.id).run();
+        await env.DB.prepare(`UPDATE users SET is_super = 1, active = 1 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM users WHERE is_super = 1 AND active = 1)`).bind(user.id).run();
+        ctx.audit = false;
+        return json({ ok: true });
+      }
+      if (!tables.includes(d.table)) throw new HttpError(400, 'Tabla desconocida: ' + d.table);
+      const rows = Array.isArray(d.rows) ? d.rows : [];
+      const cols = (await env.DB.prepare(`PRAGMA table_info(${d.table})`).all()).results.map((r) => r.name);
+      const stmts = rows.map((r) => { const ks = cols.filter((k) => k in r); return env.DB.prepare(`INSERT OR REPLACE INTO ${d.table} (${ks.join(',')}) VALUES (${ks.map(() => '?').join(',')})`).bind(...ks.map((k) => r[k])); });
+      await runBatch(env, stmts);
+      ctx.audit = false;
+      return json({ ok: true, count: rows.length });
+    }
+  }
 
   // --- datos iniciales para la app ---
   if (a === 'bootstrap') {
@@ -312,10 +545,11 @@ async function route(parts, method, request, env, url) {
     let products = prod.results, recipes = rec.results, formats = fmt.results;
     if (!can(user, 'costes.ver')) {
       products = products.map(({ price, ...p }) => p);
-      recipes = recipes.map(({ cost, ...r }) => r);
+      recipes = recipes.map(({ cost, raw_cost, ...r }) => r);
       formats = formats.map(({ price, ...f }) => f);
     }
-    return json({ user, settings: st, suppliers: sup.results, products, recipes, formats });
+    const fixed = can(user, 'costes.ver') ? await fixedShare(env, st) : null;
+    return json({ user, settings: { ...st, qamarero_cols: undefined, has_qamarero_format: !!st.qamarero_cols }, suppliers: sup.results, products, recipes, formats, fixed, allergens: ALLERGENS });
   }
 
   // --- vínculos Qamarero -> plato ---
@@ -393,7 +627,7 @@ async function route(parts, method, request, env, url) {
   if (a === 'settings' && method === 'PUT') {
     need(user, 'super');
     const d = await body(request);
-    const stmts = ['restaurant_name', 'iva_pct', 'food_cost_target'].filter((k) => k in d)
+    const stmts = ['restaurant_name', 'iva_pct', 'food_cost_target', 'misc_pct', 'expected_revenue'].filter((k) => k in d)
       .map((k) => env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, String(d[k])));
     if (stmts.length) await env.DB.batch(stmts);
     return json({ ok: true });
@@ -401,24 +635,44 @@ async function route(parts, method, request, env, url) {
 
   // --- maestros ---
   if (a === 'products' && b === 'bulk' && method === 'POST') return productsBulk(request, env, user);
+  if (a === 'products' && b === 'bulk-edit' && method === 'PUT') return productsBulkEdit(request, env, user);
+  if (a === 'allergens' && b === 'suggest' && method === 'POST') {
+    need(user, 'productos.editar');
+    const d = await body(request);
+    const ids = (d.ids || []).map(Number).filter(Boolean);
+    const { results } = await env.DB.prepare(`SELECT id, name, allergens, allergens_checked FROM products WHERE active = 1 ${ids.length ? `AND id IN (${ids.map(() => '?').join(',')})` : 'AND COALESCE(allergens_checked, 0) = 0'} ORDER BY name LIMIT 300`).bind(...ids).all();
+    const rows = results.map((p) => ({ id: p.id, name: p.name, current: String(p.allergens || '').split(',').filter(Boolean), checked: !!p.allergens_checked, dict: dictAllergens(p.name), ai: null }));
+    let aiUsed = false;
+    if (d.use_ai !== false) {
+      const ask = rows.filter((r) => !r.dict.length).map((r) => r.name);
+      for (let i = 0; i < ask.length; i += 40) {
+        const got = await aiAllergens(env, ask.slice(i, i + 40));
+        if (Object.keys(got).length) aiUsed = true;
+        rows.forEach((r) => { if (r.name.toLowerCase() in got) r.ai = got[r.name.toLowerCase()]; });
+      }
+    }
+    return json({ rows, ai: !!env.AI, ai_used: aiUsed });
+  }
+  if (a === 'recipes' && b === 'bulk-edit' && method === 'PUT') return recipesBulkEdit(request, env, user);
+  if (a === 'recipes' && b === 'export') return recipesExport(env, user);
   if (a === 'suppliers' && b === 'bulk' && method === 'POST') return suppliersBulk(request, env, user);
   if (a === 'products' && (method === 'POST' || method === 'PUT')) {
     const d = await request.clone().json().catch(() => ({}));
     if (d.unit && !['kg', 'l', 'ud'].includes(d.unit)) throw new HttpError(400, 'La unidad base debe ser kg, l o ud. Las cajas, botellas o sacos se añaden como formatos.');
-    const res = await crud(a, b, method, request, env, user);
+    const res = await crud(a, b, method, request, env, user, ctx);
     if (res.ok && Array.isArray(d.formats)) {
       const id = method === 'POST' ? (await res.clone().json()).id : Number(b);
       await syncFormats(env, id, d.formats);
     }
     return res;
   }
-  if (TABLES[a]) return crud(a, b, method, request, env, user);
+  if (TABLES[a]) return crud(a, b, method, request, env, user, ctx);
 
   // --- usuarios y permisos (solo superusuario) ---
   if (a === 'users') {
     need(user, 'super');
     if (method === 'GET') {
-      const { results } = await env.DB.prepare('SELECT id, name, username, role, active, is_super, perms FROM users ORDER BY active DESC, is_super DESC, name').all();
+      const { results } = await env.DB.prepare('SELECT id, name, username, role, active, is_super, perms, phone, email FROM users ORDER BY active DESC, is_super DESC, name').all();
       return json({ users: results.map((u) => ({ ...u, is_super: !!u.is_super, perms: permsOf(u) })), perms: PERMS, templates: TEMPLATES });
     }
     const d = await body(request);
@@ -427,8 +681,8 @@ async function route(parts, method, request, env, url) {
     if (method === 'POST') {
       if (!d.name || !d.username || String(d.password || '').length < 6) throw new HttpError(400, 'Nombre, usuario y contraseña (mín. 6 caracteres)');
       try {
-        const r = await env.DB.prepare('INSERT INTO users (name, username, pass, role, is_super, perms) VALUES (?,?,?,?,?,?) RETURNING id')
-          .bind(d.name, d.username.trim(), await hashPass(d.password), d.role || 'sala', d.is_super ? 1 : 0, perms ?? JSON.stringify(TEMPLATES[d.role || 'sala'])).first();
+        const r = await env.DB.prepare('INSERT INTO users (name, username, pass, role, is_super, perms, phone, email) VALUES (?,?,?,?,?,?,?,?) RETURNING id')
+          .bind(d.name, d.username.trim(), await hashPass(d.password), d.role || 'sala', d.is_super ? 1 : 0, perms ?? JSON.stringify(TEMPLATES[d.role || 'sala']), String(d.phone || '').trim() || null, String(d.email || '').trim() || null).first();
         return json({ id: r.id });
       } catch (e) {
         if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Ese nombre de usuario ya existe');
@@ -445,6 +699,8 @@ async function route(parts, method, request, env, url) {
       }
       const sets = [], vals = [];
       if (d.name) { sets.push('name = ?'); vals.push(d.name); }
+      if ('phone' in d) { sets.push('phone = ?'); vals.push(String(d.phone || '').trim() || null); }
+      if ('email' in d) { sets.push('email = ?'); vals.push(String(d.email || '').trim() || null); }
       if (d.role) { sets.push('role = ?'); vals.push(d.role); }
       if (d.active === 0 || d.active === 1) { sets.push('active = ?'); vals.push(d.active); }
       if (typeof d.is_super === 'boolean') { sets.push('is_super = ?'); vals.push(d.is_super ? 1 : 0); }
@@ -460,6 +716,11 @@ async function route(parts, method, request, env, url) {
   }
 
   // --- pedidos ---
+  if (a === 'orders' && b === 'suggest' && method === 'GET') {
+    need(user, 'pedidos.crear');
+    ctx.audit = false;
+    return json(await suggestOrder(env, Number(url.searchParams.get('supplier_id')), Math.min(Math.max(Number(url.searchParams.get('days')) || 3, 1), 30)));
+  }
   if (a === 'orders') {
     need(user, method === 'GET' ? ['pedidos.ver', 'pedidos.crear'] : 'pedidos.crear');
     if (method === 'GET' && !b) {
@@ -468,44 +729,78 @@ async function route(parts, method, request, env, url) {
                 (SELECT SUM(qty * COALESCE(price, 0)) FROM order_lines WHERE order_id = o.id) AS total,
                 (SELECT COUNT(*) FROM order_lines WHERE order_id = o.id) AS n_lines
          FROM orders o JOIN suppliers s ON s.id = o.supplier_id LEFT JOIN users u ON u.id = o.user_id
-         ORDER BY CASE o.status WHEN 'enviado' THEN 0 WHEN 'borrador' THEN 1 ELSE 2 END, o.id DESC LIMIT 200`
+         ORDER BY CASE o.status WHEN 'pendiente' THEN 0 WHEN 'enviado' THEN 1 WHEN 'borrador' THEN 2 ELSE 3 END, o.id DESC LIMIT 200`
       ).all();
       return json(results);
     }
+    if (method === 'GET' && b === 'approvers') return json(await approvers(env, user.id));
     if (method === 'GET' && b) {
       const o = await env.DB.prepare(
-        `SELECT o.*, s.name AS supplier_name, s.phone, s.email, s.contact FROM orders o JOIN suppliers s ON s.id = o.supplier_id WHERE o.id = ?`
+        `SELECT o.*, s.name AS supplier_name, s.phone, s.email, s.contact, u.name AS user_name, ap.name AS approved_by_name
+         FROM orders o JOIN suppliers s ON s.id = o.supplier_id LEFT JOIN users u ON u.id = o.user_id LEFT JOIN users ap ON ap.id = o.approved_by WHERE o.id = ?`
       ).bind(b).first();
       if (!o) throw new HttpError(404, 'Pedido no encontrado');
       const { results } = await env.DB.prepare(
         `SELECT ol.*, p.name, p.unit FROM order_lines ol JOIN products p ON p.id = ol.product_id WHERE ol.order_id = ? ORDER BY p.name`
       ).bind(b).all();
-      return json({ ...o, lines: results });
+      return json({ ...o, lines: results, can_edit: canEditOrder(user, o), can_approve: can(user, 'pedidos.aprobar') });
     }
-    if (method === 'POST' && !b) {
+    if ((method === 'POST' && !b) || (method === 'PUT' && b && !c)) {
       const d = await body(request);
       const lines = (d.lines || []).filter((l) => l.product_id && Number(l.qty) > 0);
-      if (!d.supplier_id || !lines.length) throw new HttpError(400, 'Elige proveedor y al menos un producto');
+      if (!d.supplier_id || !lines.length) throw new HttpError(400, 'Elige proveedor y al menos un artículo');
+      let prev = null;
+      if (method === 'PUT') {
+        prev = await env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(b).first();
+        if (!prev) throw new HttpError(404, 'Pedido no encontrado');
+        if (!canEditOrder(user, prev)) throw new HttpError(403, prev.status === 'enviado' || prev.status === 'recibido' ? 'Este pedido ya se envió al proveedor y no se puede cambiar' : 'No puedes cambiar este pedido');
+      }
+      // quien no puede aprobar deja el pedido pendiente de aprobación
+      const approver = can(user, 'pedidos.aprobar');
+      const status = d.status === 'borrador' ? 'borrador' : approver ? (d.status === 'pendiente' ? 'pendiente' : 'enviado') : 'pendiente';
       const { pmap, fmap } = await unitCtx(env, lines.map((l) => l.product_id));
       const rows = lines.map((l) => {
         const p = pmap[l.product_id];
-        if (!p) throw new HttpError(400, 'Producto no encontrado');
+        if (!p) throw new HttpError(400, 'Artículo no encontrado');
         const u = unitInfo(p, l.unit, fmap);
         return { p, qty: Number(l.qty), base: Number(l.qty) * u.factor, unit: l.unit || p.unit, label: u.label };
       });
-      const o = await env.DB.prepare(
-        `INSERT INTO orders (supplier_id, status, order_date, expected_date, notes, user_id) VALUES (?,?,?,?,?,?) RETURNING id`
-      ).bind(d.supplier_id, d.status === 'borrador' ? 'borrador' : 'enviado', todayStr(), d.expected_date || null, d.notes || null, user.id).first();
-      await runBatch(env, rows.map((r) => env.DB.prepare(
+      const appr = status === 'enviado' ? [user.id] : [null];
+      let o;
+      if (prev) {
+        o = { id: Number(b) };
+        await env.DB.prepare(`UPDATE orders SET supplier_id = ?, status = ?, expected_date = ?, notes = ?, approved_by = ?, approved_at = CASE WHEN ? IS NOT NULL THEN datetime('now') END WHERE id = ?`)
+          .bind(d.supplier_id, status, d.expected_date || null, d.notes || null, appr[0], appr[0], o.id).run();
+        const old = (await env.DB.prepare('SELECT ol.input_qty, ol.unit_label, p.name FROM order_lines ol JOIN products p ON p.id = ol.product_id WHERE ol.order_id = ?').bind(o.id).all()).results;
+        ctx.audit = { action: 'modificación', id: o.id, summary: `Pedido #${o.id} modificado por ${user.name}${status === 'enviado' ? ' y aprobado' : ''}`, detail: { antes: old } };
+      } else {
+        o = await env.DB.prepare(
+          `INSERT INTO orders (supplier_id, status, order_date, expected_date, notes, user_id, approved_by, approved_at) VALUES (?,?,?,?,?,?,?, CASE WHEN ? IS NOT NULL THEN datetime('now') END) RETURNING id`
+        ).bind(d.supplier_id, status, todayStr(), d.expected_date || null, d.notes || null, user.id, appr[0], appr[0]).first();
+      }
+      const stmts = prev ? [env.DB.prepare('DELETE FROM order_lines WHERE order_id = ?').bind(o.id)] : [];
+      stmts.push(...rows.map((r) => env.DB.prepare(
         `INSERT INTO order_lines (order_id, product_id, qty, price, input_qty, input_unit, unit_label) VALUES (?,?,?,?,?,?,?)`
       ).bind(o.id, r.p.id, r2(r.base), r.p.price, r.qty, r.unit, r.label)));
-      return json({ id: o.id });
+      await runBatch(env, stmts);
+      return json({ id: o.id, status, approvers: status === 'pendiente' ? await approvers(env, user.id) : [] });
     }
     if (method === 'PUT' && b && c === 'status') {
       const d = await body(request);
-      if (!['borrador', 'enviado', 'cancelado'].includes(d.status)) throw new HttpError(400, 'Estado no válido');
-      await env.DB.prepare('UPDATE orders SET status = ? WHERE id = ?').bind(d.status, b).run();
-      return json({ ok: true });
+      const o = await env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(b).first();
+      if (!o) throw new HttpError(404, 'Pedido no encontrado');
+      if (!['borrador', 'pendiente', 'enviado', 'cancelado'].includes(d.status)) throw new HttpError(400, 'Estado no válido');
+      const approver = can(user, 'pedidos.aprobar');
+      if (d.status === 'enviado' && !approver) throw new HttpError(403, 'Solo quien aprueba pedidos puede enviarlos al proveedor');
+      if (!approver && o.user_id !== user.id) throw new HttpError(403, 'Solo puedes cambiar tus propios pedidos');
+      if (['recibido', 'cancelado'].includes(o.status)) throw new HttpError(400, 'Este pedido ya está cerrado');
+      const reason = String(d.reason || '').trim();
+      await env.DB.prepare(`UPDATE orders SET status = ?, approved_by = CASE WHEN ? = 'enviado' THEN ? ELSE approved_by END, approved_at = CASE WHEN ? = 'enviado' THEN datetime('now') ELSE approved_at END,
+        notes = CASE WHEN ? <> '' THEN COALESCE(notes || char(10), '') || ? ELSE notes END WHERE id = ?`)
+        .bind(d.status, d.status, user.id, d.status, reason, `Rechazado por ${user.name}: ${reason}`, b).run();
+      ctx.audit = { action: d.status === 'enviado' ? 'aprobación' : d.status === 'cancelado' ? 'cancelación' : 'cambio de estado', id: b,
+        summary: `Pedido #${b}: ${d.status === 'enviado' ? 'aprobado y enviado al proveedor' : d.status === 'cancelado' ? 'cancelado' + (reason ? ' (' + reason + ')' : '') : d.status === 'pendiente' ? 'enviado a aprobación' : d.status}` };
+      return json({ ok: true, approvers: d.status === 'pendiente' ? await approvers(env, user.id) : [] });
     }
   }
 
@@ -530,15 +825,16 @@ async function route(parts, method, request, env, url) {
     if (method === 'POST') {
       const d = await body(request);
       const lines = (d.lines || []).filter((l) => l.product_id && Number(l.qty) > 0);
-      if (!d.supplier_id || !lines.length) throw new HttpError(400, 'Falta proveedor o productos');
+      if (!d.supplier_id || !lines.length) throw new HttpError(400, 'Falta proveedor o artículos');
       const date = isDate(d.receipt_date) ? d.receipt_date : todayStr();
       const docType = d.doc_type === 'factura' ? 'factura' : 'albaran';
       const { pmap, fmap } = await unitCtx(env, lines.map((l) => l.product_id));
-      for (const l of lines) if (!pmap[l.product_id]) throw new HttpError(400, 'Producto no encontrado');
+      for (const l of lines) if (!pmap[l.product_id]) throw new HttpError(400, 'Artículo no encontrado');
       const total = lines.reduce((s, l) => s + Number(l.qty) * Number(l.price || 0), 0); // cantidad × precio en la unidad escrita
       const rec = await env.DB.prepare(
-        `INSERT INTO receipts (supplier_id, order_id, doc_type, delivery_note, receipt_date, total, notes, user_id) VALUES (?,?,?,?,?,?,?,?) RETURNING id`
-      ).bind(d.supplier_id, d.order_id || null, docType, d.delivery_note || null, date, r2(total), d.notes || null, user.id).first();
+        `INSERT INTO receipts (supplier_id, order_id, doc_type, delivery_note, receipt_date, total, notes, rec_temp, rec_check, user_id) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id`
+      ).bind(d.supplier_id, d.order_id || null, docType, d.delivery_note || null, date, r2(total), d.notes || null,
+        d.rec_temp === '' || d.rec_temp == null || isNaN(Number(d.rec_temp)) ? null : Number(d.rec_temp), d.rec_check == null ? null : d.rec_check ? 1 : 0, user.id).first();
       const docLabel = `${docType === 'factura' ? 'Factura' : 'Albarán'} ${d.delivery_note || '#' + rec.id}`;
 
       const stmts = [], priceChanges = [], seen = new Set();
@@ -548,8 +844,8 @@ async function route(parts, method, request, env, url) {
         const inQty = Number(l.qty), inPrice = Number(l.price || 0);
         const qty = r2(inQty * u.factor), price = r2(inPrice / u.factor); // a unidad base
         const grp = uuid();
-        stmts.push(env.DB.prepare(`INSERT INTO receipt_lines (receipt_id, product_id, qty, price, ordered_qty, input_qty, input_unit, unit_label, input_price) VALUES (?,?,?,?,?,?,?,?,?)`)
-          .bind(rec.id, p.id, qty, price, l.ordered_qty ?? null, inQty, l.unit || p.unit, u.label, inPrice));
+        stmts.push(env.DB.prepare(`INSERT INTO receipt_lines (receipt_id, product_id, qty, price, ordered_qty, input_qty, input_unit, unit_label, input_price, lot, expiry) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+          .bind(rec.id, p.id, qty, price, l.ordered_qty ?? null, inQty, l.unit || p.unit, u.label, inPrice, String(l.lot || '').trim() || null, isDate(l.expiry) ? l.expiry : null));
         if (u.format && inPrice > 0) stmts.push(env.DB.prepare('UPDATE product_formats SET price = ? WHERE id = ?').bind(inPrice, u.format.id));
         if (seen.has(p.id)) { stmts.push(env.DB.prepare(
           `INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`
@@ -566,6 +862,7 @@ async function route(parts, method, request, env, url) {
         }
       }
       if (d.order_id) stmts.push(env.DB.prepare(`UPDATE orders SET status = 'recibido' WHERE id = ?`).bind(d.order_id));
+      ctx.afterPrices = true;
       // lo que venía de un escaneo: recordar qué producto es cada línea de este proveedor
       for (const l of lines) {
         if (!l.source) continue;
@@ -581,6 +878,8 @@ async function route(parts, method, request, env, url) {
     }
     if (method === 'DELETE' && b) {
       need(user, 'recepcion.anular');
+      const old = await env.DB.prepare('SELECT r.*, s.name AS supplier FROM receipts r JOIN suppliers s ON s.id = r.supplier_id WHERE r.id = ?').bind(b).first();
+      if (old) ctx.audit = { action: 'anulación', summary: `Anulación de ${old.doc_type === 'factura' ? 'factura' : 'albarán'} ${old.delivery_note || '#' + old.id} de ${old.supplier} (${old.total} €)`, detail: old };
       await env.DB.batch([
         env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'albaran' AND ref_id = ?`).bind(b),
         env.DB.prepare('DELETE FROM receipt_lines WHERE receipt_id = ?').bind(b),
@@ -627,7 +926,7 @@ async function route(parts, method, request, env, url) {
       } else {
         const { pmap, fmap } = await unitCtx(env, [d.product_id]);
         const p = pmap[d.product_id];
-        if (!p) throw new HttpError(400, 'Producto no encontrado');
+        if (!p) throw new HttpError(400, 'Artículo no encontrado');
         const u = unitInfo(p, d.unit, fmap);
         stmts.push(ins(p.id, qty * u.factor, p.price, `${p.name} · ${qty} ${u.label}`));
       }
@@ -639,6 +938,8 @@ async function route(parts, method, request, env, url) {
       const m = await env.DB.prepare('SELECT grp, type, user_id, created_at FROM movements WHERE id = ?').bind(b).first();
       if (!m || !['merma', 'consumo_personal'].includes(m.type)) throw new HttpError(404, 'Registro no encontrado');
       if (!can(user, 'mermas.borrar') && m.user_id !== user.id) throw new HttpError(403, 'Solo puedes borrar tus propios registros');
+      const g = await env.DB.prepare(`SELECT MAX(m.label) AS label, m.type, m.mov_date, m.reason, -SUM(m.qty * m.unit_cost) AS value, u.name AS who FROM movements m LEFT JOIN users u ON u.id = m.user_id WHERE m.grp = ? GROUP BY m.grp`).bind(m.grp).first();
+      ctx.audit = { action: 'borrado', summary: `Borrado de ${g.type === 'merma' ? 'merma' : 'consumo de personal'}: ${g.label} (${g.mov_date}, registrado por ${g.who || '?'}, ${Math.round((g.value || 0) * 100) / 100} €)`, detail: g };
       await env.DB.prepare('DELETE FROM movements WHERE grp = ?').bind(m.grp).run();
       return json({ ok: true });
     }
@@ -656,7 +957,7 @@ async function route(parts, method, request, env, url) {
     if (method === 'POST') {
       const d = await body(request);
       const counts = (d.counts || []).filter((x) => x.product_id && x.counted !== '' && x.counted !== null && !isNaN(Number(x.counted)));
-      if (!counts.length) throw new HttpError(400, 'No has contado ningún producto');
+      if (!counts.length) throw new HttpError(400, 'No has contado ningún artículo');
       const date = isDate(d.date) ? d.date : todayStr();
       const { results: prods } = await env.DB.prepare(PRODUCTS_SQL).all();
       const pmap = Object.fromEntries(prods.map((p) => [p.id, p]));
@@ -699,36 +1000,108 @@ async function route(parts, method, request, env, url) {
       need(user, 'escandallos.editar');
       const d = await body(request);
       if (!d.name) throw new HttpError(400, 'Pon nombre al plato');
-      const vals = [d.name.trim(), d.category || null, Number(d.pvp) || 0, Number(d.portions) || 1, d.pos_name || null, d.notes || null];
+      const isPrep = d.kind === 'elaboracion';
+      if (isPrep && !(Number(d.yield_qty) > 0)) throw new HttpError(400, 'Indica cuánto produce la elaboración (por ejemplo 5 l)');
+      if (isPrep && !['kg', 'l', 'ud'].includes(d.yield_unit)) throw new HttpError(400, 'La elaboración se mide en kg, l o ud');
+      if (d.photo && String(d.photo).length > 400000) throw new HttpError(400, 'La foto es demasiado grande');
+      const txt = (x) => (x == null || String(x).trim() === '' ? null : String(x));
+      const cols = ['name', 'category', 'pvp', 'portions', 'pos_name', 'notes', 'plating', 'conservation', 'prep_time', 'misc_pct', 'allergens_extra', 'photo', 'author', 'kind', 'yield_qty', 'yield_unit'];
+      const vals = [d.name.trim(), txt(d.category), isPrep ? 0 : Number(d.pvp) || 0, isPrep ? 1 : Number(d.portions) || 1, txt(d.pos_name), txt(d.notes), txt(d.plating), txt(d.conservation), txt(d.prep_time),
+        d.misc_pct === '' || d.misc_pct == null || isNaN(Number(d.misc_pct)) ? null : Math.min(Math.max(Number(d.misc_pct), 0), 50),
+        Array.isArray(d.allergens_extra) ? d.allergens_extra.filter((a) => ALLERGENS.includes(a)).join(',') : txt(d.allergens_extra), d.photo === undefined ? undefined : txt(d.photo), txt(d.author) || user.name,
+        method === 'POST' || d.kind ? (isPrep ? 'elaboracion' : 'plato') : undefined, isPrep ? Number(d.yield_qty) : null, isPrep ? d.yield_unit : null];
+      const use = cols.map((c, i) => [c, vals[i]]).filter(([, v]) => v !== undefined);
       let id = b;
       try {
         if (method === 'POST') {
-          id = (await env.DB.prepare('INSERT INTO recipes (name, category, pvp, portions, pos_name, notes) VALUES (?,?,?,?,?,?) RETURNING id').bind(...vals).first()).id;
+          id = (await env.DB.prepare(`INSERT INTO recipes (${use.map((x) => x[0]).join(',')}) VALUES (${use.map(() => '?').join(',')}) RETURNING id`).bind(...use.map((x) => x[1])).first()).id;
         } else {
-          await env.DB.prepare('UPDATE recipes SET name=?, category=?, pvp=?, portions=?, pos_name=?, notes=?, active=1 WHERE id=?').bind(...vals, id).run();
+          await env.DB.prepare(`UPDATE recipes SET ${use.map((x) => x[0] + ' = ?').join(', ')}, active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(...use.map((x) => x[1]), id).run();
         }
       } catch (e) {
-        if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Ya existe un plato con ese nombre');
+        if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Ya existe un plato o elaboración con ese nombre');
         throw e;
       }
+      // la elaboración tiene su artículo en Existencias (para su stock y para usarla como ingrediente)
+      if (isPrep) await ensurePrepProduct(env, id, d.name.trim(), d.yield_unit, txt(d.category));
+      const own = (await env.DB.prepare('SELECT product_id FROM recipes WHERE id = ?').bind(id).first())?.product_id;
       if (Array.isArray(d.lines)) {
-        const valid = d.lines.filter((l) => l.product_id && Number(l.qty) > 0);
+        const valid = d.lines.filter((l) => l.product_id && Number(l.qty) > 0 && Number(l.product_id) !== own);
         const { pmap, fmap } = await unitCtx(env, valid.map((l) => l.product_id));
         const stmts = [env.DB.prepare('DELETE FROM recipe_lines WHERE recipe_id = ?').bind(id)];
         for (const l of valid) {
           const p = pmap[l.product_id];
           if (!p) continue;
           const u = unitInfo(p, l.unit, fmap);
-          stmts.push(env.DB.prepare('INSERT INTO recipe_lines (recipe_id, product_id, qty, waste_pct, input_qty, input_unit) VALUES (?,?,?,?,?,?)')
-            .bind(id, p.id, Number(l.qty) * u.factor, Math.min(Math.max(Number(l.waste_pct) || 0, 0), 95), Number(l.qty), l.unit || p.unit));
+          const pct = (x) => Math.min(Math.max(Number(x) || 0, 0), 95);
+          stmts.push(env.DB.prepare('INSERT INTO recipe_lines (recipe_id, product_id, qty, waste_pct, cook_loss_pct, input_qty, input_unit) VALUES (?,?,?,?,?,?,?)')
+            .bind(id, p.id, Number(l.qty) * u.factor, pct(l.waste_pct), pct(l.cook_loss_pct), Number(l.qty), l.unit || p.unit));
         }
         await runBatch(env, stmts);
       }
+      await refreshPrepCosts(env);
       return json({ id });
     }
     if (method === 'DELETE' && b) {
       need(user, 'escandallos.editar');
+      const old = await env.DB.prepare('SELECT id, name, pvp, kind, product_id FROM recipes WHERE id = ?').bind(b).first();
+      if (old) ctx.audit = { action: 'baja', summary: `Baja ${old.kind === 'elaboracion' ? 'de la elaboración' : 'del plato'} "${old.name}"`, detail: old };
+      if (old?.kind === 'elaboracion' && old.product_id) {
+        const used = await env.DB.prepare(`SELECT r.name FROM recipe_lines rl JOIN recipes r ON r.id = rl.recipe_id AND r.active = 1 WHERE rl.product_id = ? AND r.id <> ? LIMIT 3`).bind(old.product_id, b).all();
+        if (used.results.length) throw new HttpError(400, `No se puede borrar: la usan ${used.results.map((x) => x.name).join(', ')}`);
+        await env.DB.prepare('UPDATE products SET active = 0 WHERE id = ?').bind(old.product_id).run();
+      }
       await env.DB.prepare('UPDATE recipes SET active = 0 WHERE id = ?').bind(b).run();
+      return json({ ok: true });
+    }
+  }
+
+  // --- APPCC ---
+  if (a === 'appcc') return appcc(env, user, ctx, method, b, c, request, url);
+
+  // --- avisos y resumen semanal ---
+  if (a === 'alerts' && method === 'GET') { ctx.audit = false; return json(await alerts(env, user)); }
+  if (a === 'summary' && method === 'GET') { need(user, 'panel.ver'); return json(await weeklySummary(env, url.searchParams.get('end'))); }
+
+  // --- producción de elaboraciones ---
+  if (a === 'production') {
+    if (method === 'GET') {
+      need(user, ['produccion.registrar', 'escandallos.ver']);
+      const { results } = await env.DB.prepare(`
+        SELECT m.grp, m.mov_date, m.label, m.notes, u.name AS user_name, m.user_id, MAX(m.id) AS id,
+               SUM(CASE WHEN m.qty > 0 THEN m.qty ELSE 0 END) AS produced, SUM(CASE WHEN m.qty < 0 THEN -m.qty * m.unit_cost ELSE 0 END) AS cost
+        FROM movements m LEFT JOIN users u ON u.id = m.user_id WHERE m.type = 'produccion' AND m.mov_date >= date('now', '-60 days')
+        GROUP BY m.grp ORDER BY m.mov_date DESC, MAX(m.id) DESC LIMIT 200`).all();
+      return json(can(user, 'costes.ver') ? results : results.map(({ cost, ...x }) => x));
+    }
+    if (method === 'POST') {
+      need(user, 'produccion.registrar');
+      const d = await body(request);
+      const qty = Number(d.qty);
+      if (!(qty > 0)) throw new HttpError(400, 'Indica cuánto has producido');
+      await refreshPrepCosts(env);
+      const r = await env.DB.prepare(`SELECT id, name, yield_qty, yield_unit, product_id FROM recipes WHERE id = ? AND active = 1 AND kind = 'elaboracion'`).bind(d.recipe_id).first();
+      if (!r) throw new HttpError(404, 'Elaboración no encontrada');
+      const { lines } = await recipePerPortion(env, r.id);
+      if (!lines.length) throw new HttpError(400, `"${r.name}" no tiene ingredientes en su ficha`);
+      const f = qty / r.yield_qty, grp = uuid(), date = isDate(d.date) ? d.date : todayStr();
+      const prod = await env.DB.prepare('SELECT price FROM products WHERE id = ?').bind(r.product_id).first();
+      const label = `Producción: ${r.name} · ${qty} ${r.yield_unit}`;
+      const ins = (pid, q, cost) => env.DB.prepare(`INSERT INTO movements (product_id, type, qty, unit_cost, notes, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(pid, 'produccion', r2(q), cost, d.notes || null, label, grp, 'produccion', r.id, user.id, date);
+      const stmts = lines.map((l) => ins(l.product_id, -l.gross * f, l.price)); // recipePerPortion divide entre raciones (1 en elaboraciones)
+      stmts.push(ins(r.product_id, qty, prod?.price || 0));
+      await runBatch(env, stmts);
+      ctx.audit = { action: 'alta', entity: 'producción', summary: label };
+      return json({ ok: true, grp });
+    }
+    if (method === 'DELETE' && b) {
+      need(user, 'produccion.registrar');
+      const g = await env.DB.prepare(`SELECT grp, user_id, MAX(label) AS label FROM movements WHERE grp = ? AND type = 'produccion' GROUP BY grp`).bind(b).first();
+      if (!g) throw new HttpError(404, 'Producción no encontrada');
+      if (!user.is_super && g.user_id !== user.id && !can(user, 'mermas.borrar')) throw new HttpError(403, 'Solo puedes deshacer tus propias producciones');
+      await env.DB.prepare('DELETE FROM movements WHERE grp = ?').bind(b).run();
+      ctx.audit = { action: 'deshacer', entity: 'producción', summary: `Deshecha ${g.label}` };
       return json({ ok: true });
     }
   }
@@ -743,6 +1116,8 @@ async function route(parts, method, request, env, url) {
       return json(results);
     }
     if (b === 'imports' && method === 'DELETE' && c) {
+      const old = await env.DB.prepare('SELECT * FROM sales_imports WHERE id = ?').bind(c).first();
+      if (old) ctx.audit = { action: 'deshacer', entity: 'ventas', id: c, summary: `Deshecha la importación de ventas ${old.date_from} → ${old.date_to} (${old.revenue} €)`, detail: old };
       await env.DB.batch([
         env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'venta' AND ref_id = ?`).bind(c),
         env.DB.prepare('DELETE FROM sales WHERE import_id = ?').bind(c),
@@ -786,6 +1161,8 @@ async function route(parts, method, request, env, url) {
     }
     if (method === 'PUT' && isDate(b)) {
       if (!full && b < minDay) throw new HttpError(403, 'Solo puedes registrar la caja de los últimos 7 días');
+      const prev = await env.DB.prepare('SELECT cash, card, bizum, other, cash_out, pos_total, covers, notes FROM cash_days WHERE day = ?').bind(b).first();
+      ctx.audit = { action: prev ? 'modificación' : 'alta', id: b, summary: `${prev ? 'Modificación' : 'Cierre'} de caja del ${b}${prev ? ` (antes: efectivo ${prev.cash} €, tarjeta ${prev.card} €)` : ''}`, detail: prev };
       const d = await body(request);
       const n = (x) => (x === '' || x == null || isNaN(Number(x)) ? 0 : Number(x));
       const pos = d.pos_total === '' || d.pos_total == null || isNaN(Number(d.pos_total)) ? null : Number(d.pos_total);
@@ -800,6 +1177,8 @@ async function route(parts, method, request, env, url) {
     }
     if (method === 'DELETE' && isDate(b)) {
       need(user, 'caja.ver');
+      const prev = await env.DB.prepare('SELECT * FROM cash_days WHERE day = ?').bind(b).first();
+      ctx.audit = { action: 'borrado', id: b, summary: `Borrado de la caja del ${b}`, detail: prev };
       await env.DB.prepare('DELETE FROM cash_days WHERE day = ?').bind(b).run();
       return json({ ok: true });
     }
@@ -920,15 +1299,397 @@ async function productsBulk(request, env, user) {
   return json({ ok: true, count: items.length });
 }
 
+async function productsBulkEdit(request, env, user) {
+  need(user, 'productos.editar');
+  const d = await body(request);
+  const items = (d.items || []).filter((i) => Number(i.id));
+  if (!items.length) return json({ ok: true, count: 0 });
+  const { results: cur } = await env.DB.prepare(`SELECT id, price FROM products WHERE id IN (${items.map(() => '?').join(',')})`).bind(...items.map((i) => i.id)).all();
+  const old = Object.fromEntries(cur.map((p) => [p.id, p.price]));
+  const allowed = ['name', 'category', 'price', 'supplier_id', 'min_stock', 'allergens', 'allergens_checked'];
+  const stmts = [];
+  for (const i of items) {
+    const keys = allowed.filter((k) => k in i);
+    if (!keys.length || !(i.id in old)) continue;
+    const v = (k) => (k === 'price' || k === 'min_stock' ? Math.max(Number(i[k]) || 0, 0) : k === 'supplier_id' ? Number(i[k]) || null : k === 'allergens_checked' ? (i[k] ? 1 : 0) : k === 'allergens' ? (Array.isArray(i[k]) ? i[k] : String(i[k] || '').split(',')).filter((x) => ALLERGENS.includes(x)).join(',') || null : i[k] === '' ? null : i[k]);
+    if (keys.includes('name') && !String(i.name || '').trim()) throw new HttpError(400, 'Hay un artículo sin nombre');
+    stmts.push(env.DB.prepare(`UPDATE products SET ${keys.map((k) => k + ' = ?').join(', ')} WHERE id = ?`).bind(...keys.map(v), i.id));
+    if (keys.includes('price') && Math.abs(v('price') - old[i.id]) > 0.00005)
+      stmts.push(env.DB.prepare('INSERT INTO price_history (product_id, old_price, new_price, receipt_id) VALUES (?,?,?,NULL)').bind(i.id, old[i.id], v('price')));
+  }
+  try { await runBatch(env, stmts); } catch (e) { if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Hay dos artículos con el mismo nombre'); throw e; }
+  await refreshPrepCosts(env);
+  return json({ ok: true, count: items.length });
+}
+
+async function recipesBulkEdit(request, env, user) {
+  need(user, 'escandallos.editar');
+  const d = await body(request);
+  const items = (d.items || []).filter((i) => Number(i.id));
+  const allowed = ['name', 'category', 'pvp', 'portions', 'misc_pct'];
+  const stmts = [];
+  for (const i of items) {
+    const keys = allowed.filter((k) => k in i);
+    if (!keys.length) continue;
+    if (keys.includes('name') && !String(i.name || '').trim()) throw new HttpError(400, 'Hay un plato sin nombre');
+    const v = (k) => (k === 'pvp' ? Math.max(Number(i.pvp) || 0, 0) : k === 'portions' ? Math.max(Number(i.portions) || 1, 0.01) : k === 'misc_pct' ? (i.misc_pct === '' || i.misc_pct == null ? null : Number(i.misc_pct)) : i[k] === '' ? null : i[k]);
+    stmts.push(env.DB.prepare(`UPDATE recipes SET ${keys.map((k) => k + ' = ?').join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(...keys.map(v), i.id));
+  }
+  try { await runBatch(env, stmts); } catch (e) { if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Hay dos platos con el mismo nombre'); throw e; }
+  return json({ ok: true, count: items.length });
+}
+
+// ---------- avisos ----------
+async function alerts(env, user) {
+  const out = [];
+  const add = (level, icon, text, link) => out.push({ level, icon, text, link });
+  const q1 = (sql, ...b) => env.DB.prepare(sql).bind(...b).first();
+  const day = localDay();
+  const st = await settings(env);
+  if (can(user, 'caja.ver')) {
+    const r = await q1(`SELECT COUNT(*) AS n, SUM((cash + card + bizum + other) - pos_total) AS diff FROM cash_days WHERE day >= date(?, '-7 days') AND pos_total IS NOT NULL AND (cash + card + bizum + other) - pos_total < -5`, day);
+    if (r.n) add('bad', '💶', `Falta dinero en caja ${r.n} día(s) de la última semana (${Math.round(r.diff * 100) / 100} €)`, '#/panel?tab=caja');
+  }
+  if (can(user, 'caja.registrar')) {
+    const r = await q1(`SELECT MAX(day) AS d FROM cash_days`);
+    const yest = new Date(new Date(day + 'T12:00:00Z') - 86400000).toISOString().slice(0, 10);
+    if (r.d && r.d < yest) add('warn', '💶', `No se ha registrado la caja desde el ${r.d}`, '#/caja');
+  }
+  if (can(user, 'costes.ver')) {
+    const { results } = await env.DB.prepare(`SELECT p.name, ph.old_price, ph.new_price FROM price_history ph JOIN products p ON p.id = ph.product_id
+      WHERE ph.created_at >= datetime('now', '-7 days') AND ph.old_price > 0 AND ph.new_price > ph.old_price * 1.05 ORDER BY (ph.new_price / ph.old_price) DESC`).all();
+    if (results.length) add('warn', '📈', `Subidas de precio de más del 5 % esta semana: ${results.slice(0, 4).map((x) => `${x.name} (+${Math.round((x.new_price / x.old_price - 1) * 100)} %)`).join(', ')}${results.length > 4 ? '…' : ''}`, '#/panel?tab=compras');
+  }
+  if (can(user, 'panel.ver')) {
+    const from = day.slice(0, 8) + '01';
+    const d = await (await dashboard(env, new URL(`http://x/?from=${from}&to=${day}`))).json();
+    if (d.food_cost_real != null && d.revenue > 0 && d.food_cost_real > st.food_cost_target + 3) add('bad', '🍽️', `Food cost real del mes: ${Math.round(d.food_cost_real * 10) / 10} % (objetivo ${st.food_cost_target} %)`, '#/panel?tab=foodcost');
+    const w = await q1(`SELECT -SUM(CASE WHEN mov_date >= date(?, '-6 days') THEN qty * unit_cost END) AS week, -SUM(CASE WHEN mov_date < date(?, '-6 days') THEN qty * unit_cost END) / 4.0 AS avg4
+      FROM movements WHERE type = 'merma' AND mov_date >= date(?, '-34 days')`, day, day, day);
+    if (w.week > 30 && w.avg4 > 0 && w.week > w.avg4 * 1.5) add('warn', '🗑️', `Las mermas de esta semana (${Math.round(w.week)} €) superan en un ${Math.round((w.week / w.avg4 - 1) * 100)} % la media`, '#/panel?tab=mermas');
+    const inv = await q1(`SELECT inv_date, total_diff_value FROM inventories ORDER BY id DESC LIMIT 1`);
+    if (inv && inv.total_diff_value < -50) add('warn', '📋', `El último inventario (${inv.inv_date}) descuadró ${Math.round(inv.total_diff_value)} €`, '#/panel?tab=descuadres');
+  }
+  if (can(user, 'stock.ver') || can(user, 'pedidos.crear')) {
+    const r = await q1(`SELECT COUNT(*) AS n FROM (SELECT p.id, p.min_stock, COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id), 0) AS s FROM products p WHERE p.active = 1 AND p.min_stock > 0) WHERE s < min_stock`);
+    if (r.n) add('warn', '📦', `${r.n} artículo(s) por debajo del stock mínimo`, can(user, 'pedidos.crear') ? '#/pedidos/nuevo' : '#/stock');
+  }
+  if (can(user, 'pedidos.aprobar')) {
+    const r = await q1(`SELECT COUNT(*) AS n FROM orders WHERE status = 'pendiente'`);
+    if (r.n) add('bad', '📝', `${r.n} pedido(s) pendiente(s) de tu aprobación`, '#/pedidos');
+  }
+  if (can(user, 'pedidos.ver') || can(user, 'recepcion.crear')) {
+    const r = await q1(`SELECT COUNT(*) AS n FROM orders WHERE status = 'enviado' AND COALESCE(expected_date, date(order_date, '+2 days')) < ?`, day);
+    if (r.n) add('warn', '🚚', `${r.n} pedido(s) enviados sin recibir y ya fuera de plazo`, '#/recepcion');
+  }
+  if (can(user, 'appcc.registrar') || can(user, 'appcc.gestionar')) {
+    const eq = await q1(`SELECT COUNT(*) AS n FROM appcc_equipment WHERE active = 1`);
+    const shift = localHour() < 16 ? 'mañana' : 'tarde';
+    if (eq.n) {
+      const done = await q1(`SELECT COUNT(DISTINCT equipment_id) AS n FROM appcc_temps WHERE day = ? AND shift = ?`, day, shift);
+      if (done.n < eq.n) add('warn', '🌡️', `Faltan ${eq.n - done.n} temperatura(s) por anotar (${shift})`, '#/appcc');
+      const bad = await q1(`SELECT COUNT(*) AS n FROM appcc_temps WHERE day = ? AND ok = 0`, day);
+      if (bad.n) add('bad', '🌡️', `${bad.n} lectura(s) de temperatura fuera de rango hoy`, '#/appcc');
+    } else if (can(user, 'appcc.gestionar')) add('info', '🧊', 'Configura tus cámaras y el plan de limpieza para llevar el APPCC en la app', '#/appcc?tab=config');
+    const exp = await expiring(env, 2);
+    if (exp.length) add(exp.some((x) => x.days_left < 0) ? 'bad' : 'warn', '⏳', `${exp.length} lote(s) caducan en 2 días o menos${exp.some((x) => x.days_left < 0) ? ' (alguno ya caducado)' : ''}`, '#/appcc?tab=caducidades');
+  }
+  if (user.is_super) {
+    const last = st.last_backup ? (Date.now() - new Date(st.last_backup.replace(' ', 'T') + 'Z')) / 86400000 : Infinity;
+    if (last > 7) add('info', '💾', last === Infinity ? 'Todavía no has descargado ninguna copia de seguridad' : `La última copia de seguridad es de hace ${Math.floor(last)} días`, '#/copias');
+  }
+  if (can(user, 'productos.editar')) {
+    const r = await q1(`SELECT COUNT(*) AS n FROM products WHERE active = 1 AND COALESCE(allergens_checked, 0) = 0`);
+    if (r.n) add('info', '🧠', `${r.n} artículo(s) con alérgenos sin revisar`, '#/productos/alergenos');
+  }
+  if (can(user, 'ventas.gestionar')) {
+    const r = await q1(`SELECT COUNT(DISTINCT pos_name) AS n FROM pos_pending`);
+    if (r.n) add('warn', '🧾', `${r.n} nombre(s) de Qamarero sin vincular: sus ventas no cuentan`, '#/ventas?tab=pendientes');
+  }
+  if (can(user, 'escandallos.editar')) {
+    const r = await q1(`SELECT COUNT(*) AS n FROM recipes r WHERE r.active = 1 AND COALESCE(r.kind, 'plato') = 'plato' AND NOT EXISTS (SELECT 1 FROM recipe_lines WHERE recipe_id = r.id)`);
+    if (r.n) add('info', '🍽️', `${r.n} plato(s) de la carta sin escandallo`, '#/escandallos');
+  }
+  const order = { bad: 0, warn: 1, info: 2 };
+  return out.sort((x, y) => order[x.level] - order[y.level]);
+}
+
+// ---------- resumen semanal (lunes a domingo) ----------
+async function weeklySummary(env, endParam) {
+  const today = localDay();
+  const t = new Date((isDate(endParam) ? endParam : today) + 'T12:00:00Z');
+  if (!isDate(endParam)) t.setUTCDate(t.getUTCDate() - ((t.getUTCDay() + 6) % 7) - 1); // domingo pasado
+  const to = t.toISOString().slice(0, 10), fromD = new Date(t); fromD.setUTCDate(fromD.getUTCDate() - 6);
+  const from = fromD.toISOString().slice(0, 10);
+  const prevTo = new Date(fromD); prevTo.setUTCDate(prevTo.getUTCDate() - 1);
+  const prevFrom = new Date(prevTo); prevFrom.setUTCDate(prevFrom.getUTCDate() - 6);
+  const dash = async (f, tt) => (await dashboard(env, new URL(`http://x/?from=${f}&to=${tt}`))).json();
+  const [cur, prev, varc, top] = await Promise.all([
+    dash(from, to), dash(prevFrom.toISOString().slice(0, 10), prevTo.toISOString().slice(0, 10)), variance(env, from, to),
+    env.DB.prepare(`SELECT r.name, SUM(s.units) AS units, SUM(s.revenue) AS revenue FROM sales s JOIN recipes r ON r.id = s.recipe_id WHERE s.sale_date BETWEEN ? AND ? GROUP BY r.id ORDER BY revenue DESC LIMIT 5`).bind(from, to).all(),
+  ]);
+  const eq = await env.DB.prepare(`SELECT COUNT(*) AS n FROM appcc_equipment WHERE active = 1`).first();
+  const tr = await env.DB.prepare(`SELECT COUNT(*) AS n, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS bad FROM appcc_temps WHERE day BETWEEN ? AND ?`).bind(from, to).first();
+  const prices = (await env.DB.prepare(`SELECT p.name, p.unit, ph.old_price, ph.new_price FROM price_history ph JOIN products p ON p.id = ph.product_id WHERE date(ph.created_at) BETWEEN ? AND ? AND ph.old_price > 0 ORDER BY (ph.new_price - ph.old_price) / ph.old_price DESC LIMIT 5`).bind(from, to).all()).results;
+  return {
+    from, to, cur, prev, top: top.results, variance: varc.rows.slice(0, 5), prices,
+    appcc: { expected: eq.n * 14, done: tr.n || 0, out_of_range: tr.bad || 0 },
+  };
+}
+
+// ---------- aprobación de pedidos ----------
+function canEditOrder(user, o) {
+  if (!['borrador', 'pendiente'].includes(o.status)) return false;
+  return can(user, 'pedidos.aprobar') || o.user_id === user.id;
+}
+async function approvers(env, exceptId) {
+  const { results } = await env.DB.prepare('SELECT id, name, phone, email, is_super, perms FROM users WHERE active = 1').all();
+  return results.filter((u) => u.id !== exceptId && permsOf(u).includes('pedidos.aprobar')).map(({ id, name, phone, email }) => ({ id, name, phone, email }));
+}
+
+// ---------- pedidos sugeridos ----------
+// Consumo medio diario de las últimas 4 semanas (ventas por escandallo + mermas + personal + producción),
+// ajustado al día de la semana, × días a cubrir + stock mínimo − stock actual. Se redondea al formato de compra.
+async function suggestOrder(env, supplierId, days) {
+  if (!supplierId) throw new HttpError(400, 'Elige el proveedor');
+  const since = new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10);
+  const { results } = await env.DB.prepare(`
+    SELECT p.id, p.name, p.unit, p.min_stock, p.price,
+      COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id), 0) AS stock,
+      COALESCE((SELECT -SUM(qty) FROM movements WHERE product_id = p.id AND mov_date >= ? AND (type IN ('venta', 'merma', 'consumo_personal') OR (type = 'produccion' AND qty < 0))), 0) AS used,
+      (SELECT MIN(mov_date) FROM movements WHERE product_id = p.id) AS first_mov
+    FROM products p WHERE p.active = 1 AND p.supplier_id = ? AND p.prep_recipe_id IS NULL ORDER BY p.category, p.name`).bind(since, supplierId).all();
+  // peso de los próximos días según cómo se reparte la venta por día de la semana
+  const { results: wd } = await env.DB.prepare(`SELECT CAST(strftime('%w', sale_date) AS INTEGER) AS w, SUM(units) AS u FROM sales WHERE sale_date >= ? GROUP BY w`).bind(since).all();
+  const totalU = wd.reduce((t, x) => t + x.u, 0);
+  let factor = 1;
+  if (totalU > 0) {
+    const share = Object.fromEntries(wd.map((x) => [x.w, x.u / totalU]));
+    let next = 0;
+    for (let i = 1; i <= days; i++) next += share[(new Date(Date.now() + i * 86400000).getUTCDay())] || 0;
+    factor = next / (days / 7); // >1 si se cubren días fuertes (fin de semana)
+  }
+  const { results: fmts } = await env.DB.prepare(`SELECT * FROM product_formats WHERE active = 1 AND is_default = 1`).all();
+  const fmap = Object.fromEntries(fmts.map((f) => [f.product_id, f]));
+  const out = results.map((p) => {
+    const span = p.first_mov ? Math.min(28, Math.max(7, (Date.now() - new Date(p.first_mov + 'T12:00:00Z')) / 86400000)) : 28;
+    const perDay = p.used / span;
+    const needBase = Math.max(perDay * days * factor + p.min_stock - p.stock, 0);
+    const f = fmap[p.id];
+    let qty = 0, unit = p.unit;
+    if (needBase > 0.0001) {
+      if (f && f.factor > 0) { qty = Math.ceil(needBase / f.factor - 0.05); unit = 'f:' + f.id; }
+      else qty = p.unit === 'ud' ? Math.ceil(needBase) : Math.ceil(needBase * 10) / 10;
+    }
+    return { product_id: p.id, name: p.name, stock: r2(p.stock), per_day: r2(perDay), min_stock: p.min_stock, need: r2(needBase), qty, unit };
+  });
+  return { days, weekday_factor: r2(factor), lines: out };
+}
+
+// ---------- APPCC ----------
+const EQUIP_KINDS = ['refrigeracion', 'congelacion', 'caliente', 'otro'];
+function localDay() { const n = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' })); return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`; }
+const localHour = () => Number(new Date().toLocaleString('en-GB', { timeZone: 'Europe/Madrid', hour: '2-digit', hour12: false }));
+
+async function appcc(env, user, ctx, method, b, c, request, url) {
+  const day = localDay();
+  // resumen del día: lo que falta por registrar
+  if (b === 'today' && method === 'GET') {
+    need(user, ['appcc.registrar', 'appcc.gestionar']);
+    const [eq, temps, tasks, done, exp] = await Promise.all([
+      env.DB.prepare('SELECT * FROM appcc_equipment WHERE active = 1 ORDER BY name').all(),
+      env.DB.prepare(`SELECT t.*, u.name AS user_name FROM appcc_temps t LEFT JOIN users u ON u.id = t.user_id WHERE t.day = ? ORDER BY t.id`).bind(day).all(),
+      env.DB.prepare('SELECT * FROM appcc_tasks WHERE active = 1 ORDER BY frequency, zone, name').all(),
+      env.DB.prepare(`SELECT c.task_id, MAX(c.day) AS last_day, MAX(c.at) AS last_at FROM appcc_cleaning c GROUP BY c.task_id`).all(),
+      expiring(env, 3),
+    ]);
+    const last = Object.fromEntries(done.results.map((x) => [x.task_id, x]));
+    const span = { diaria: 0, semanal: 6, mensual: 29 };
+    const dayDiff = (d) => (d ? Math.round((new Date(day + 'T12:00:00Z') - new Date(d + 'T12:00:00Z')) / 86400000) : Infinity);
+    const shift = localHour() < 16 ? 'mañana' : 'tarde';
+    return json({
+      day, shift,
+      equipment: eq.results.map((e) => ({ ...e, readings: temps.results.filter((t) => t.equipment_id === e.id) })),
+      tasks: tasks.results.map((t) => { const l = last[t.id]; return { ...t, last_day: l?.last_day || null, due: dayDiff(l?.last_day) > (span[t.frequency] ?? 0) }; }),
+      expiring: exp,
+    });
+  }
+  if (b === 'temp' && method === 'POST') {
+    need(user, ['appcc.registrar', 'appcc.gestionar']);
+    const d = await body(request);
+    const e = await env.DB.prepare('SELECT * FROM appcc_equipment WHERE id = ? AND active = 1').bind(d.equipment_id).first();
+    if (!e) throw new HttpError(404, 'Equipo no encontrado');
+    const t = Number(String(d.temp).replace(',', '.'));
+    if (isNaN(t)) throw new HttpError(400, 'Indica la temperatura');
+    const okT = (e.min_temp == null || t >= e.min_temp) && (e.max_temp == null || t <= e.max_temp);
+    if (!okT && !String(d.action || '').trim()) throw new HttpError(400, 'Temperatura fuera de rango: anota la medida correctora (regular termostato, trasladar género, avisar al técnico…)');
+    await env.DB.prepare('INSERT INTO appcc_temps (equipment_id, day, shift, temp, ok, action, user_id) VALUES (?,?,?,?,?,?,?)')
+      .bind(e.id, day, d.shift === 'tarde' ? 'tarde' : 'mañana', t, okT ? 1 : 0, String(d.action || '').trim() || null, user.id).run();
+    ctx.audit = { action: 'registro', entity: 'APPCC', summary: `Temperatura ${e.name}: ${t} °C${okT ? '' : ' (FUERA DE RANGO)'}` };
+    return json({ ok: true, in_range: okT });
+  }
+  if (b === 'clean' && method === 'POST') {
+    need(user, ['appcc.registrar', 'appcc.gestionar']);
+    const d = await body(request);
+    const t = await env.DB.prepare('SELECT * FROM appcc_tasks WHERE id = ? AND active = 1').bind(d.task_id).first();
+    if (!t) throw new HttpError(404, 'Tarea no encontrada');
+    await env.DB.prepare('INSERT INTO appcc_cleaning (task_id, day, notes, user_id) VALUES (?,?,?,?)').bind(t.id, day, String(d.notes || '').trim() || null, user.id).run();
+    ctx.audit = { action: 'registro', entity: 'APPCC', summary: `Limpieza hecha: ${t.name}` };
+    return json({ ok: true });
+  }
+  if ((b === 'temp' || b === 'clean') && method === 'DELETE' && c) {
+    const table = b === 'temp' ? 'appcc_temps' : 'appcc_cleaning';
+    const row = await env.DB.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(c).first();
+    if (!row) throw new HttpError(404, 'Registro no encontrado');
+    if (!can(user, 'appcc.gestionar') && !(row.user_id === user.id && row.day === day)) throw new HttpError(403, 'Solo puedes borrar tus registros de hoy');
+    await env.DB.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(c).run();
+    ctx.audit = { action: 'borrado', entity: 'APPCC', summary: `Borrado registro de ${b === 'temp' ? 'temperatura' : 'limpieza'} del ${row.day}`, detail: row };
+    return json({ ok: true });
+  }
+  // configuración de equipos y tareas
+  if (b === 'equipment' || b === 'tasks') {
+    const table = b === 'equipment' ? 'appcc_equipment' : 'appcc_tasks';
+    if (method === 'GET') { need(user, ['appcc.registrar', 'appcc.gestionar']); return json((await env.DB.prepare(`SELECT * FROM ${table} WHERE active = 1 ORDER BY name`).all()).results); }
+    need(user, 'appcc.gestionar');
+    if (method === 'DELETE' && c) { await env.DB.prepare(`UPDATE ${table} SET active = 0 WHERE id = ?`).bind(c).run(); return json({ ok: true }); }
+    const d = await body(request);
+    const items = Array.isArray(d.items) ? d.items : [d];
+    const stmts = [];
+    for (const i of items) {
+      if (!String(i.name || '').trim()) throw new HttpError(400, 'Falta el nombre');
+      const n = (x) => (x === '' || x == null || isNaN(Number(x)) ? null : Number(x));
+      if (b === 'equipment') {
+        const kind = EQUIP_KINDS.includes(i.kind) ? i.kind : 'otro';
+        const vals = [i.name.trim(), kind, n(i.min_temp), n(i.max_temp)];
+        stmts.push(method === 'PUT' && c ? env.DB.prepare('UPDATE appcc_equipment SET name=?, kind=?, min_temp=?, max_temp=? WHERE id = ?').bind(...vals, c)
+          : env.DB.prepare('INSERT INTO appcc_equipment (name, kind, min_temp, max_temp) VALUES (?,?,?,?)').bind(...vals));
+      } else {
+        const freq = ['diaria', 'semanal', 'mensual'].includes(i.frequency) ? i.frequency : 'diaria';
+        const vals = [i.name.trim(), String(i.zone || '').trim() || null, freq, String(i.product || '').trim() || null];
+        stmts.push(method === 'PUT' && c ? env.DB.prepare('UPDATE appcc_tasks SET name=?, zone=?, frequency=?, product=? WHERE id = ?').bind(...vals, c)
+          : env.DB.prepare('INSERT INTO appcc_tasks (name, zone, frequency, product) VALUES (?,?,?,?)').bind(...vals));
+      }
+    }
+    await runBatch(env, stmts);
+    return json({ ok: true, count: stmts.length });
+  }
+  // caducidades
+  if (b === 'expiry') {
+    need(user, ['appcc.registrar', 'appcc.gestionar', 'recepcion.crear']);
+    if (method === 'GET') return json(await expiring(env, Math.min(Number(url.searchParams.get('days')) || 7, 60)));
+    if (method === 'POST' && c) {
+      const l = await env.DB.prepare('SELECT rl.id, rl.lot, rl.expiry, p.name FROM receipt_lines rl JOIN products p ON p.id = rl.product_id WHERE rl.id = ?').bind(c).first();
+      if (!l) throw new HttpError(404, 'Lote no encontrado');
+      await env.DB.prepare('UPDATE receipt_lines SET expiry_done = 1 WHERE id = ?').bind(c).run();
+      ctx.audit = { action: 'cierre', entity: 'APPCC', summary: `Lote gastado o retirado: ${l.name}${l.lot ? ' (lote ' + l.lot + ')' : ''}, caduca ${l.expiry}` };
+      return json({ ok: true });
+    }
+  }
+  // informe para la inspección
+  if (b === 'report' && method === 'GET') {
+    need(user, ['appcc.gestionar', 'informes.ver']);
+    const from = isDate(url.searchParams.get('from')) ? url.searchParams.get('from') : day.slice(0, 8) + '01';
+    const to = isDate(url.searchParams.get('to')) ? url.searchParams.get('to') : day;
+    const [temps, clean, recs] = await Promise.all([
+      env.DB.prepare(`SELECT t.day, t.shift, e.name AS equipment, e.min_temp, e.max_temp, t.temp, t.ok, t.action, u.name AS user_name, t.at FROM appcc_temps t JOIN appcc_equipment e ON e.id = t.equipment_id LEFT JOIN users u ON u.id = t.user_id WHERE t.day BETWEEN ? AND ? ORDER BY t.day, e.name, t.shift`).bind(from, to).all(),
+      env.DB.prepare(`SELECT c.day, k.name AS task, k.zone, k.frequency, k.product, c.notes, u.name AS user_name, c.at FROM appcc_cleaning c JOIN appcc_tasks k ON k.id = c.task_id LEFT JOIN users u ON u.id = c.user_id WHERE c.day BETWEEN ? AND ? ORDER BY c.day, k.zone, k.name`).bind(from, to).all(),
+      env.DB.prepare(`SELECT r.receipt_date, s.name AS supplier, r.doc_type, r.delivery_note, r.rec_temp, r.rec_check, u.name AS user_name,
+          (SELECT GROUP_CONCAT(p.name || COALESCE(' · lote ' || rl.lot, '') || COALESCE(' · cad. ' || rl.expiry, ''), ' | ') FROM receipt_lines rl JOIN products p ON p.id = rl.product_id WHERE rl.receipt_id = r.id) AS lines
+        FROM receipts r JOIN suppliers s ON s.id = r.supplier_id LEFT JOIN users u ON u.id = r.user_id WHERE r.receipt_date BETWEEN ? AND ? ORDER BY r.receipt_date`).bind(from, to).all(),
+    ]);
+    const st = await settings(env);
+    return json({ from, to, restaurant: st.restaurant_name, temps: temps.results, cleaning: clean.results, receptions: recs.results });
+  }
+  throw new HttpError(404, 'Ruta no encontrada');
+}
+
+async function expiring(env, days) {
+  const { results } = await env.DB.prepare(`
+    SELECT rl.id, rl.lot, rl.expiry, rl.qty, p.name, p.unit, p.id AS product_id, s.name AS supplier, r.receipt_date,
+           CAST(julianday(rl.expiry) - julianday(date('now')) AS INTEGER) AS days_left
+    FROM receipt_lines rl JOIN receipts r ON r.id = rl.receipt_id JOIN products p ON p.id = rl.product_id LEFT JOIN suppliers s ON s.id = r.supplier_id
+    WHERE rl.expiry IS NOT NULL AND COALESCE(rl.expiry_done, 0) = 0 AND rl.expiry <= date('now', '+' || ? || ' days')
+    ORDER BY rl.expiry LIMIT 200`).bind(String(days)).all();
+  return results;
+}
+
+// ---------- elaboraciones intermedias ----------
+async function ensurePrepProduct(env, recipeId, name, unit, category) {
+  const r = await env.DB.prepare('SELECT product_id FROM recipes WHERE id = ?').bind(recipeId).first();
+  let pid = r?.product_id;
+  const exists = pid ? await env.DB.prepare('SELECT id FROM products WHERE id = ?').bind(pid).first() : null;
+  let pname = name;
+  const clash = await env.DB.prepare('SELECT id FROM products WHERE name = ? AND (prep_recipe_id IS NULL OR prep_recipe_id <> ?)').bind(pname, recipeId).first();
+  if (clash) pname = `${name} (elaboración)`;
+  if (!exists) {
+    pid = (await env.DB.prepare(`INSERT INTO products (name, category, unit, price, prep_recipe_id, allergens_checked) VALUES (?,?,?,0,?,1)
+      ON CONFLICT(name) DO UPDATE SET prep_recipe_id = excluded.prep_recipe_id, unit = excluded.unit, active = 1 RETURNING id`).bind(pname, category || 'Elaboraciones', unit, recipeId).first()).id;
+    await env.DB.prepare('UPDATE recipes SET product_id = ? WHERE id = ?').bind(pid, recipeId).run();
+  } else {
+    await env.DB.prepare('UPDATE products SET name = ?, unit = ?, active = 1, prep_recipe_id = ? WHERE id = ?').bind(pname, unit, recipeId, pid).run();
+  }
+  return pid;
+}
+
+// Coste por kg/l/ud de cada elaboración = coste del lote ÷ lo que produce. Se repite por si unas usan otras.
+// Sus alérgenos son los de sus ingredientes.
+async function refreshPrepCosts(env) {
+  for (let pass = 0; pass < 4; pass++) {
+    const { results } = await env.DB.prepare(`
+      SELECT r.id, r.product_id, r.yield_qty,
+             COALESCE(SUM(rl.qty / ${YIELD_SQL} * p.price), 0) * (1 + COALESCE(r.misc_pct, (SELECT CAST(value AS REAL) FROM settings WHERE key = 'misc_pct'), 0) / 100.0) AS batch,
+             GROUP_CONCAT(p.allergens) AS algs, MIN(COALESCE(p.allergens_checked, 0)) AS checked,
+             (SELECT price FROM products WHERE id = r.product_id) AS cur, (SELECT allergens FROM products WHERE id = r.product_id) AS cur_alg
+      FROM recipes r LEFT JOIN recipe_lines rl ON rl.recipe_id = r.id LEFT JOIN products p ON p.id = rl.product_id
+      WHERE r.active = 1 AND r.kind = 'elaboracion' AND r.product_id IS NOT NULL GROUP BY r.id`).all();
+    const stmts = [];
+    for (const x of results) {
+      const price = x.yield_qty > 0 ? Math.round((x.batch / x.yield_qty) * 10000) / 10000 : 0;
+      const alg = [...new Set(String(x.algs || '').split(',').filter((a) => ALLERGENS.includes(a)))].sort().join(',') || null;
+      if (Math.abs(price - (x.cur || 0)) > 0.00005 || alg !== (x.cur_alg || null))
+        stmts.push(env.DB.prepare('UPDATE products SET price = ?, allergens = ?, allergens_checked = ? WHERE id = ?').bind(price, alg, x.checked ? 1 : 0, x.product_id));
+    }
+    if (!stmts.length) return;
+    await runBatch(env, stmts);
+  }
+}
+
+// Exporta la carta con las mismas columnas del archivo que se importó de Qamarero
+async function recipesExport(env, user) {
+  need(user, ['escandallos.editar', 'ventas.gestionar']);
+  const st = await settings(env);
+  const { results } = await env.DB.prepare('SELECT id, name, category, pvp, pos_name, pos_raw FROM recipes WHERE active = 1 ORDER BY id').all();
+  const qc = st.qamarero_cols; // { headers: [...], map: { name: i, pvp: i, category: i } }
+  const headers = qc?.headers?.length ? qc.headers : ['Nombre', 'Categoría', 'Precio'];
+  const map = qc?.map || { name: 0, category: 1, pvp: 2 };
+  const fmtPrice = (x) => Math.round((Number(x) || 0) * 100) / 100;
+  const rows = results.map((r) => {
+    let row = [];
+    try { row = JSON.parse(r.pos_raw || '[]'); } catch { row = []; }
+    row = headers.map((_, i) => (row[i] ?? ''));
+    if (map.name >= 0) row[map.name] = r.pos_name || r.name;
+    if (map.pvp >= 0) row[map.pvp] = fmtPrice(r.pvp);
+    if (map.category >= 0 && r.category) row[map.category] = r.category;
+    return { row, known: !!r.pos_raw };
+  });
+  rows.sort((x, y) => Number(y.known) - Number(x.known)); // los nuevos, al final
+  return json({ headers, rows: rows.map((x) => x.row), from_qamarero: !!qc, sheet: qc?.sheet || 'Productos' });
+}
+
 async function recipesBulk(request, env, user) {
   need(user, 'escandallos.editar');
   const d = await body(request);
   const items = (d.items || []).filter((i) => i.name && String(i.name).trim());
   const stmts = items.map((i) => env.DB.prepare(
-    `INSERT INTO recipes (name, category, pvp, pos_name) VALUES (?,?,?,?)
+    `INSERT INTO recipes (name, category, pvp, pos_name, pos_raw) VALUES (?,?,?,?,?)
      ON CONFLICT(name) DO UPDATE SET pvp = CASE WHEN excluded.pvp > 0 THEN excluded.pvp ELSE pvp END,
-       category = COALESCE(excluded.category, category), pos_name = COALESCE(pos_name, excluded.pos_name), active = 1`
-  ).bind(String(i.name).trim(), i.category || null, Number(String(i.pvp ?? 0).replace(',', '.')) || 0, String(i.name).trim()));
+       category = COALESCE(excluded.category, category), pos_name = COALESCE(pos_name, excluded.pos_name),
+       pos_raw = COALESCE(excluded.pos_raw, pos_raw), active = 1`
+  ).bind(String(i.name).trim(), i.category || null, Number(String(i.pvp ?? 0).replace(',', '.')) || 0, String(i.name).trim(), Array.isArray(i._raw) ? JSON.stringify(i._raw) : null));
+  // formato del archivo de Qamarero, para poder exportar con las mismas columnas
+  if (Array.isArray(d.headers) && d.headers.length && d.map)
+    stmts.push(env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('qamarero_carta_cols', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .bind(JSON.stringify({ headers: d.headers.map(String), map: d.map, sheet: d.sheet || null })));
   await runBatch(env, stmts);
   return json({ ok: true, count: items.length });
 }
@@ -954,7 +1715,7 @@ async function savePending(env, pending, from, to, source) {
 async function matchPosRows(env, rows) {
   const [{ results: aliases }, { results: recipes }] = await Promise.all([
     env.DB.prepare('SELECT a.pos_name, a.recipe_id, a.factor, a.pvp FROM pos_aliases a JOIN recipes r ON r.id = a.recipe_id AND r.active = 1').all(),
-    env.DB.prepare('SELECT id, name, pos_name FROM recipes WHERE active = 1').all(),
+    env.DB.prepare(`SELECT id, name, pos_name FROM recipes WHERE active = 1 AND COALESCE(kind, 'plato') = 'plato'`).all(),
   ]);
   const norm = (s) => String(s || '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ');
   const amap = Object.fromEntries(aliases.map((a) => [norm(a.pos_name), a]));
@@ -1006,7 +1767,7 @@ async function importSales(env, userId, d) {
     byRecipe[rec.id].revenue += gross / div;
   }
   const { results: lines } = await env.DB.prepare(
-    `SELECT rl.recipe_id, rl.product_id, rl.qty, rl.waste_pct, p.price FROM recipe_lines rl JOIN products p ON p.id = rl.product_id
+    `SELECT rl.recipe_id, rl.product_id, rl.qty, rl.waste_pct, rl.cook_loss_pct, p.price FROM recipe_lines rl JOIN products p ON p.id = rl.product_id
      WHERE rl.recipe_id IN (${ids.map(() => '?').join(',')})`
   ).bind(...ids).all();
 
@@ -1020,7 +1781,7 @@ async function importSales(env, userId, d) {
     saleRows.push({ recipe_id: rec.id, units: agg.units, revenue });
     const portions = Number(rec.portions) || 1;
     for (const l of lines.filter((x) => x.recipe_id === rec.id)) {
-      const gross = (l.qty / (1 - Math.min(l.waste_pct || 0, 95) / 100) / portions) * agg.units;
+      const gross = (l.qty / lineYield(l) / portions) * agg.units;
       consumption[l.product_id] = consumption[l.product_id] || { qty: 0, price: l.price };
       consumption[l.product_id].qty += gross;
     }
@@ -1086,7 +1847,7 @@ async function dashboard(env, url) {
   const pct = (x) => (revenue > 0 ? (x / revenue) * 100 : null);
 
   const dishAlerts = dishes.results
-    .filter((r) => r.pvp > 0 && r.n_lines > 0)
+    .filter((r) => r.kind === 'plato' && r.pvp > 0 && r.n_lines > 0)
     .map((r) => ({ name: r.name, cost: r.cost, pvp: r.pvp, fc: (r.cost / (r.pvp / div)) * 100 }))
     .filter((r) => r.fc > st.food_cost_target + 5)
     .sort((x, y) => y.fc - x.fc)
@@ -1102,7 +1863,7 @@ async function dashboard(env, url) {
     stock_value: stockVal.v,
     top_waste: topWaste.results, top_dishes: topDishes.results, price_changes: prices.results,
     low_stock: lowStock.results, by_supplier: bySupplier.results, dish_alerts: dishAlerts,
-    recipes_without_lines: dishes.results.filter((r) => r.n_lines === 0).length,
+    recipes_without_lines: dishes.results.filter((r) => r.kind === 'plato' && r.n_lines === 0).length,
     pending_pos: pendingPos.n,
     cash,
   });
@@ -1180,7 +1941,7 @@ async function stats(env, url, tab) {
       q(`SELECT ${bucket('mov_date')} AS b, -SUM(CASE WHEN type = 'venta' THEN qty * unit_cost END) AS theo, -SUM(CASE WHEN type IN ('merma', 'consumo_personal', 'ajuste') THEN qty * unit_cost END) AS extra FROM movements WHERE type IN ('venta', 'merma', 'consumo_personal', 'ajuste') AND mov_date BETWEEN ? AND ? GROUP BY b`, from, to),
       q(`SELECT r.id, r.name, r.category, r.pvp, rc.cost, COALESCE(SUM(s.units), 0) AS units, COALESCE(SUM(s.revenue), 0) AS revenue
          FROM (${RECIPES_SQL}) rc JOIN recipes r ON r.id = rc.id LEFT JOIN sales s ON s.recipe_id = r.id AND s.sale_date BETWEEN ? AND ?
-         WHERE rc.n_lines > 0 GROUP BY r.id`, from, to),
+         WHERE rc.n_lines > 0 AND rc.kind = 'plato' GROUP BY r.id`, from, to),
     ]);
     const rev = series(keys, sales, 'revenue'), theo = series(keys, mv, 'theo'), extra = series(keys, mv, 'extra');
     // ingeniería de menú: popularidad (uds vs media) y margen unitario (vs media ponderada)
@@ -1205,22 +1966,60 @@ async function stats(env, url, tab) {
       q(`SELECT ${bucket('day')} AS b, SUM(cash) AS cash, SUM(card) AS card, SUM(bizum + other) AS other, SUM(CASE WHEN pos_total IS NOT NULL THEN cash + card + bizum + other - pos_total END) AS diff FROM cash_days WHERE day BETWEEN ? AND ? GROUP BY b`, from, to),
     ]);
     Object.assign(out, { cash: series(keys, sales, 'cash'), card: series(keys, sales, 'card'), other: series(keys, sales, 'other'), diff: series(keys, sales, 'diff'), days });
+  } else if (tab === 'descuadres') {
+    Object.assign(out, await variance(env, from, to));
   } else throw new HttpError(404, 'Pestaña no encontrada');
   return json(out);
+}
+
+// Descuadre por artículo: lo que dicen los recuentos frente a lo que debería haber
+async function variance(env, from, to) {
+  const { results } = await env.DB.prepare(`
+    SELECT p.id, p.name, p.unit, p.category, p.price, p.prep_recipe_id,
+      SUM(CASE WHEN m.type = 'entrada' THEN m.qty ELSE 0 END) AS entradas,
+      -SUM(CASE WHEN m.type = 'venta' THEN m.qty ELSE 0 END) AS ventas,
+      -SUM(CASE WHEN m.type = 'merma' THEN m.qty ELSE 0 END) AS mermas,
+      -SUM(CASE WHEN m.type = 'consumo_personal' THEN m.qty ELSE 0 END) AS personal,
+      -SUM(CASE WHEN m.type = 'produccion' AND m.qty < 0 THEN m.qty ELSE 0 END) AS produccion_uso,
+      SUM(CASE WHEN m.type = 'produccion' AND m.qty > 0 THEN m.qty ELSE 0 END) AS producido,
+      SUM(CASE WHEN m.type = 'ajuste' THEN m.qty ELSE 0 END) AS descuadre,
+      SUM(CASE WHEN m.type = 'ajuste' THEN m.qty * m.unit_cost ELSE 0 END) AS descuadre_valor
+    FROM movements m JOIN products p ON p.id = m.product_id
+    WHERE m.mov_date BETWEEN ? AND ? GROUP BY p.id`).bind(from, to).all();
+  const { results: counts } = await env.DB.prepare(`
+    SELECT il.product_id, MAX(i.inv_date) AS last_count, SUM(CASE WHEN i.inv_date BETWEEN ? AND ? THEN 1 ELSE 0 END) AS counts_in_period
+    FROM inventory_lines il JOIN inventories i ON i.id = il.inventory_id GROUP BY il.product_id`).bind(from, to).all();
+  const cmap = Object.fromEntries(counts.map((c) => [c.product_id, c]));
+  const rows = results.map((r) => {
+    const consumo = r.ventas + r.mermas + r.personal + r.produccion_uso;
+    const c = cmap[r.id] || {};
+    return { ...r, consumo, pct: consumo > 0 ? (r.descuadre / consumo) * 100 : null, last_count: c.last_count || null, counted: (c.counts_in_period || 0) > 0 };
+  });
+  const counted = rows.filter((r) => r.counted);
+  const total = counted.reduce((t, r) => t + r.descuadre_valor, 0);
+  // qué contar: lo que más valor mueve y hace más de 14 días que no se cuenta
+  const stale = (d) => !d || (Date.now() - new Date(d + 'T12:00:00Z')) / 86400000 > 14;
+  const toCount = rows.filter((r) => stale(r.last_count) && r.consumo > 0).map((r) => ({ ...r, consumo_valor: r.consumo * r.price }))
+    .sort((a, b) => b.consumo_valor - a.consumo_valor).slice(0, 15);
+  return {
+    rows: counted.sort((a, b) => a.descuadre_valor - b.descuadre_valor),
+    total_descuadre: total, n_counted: counted.length, n_moved: rows.length, to_count: toCount,
+  };
 }
 
 // ---------- informes ----------
 const REPORTS = {
   resultado: 'Cuenta de resultados del periodo',
   compras_proveedor: 'Compras por proveedor (albaranes)',
-  compras_producto: 'Compras por producto',
+  compras_producto: 'Compras por artículo',
   mermas: 'Mermas (detalle)',
   personal: 'Consumo de personal (detalle)',
   foodcost: 'Food cost y margen por plato',
   ventas: 'Ventas por plato',
   caja: 'Cuadre de caja diario',
   stock: 'Inventario valorado (stock actual)',
-  descuadres: 'Descuadres de inventario',
+  descuadres: 'Descuadres de inventario (recuentos)',
+  desviacion: 'Descuadre por artículo (consumo teórico frente a real)',
   gastos: 'Gastos fijos',
 };
 
@@ -1256,7 +2055,7 @@ async function report(env, url, type, user) {
       FROM receipts r JOIN suppliers s ON s.id = r.supplier_id LEFT JOIN users u ON u.id = r.user_id WHERE r.receipt_date BETWEEN ? AND ? ORDER BY s.name, r.receipt_date`, from, to);
     total = { total: rows.reduce((x, r) => x + r.total, 0) };
   } else if (type === 'compras_producto') {
-    columns = [C('name', 'Producto'), C('category', 'Categoría'), C('supplier', 'Proveedor'), C('qty', 'Cantidad', 'num'), C('unit', 'Ud'), C('avg_price', 'Precio medio', 'eur'), C('min_price', 'Mín.', 'eur'), C('max_price', 'Máx.', 'eur'), C('value', 'Importe', 'eur')];
+    columns = [C('name', 'Artículo'), C('category', 'Categoría'), C('supplier', 'Proveedor'), C('qty', 'Cantidad', 'num'), C('unit', 'Ud'), C('avg_price', 'Precio medio', 'eur'), C('min_price', 'Mín.', 'eur'), C('max_price', 'Máx.', 'eur'), C('value', 'Importe', 'eur')];
     rows = await q(`SELECT p.name, p.category, s.name AS supplier, SUM(rl.qty) AS qty, p.unit, SUM(rl.qty * rl.price) / NULLIF(SUM(rl.qty), 0) AS avg_price, MIN(rl.price) AS min_price, MAX(rl.price) AS max_price, SUM(rl.qty * rl.price) AS value
       FROM receipt_lines rl JOIN receipts r ON r.id = rl.receipt_id JOIN products p ON p.id = rl.product_id LEFT JOIN suppliers s ON s.id = r.supplier_id
       WHERE r.receipt_date BETWEEN ? AND ? GROUP BY p.id, r.supplier_id ORDER BY value DESC`, from, to);
@@ -1287,16 +2086,22 @@ async function report(env, url, type, user) {
     const sum = (k) => rows.reduce((x, r) => x + (Number(r[k]) || 0), 0);
     total = { cash: sum('cash'), card: sum('card'), bizum: sum('bizum'), other: sum('other'), total: sum('total'), pos_total: sum('pos_total'), diff: sum('diff'), covers: sum('covers'), cash_out: sum('cash_out') };
   } else if (type === 'stock') {
-    columns = [C('name', 'Producto'), C('category', 'Categoría'), C('supplier_name', 'Proveedor'), C('stock', 'Stock', 'num'), C('unit', 'Ud'), C('price', 'Precio', 'eur'), C('value', 'Valor', 'eur')];
+    columns = [C('name', 'Artículo'), C('category', 'Categoría'), C('supplier_name', 'Proveedor'), C('stock', 'Stock', 'num'), C('unit', 'Ud'), C('price', 'Precio', 'eur'), C('value', 'Valor', 'eur')];
     rows = (await q(PRODUCTS_SQL)).map((p) => ({ ...p, value: Math.max(p.stock, 0) * p.price }));
     total = { value: rows.reduce((x, r) => x + r.value, 0) };
   } else if (type === 'descuadres') {
-    columns = [C('inv_date', 'Fecha', 'date'), C('name', 'Producto'), C('expected', 'Teórico', 'num'), C('counted', 'Contado', 'num'), C('unit', 'Ud'), C('detail', 'Recuento'), C('diff', 'Diferencia', 'num'), C('value', 'Valor', 'eur'), C('user', 'Quién')];
+    columns = [C('inv_date', 'Fecha', 'date'), C('name', 'Artículo'), C('expected', 'Teórico', 'num'), C('counted', 'Contado', 'num'), C('unit', 'Ud'), C('detail', 'Recuento'), C('diff', 'Diferencia', 'num'), C('value', 'Valor', 'eur'), C('user', 'Quién')];
     rows = await q(`SELECT i.inv_date, p.name, il.expected, il.counted, p.unit, il.detail, il.counted - il.expected AS diff,
         (SELECT SUM(m.qty * m.unit_cost) FROM movements m WHERE m.ref_type = 'inventario' AND m.ref_id = i.id AND m.product_id = il.product_id) AS value, u.name AS user
       FROM inventory_lines il JOIN inventories i ON i.id = il.inventory_id JOIN products p ON p.id = il.product_id LEFT JOIN users u ON u.id = i.user_id
       WHERE i.inv_date BETWEEN ? AND ? ORDER BY i.inv_date, value`, from, to);
     total = { value: rows.reduce((x, r) => x + (r.value || 0), 0) };
+  } else if (type === 'desviacion') {
+    const vr = await variance(env, from, to);
+    columns = [C('name', 'Artículo'), C('unit', 'Ud'), C('entradas', 'Entradas', 'num'), C('ventas', 'Ventas (escandallo)', 'num'), C('mermas', 'Mermas', 'num'), C('personal', 'Personal', 'num'),
+      C('produccion_uso', 'Usado en producción', 'num'), C('descuadre', 'Descuadre', 'num'), C('pct', '% s/ consumo', 'pct'), C('descuadre_valor', 'Valor descuadre', 'eur'), C('last_count', 'Último recuento', 'date')];
+    rows = vr.rows;
+    total = { descuadre_valor: vr.total_descuadre };
   } else if (type === 'gastos') {
     columns = [C('concept', 'Concepto'), C('category', 'Categoría'), C('amount', 'Importe', 'eur'), C('frequency', 'Periodicidad'), C('monthly', 'Al mes', 'eur'), C('period', 'En el periodo', 'eur')];
     const days = Math.round((new Date(to) - new Date(from)) / 86400000) + 1;
@@ -1417,7 +2222,7 @@ async function ocrScan(request, env, user) {
     const quota = /limit|quota|neuron|429|capacity/i.test(msg);
     return json({ failed: true, message: quota ? 'Se ha agotado el cupo gratuito de lectura de hoy. Mete los datos a mano; mañana vuelve a funcionar.' : 'No he podido leer el documento. Mete los datos a mano o prueba con una foto más nítida.', detail: msg.slice(0, 200) });
   }
-  if (!raw || !Array.isArray(raw.lines) || !raw.lines.length) return json({ failed: true, message: 'No he encontrado líneas de productos en la foto. Mete los datos a mano o prueba con otra foto más recta y con luz.' });
+  if (!raw || !Array.isArray(raw.lines) || !raw.lines.length) return json({ failed: true, message: 'No he encontrado líneas de artículos en la foto. Mete los datos a mano o prueba con otra foto más recta y con luz.' });
 
   // proveedor: por CIF y, si no, por parecido del nombre
   const { results: sups } = await env.DB.prepare('SELECT id, name, cif FROM suppliers WHERE active = 1').all();
@@ -1455,7 +2260,7 @@ async function ocrScan(request, env, user) {
       if (cands[0] && cands[0].sc >= 0.45) { product = cands[0].p; confidence = cands[0].sc >= 0.75 ? 'alta' : 'revisar'; }
     }
     return {
-      source, printed_unit: l.unit || '', qty, price: Math.round(price * 10000) / 10000, line_total: Number(l.line_total) || qty * price,
+      source, description: l.description || '', printed_unit: l.unit || '', qty, price: Math.round(price * 10000) / 10000, line_total: Number(l.line_total) || qty * price,
       product_id: product?.id || null, unit: product ? (learned?.unit || unitGuess(product, l.unit)) : null, confidence,
     };
   });
