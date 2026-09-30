@@ -562,13 +562,85 @@ VIEWS.recepcion = async (v, id, q) => {
   if (id) return recepcionDetalle(v, id);
   const [list, orders] = await Promise.all([api('receipts'), api('orders')]);
   const pend = orders.filter((o) => o.status === 'enviado');
-  v.innerHTML = `<div class="row between"><h1>Recepción de mercancía</h1><a class="btn primary" href="#/recepcion/nueva">+ Recibir sin pedido</a></div>
+  v.innerHTML = `<div class="row between"><h1>Recepción de mercancía</h1><div class="row"><button id="impfac">Importar facturas (Excel)</button><a class="btn primary" href="#/recepcion/nueva">+ Recibir sin pedido</a></div></div>
     ${pend.length ? `<div class="card"><h3>Pedidos pendientes de recibir</h3><div class="table-wrap"><table><tbody>${pend.map((o) => `<tr class="click" data-h="#/recepcion/nueva?pedido=${o.id}"><td>#${o.id}</td><td>${esc(o.supplier_name)}</td><td>${fdate(o.order_date)}</td><td class="num"><span class="btn sm primary">Recibir →</span></td></tr>`).join('')}</tbody></table></div></div>` : ''}
     <div class="card"><h3>Albaranes y facturas registrados</h3>${list.length ? `<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Proveedor</th><th>Documento</th><th>Recibió</th><th class="num">Total</th></tr></thead><tbody>
     ${list.map((r) => `<tr class="click" data-h="#/recepcion/${r.id}"><td>${fdate(r.receipt_date)}</td><td>${esc(r.supplier_name)}</td><td>${r.doc_type === 'factura' ? 'Factura' : 'Albarán'} ${esc(r.delivery_note || '')}</td><td>${esc(r.user_name || '')}</td><td class="num">${eur(r.total)}</td></tr>`).join('')}
     </tbody></table></div>` : '<div class="empty">Sin albaranes todavía.</div>'}</div>`;
   bindRowLinks(v);
+  $('#impfac').onclick = () => comprasImport();
 };
+
+// Compras pasadas desde un Excel (una fila por línea de factura). Se envía por tandas de facturas completas.
+function comprasImport() {
+  return importWizard({
+    title: 'Importar facturas de compra', sheetHint: ['compra', 'factura'],
+    help: 'Una fila por línea de factura: proveedor, nº de factura, fecha, artículo, cantidad, unidad y precio. Cada factura entra como recepción con su fecha, suma al stock y no se repite si ya estaba importada. Los proveedores y artículos que no existan se dan de alta.',
+    cols: [['name', 'Artículo', true, ['articulo', 'linea de mercancia', 'descripcion', 'producto', 'concepto']], ['supplier_name', 'Proveedor', true, ['proveedor']], ['cif', 'CIF del proveedor', false, ['cif', 'nif']],
+      ['doc', 'Nº de factura o albarán', false, ['n factura', 'no factura', 'factura', 'numero', 'documento', 'albaran']], ['date', 'Fecha', true, ['fecha']],
+      ['qty', 'Cantidad', true, ['cantidad', 'unidades', 'uds', 'cant']], ['unit', 'Unidad', false, ['unidad', 'ud', 'medida', 'unidad kglitrounidad']],
+      ['price', 'Precio unitario sin IVA', false, ['precio unitario', 'p unit', 'precio']], ['amount', 'Importe de la línea sin IVA', false, ['importe', 'precio sin iva', 'base', 'total']]],
+    send: async (items) => {
+      items.forEach((it, i) => (it._row = i + 2));
+      // tandas sin partir facturas
+      const groups = new Map();
+      for (const it of items) { const k = `${norm(it.supplier_name)}|${String(it.doc ?? '').trim() || String(it.date)}`; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(it); }
+      const chunks = []; let cur = [];
+      for (const g of groups.values()) { if (cur.length && cur.length + g.length > 400) { chunks.push(cur); cur = []; } cur.push(...g); }
+      if (cur.length) chunks.push(cur);
+      const agg = { lines: 0, invoices: 0, already: 0, total: 0, bad: [], ns: new Set(), na: new Set(), uu: new Set(), from: null, to: null, can_create: true };
+      for (const [i, ch] of chunks.entries()) {
+        toast(`Revisando… ${i + 1}/${chunks.length}`);
+        const p = await api('receipts/import', { body: { items: ch, dry: true } });
+        agg.lines += p.lines; agg.invoices += p.invoices; agg.already += p.already; agg.total += p.total; agg.bad.push(...p.bad); agg.can_create = p.can_create;
+        p.new_suppliers.forEach((x) => agg.ns.add(x)); p.new_articles.forEach((x) => agg.na.add(x)); p.unknown_units.forEach((x) => agg.uu.add(x));
+        if (p.from && (!agg.from || p.from < agg.from)) agg.from = p.from; if (p.to && (!agg.to || p.to > agg.to)) agg.to = p.to;
+      }
+      const r = await modal(`<h2>Revisa antes de importar</h2>
+        <div class="grid k">${kpi('Facturas', num(agg.invoices - agg.already, 0), agg.already ? `${agg.already} ya estaban importadas (se saltan)` : `${fdate(agg.from)} → ${fdate(agg.to)}`)}${kpi('Líneas', num(agg.lines, 0), agg.bad.length ? `${agg.bad.length} con error` : '')}${kpi('Importe sin IVA', eur(agg.total), 'de las facturas nuevas')}${kpi('Altas', num(agg.ns.size + agg.na.size, 0), `${agg.ns.size} proveedores · ${agg.na.size} artículos`, agg.na.size > 50 ? 'bad' : '')}</div>
+        ${agg.na.size ? `<details><summary class="small">Artículos que no existen y se darán de alta (${agg.na.size})</summary><div class="small">${[...agg.na].slice(0, 300).map(esc).join(' · ')}</div></details>
+          <p class="small muted">Si son muchos, importa antes el catálogo (Existencias → Importar Excel) para que los nombres coincidan.</p>` : ''}
+        ${agg.ns.size ? `<details><summary class="small">Proveedores nuevos (${agg.ns.size})</summary><div class="small">${[...agg.ns].map(esc).join(' · ')}</div></details>` : ''}
+        ${agg.uu.size ? `<p class="small txt-warn">Unidades que no encajan con el artículo: ${[...agg.uu].map(esc).join(', ')}. Esas líneas entran tal cual (1 = 1 unidad base).</p>` : ''}
+        ${agg.bad.length ? `<details><summary class="small txt-bad">${agg.bad.length} líneas con error (no se importan)</summary>${agg.bad.slice(0, 40).map((b) => `<div class="small">Fila ${b.row}: ${esc(b.name)} — ${esc(b.why)}</div>`).join('')}</details>` : ''}
+        <p class="small muted">Cada factura suma al stock en su fecha y queda en Recepción. Los precios actuales de los artículos no se cambian.</p>
+        <div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok">Importar ${num(agg.invoices - agg.already, 0)} facturas</button></div>`);
+      if (!r) return 'Importación cancelada';
+      let inv = 0, ln = 0;
+      for (const [i, ch] of chunks.entries()) {
+        toast(`Importando… ${i + 1}/${chunks.length}`);
+        const x = await api('receipts/import', { body: { items: ch } });
+        inv += x.created_invoices; ln += x.created_lines;
+      }
+      await reload(); route();
+      return `${inv} facturas importadas (${ln} líneas)`;
+    },
+  });
+}
+
+// Escandallos desde Excel: plato, ingrediente, cantidad por ración, unidad y mermas
+function escandallosImport() {
+  return importWizard({
+    title: 'Importar escandallos', sheetHint: ['escandallo', 'receta', 'ficha'],
+    help: 'Una fila por ingrediente: plato, ingrediente (tal como está en Existencias), cantidad neta POR RACIÓN, unidad (g, kg, ml, cl, l, ud o un formato) y, si quieres, % de merma de limpieza y de cocción. Sustituye los ingredientes de los platos que vengan en el archivo; los demás no se tocan.',
+    template: ['plantilla-escandallos.csv', [['Plato', 'Ingrediente', 'Cantidad por ración', 'Unidad', 'Merma limpieza %', 'Merma cocción %'], ['Chocos fritos', 'Choco limpio', 180, 'g', 10, 0], ['Chocos fritos', 'Harina de freír', 25, 'g', 0, 0], ['Caña Cruzcampo', 'Cruzcampo barril 50 l', 20, 'cl', 3, 0]]],
+    cols: [['recipe', 'Plato', true, ['plato', 'receta', 'producto']], ['name', 'Ingrediente', true, ['ingrediente', 'articulo']], ['qty', 'Cantidad por ración', true, ['cantidad', 'neto', 'gramos']],
+      ['unit', 'Unidad', false, ['unidad', 'ud']], ['waste_pct', 'Merma de limpieza %', false, ['merma limpieza', 'limpieza', 'merma']], ['cook_pct', 'Merma de cocción %', false, ['coccion', 'merma coccion']]],
+    send: async (items) => {
+      const p = await api('recipes/lines-import', { body: { items, dry: true } });
+      const r = await modal(`<h2>Revisa antes de guardar</h2>
+        <div class="grid k">${kpi('Platos', num(p.recipes, 0), 'se sustituyen sus ingredientes')}${kpi('Ingredientes', num(p.lines, 0), '')}${kpi('Sin encontrar', num(p.missing_articles.length + p.missing_dishes.length, 0), 'se saltan', p.missing_articles.length + p.missing_dishes.length ? 'bad' : '')}</div>
+        ${p.missing_dishes.length ? `<details open><summary class="small txt-bad">Platos que no están en la carta (${p.missing_dishes.length})</summary><div class="small">${p.missing_dishes.slice(0, 100).map(esc).join(' · ')}</div></details>` : ''}
+        ${p.missing_articles.length ? `<details open><summary class="small txt-bad">Ingredientes que no están en Existencias (${p.missing_articles.length})</summary><div class="small">${p.missing_articles.slice(0, 100).map(esc).join(' · ')}</div><p class="small muted">Escríbelos igual que en Existencias o dalos de alta antes.</p></details>` : ''}
+        ${p.bad.length ? `<details><summary class="small txt-bad">${p.bad.length} filas con error</summary>${p.bad.slice(0, 40).map((b) => `<div class="small">Fila ${b.row}: ${esc(b.name)} — ${esc(b.why)}</div>`).join('')}</details>` : ''}
+        <div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok" ${p.recipes ? '' : 'disabled'}>Guardar ${num(p.recipes, 0)} escandallos</button></div>`);
+      if (!r) return 'Importación cancelada';
+      const x = await api('recipes/lines-import', { body: { items } });
+      await reload(); route();
+      return `${x.saved} escandallos guardados`;
+    },
+  });
+}
 
 async function recepcionNueva(v, orderId, prefill) {
   let order = null, lines = [];
@@ -895,7 +967,9 @@ function costing({ lines, portions, pvp, misc_pct }) {
 function dishNumbers(r) {
   const net = r.pvp / ivaDiv(), fx = S.fixed?.pct;
   const gf = fx != null ? net * (fx / 100) : null;
-  return { net, fc: net && r.n_lines ? (r.cost / net) * 100 : null, gf, profit: gf != null && r.n_lines ? net - r.cost - gf : null };
+  const target = Number(S.settings.food_cost_target) || 30;
+  return { net, fc: net && r.n_lines ? (r.cost / net) * 100 : null, gf, profit: gf != null && r.n_lines ? net - r.cost - gf : null,
+    rec: r.n_lines && r.cost ? (r.cost / (target / 100)) * ivaDiv() : null };
 }
 // precio legible: en g/ml/cl se muestra por kg/l
 const priceLabel = (p, unit, up) => (['g', 'ml', 'cl'].includes(unit) ? `${eur(p.price)}/${p.unit}` : `${eur(up)}/${unitShort(p, unit)}`);
@@ -915,23 +989,24 @@ VIEWS.escandallos = async (v, id, q) => {
   const fx = S.fixed;
   const cats = [...new Set(S.recipes.map((r) => r.category || 'Sin categoría'))];
   v.innerHTML = `<div class="row between"><h1>Carta y escandallos</h1><div class="row">
-      ${can('escandallos.editar') ? '<button id="imp">Importar carta</button>' : ''}${canAny('escandallos.editar', 'ventas.gestionar') ? '<button id="exp">⬇ Exportar para Qamarero</button>' : ''}
+      ${can('escandallos.editar') ? '<button id="imp">Importar carta</button><button id="impesc">Importar escandallos</button>' : ''}${canAny('escandallos.editar', 'ventas.gestionar') ? '<button id="exp">⬇ Exportar para Qamarero</button>' : ''}
       ${can('escandallos.editar') ? '<a class="btn" href="#/escandallos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/escandallos/nuevo">+ Nuevo plato</a>' : ''}</div></div>
     ${CARTA_TABS('platos')}
     ${showCost ? `<div class="card small">${fx?.pct != null ? `Gastos fijos imputados: <b>${pct(fx.pct)}</b> del precio sin IVA de cada plato (${eur(fx.monthly)}/mes ÷ ${eur(fx.revenue)}/mes de facturación, según ${esc(fx.source)}).` : `Para repartir los gastos fijos entre los platos, indica la <b>facturación mensual prevista</b> en <a href="#/ajustes">Ajustes</a> o importa ventas${fx?.note ? ` (${esc(fx.note)})` : ''}.`} Objetivo de coste de materia prima: ${num(target)} %.</div>` : ''}
     <div class="card"><div class="row"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar plato…"></div>
       <select id="fcat" style="width:auto"><option value="">Todas las categorías</option>${cats.map((c) => `<option>${esc(c)}</option>`).join('')}</select></div>
-    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>Plato</th><th>Categoría</th>${showCost ? '<th class="num">Coste MP</th>' : ''}<th class="num">PVP</th>${showCost ? '<th class="num">% coste</th><th class="num">Gastos fijos</th><th class="num">Beneficio neto</th>' : ''}<th>Alérgenos</th></tr></thead><tbody>
+    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>Plato</th><th>Categoría</th>${showCost ? '<th class="num">Coste MP</th>' : ''}<th class="num">PVP</th>${showCost ? `<th class="num" title="Precio con IVA para quedar en el ${num(target)} % de coste">PVP recomendado</th><th class="num">% coste</th><th class="num">Gastos fijos</th><th class="num">Beneficio neto</th>` : ''}<th>Alérgenos</th></tr></thead><tbody>
     ${S.recipes.map((r) => { const d = dishNumbers(r); const al = [...new Set([...splitList(r.ing_allergens), ...splitList(r.allergens_extra)])];
       return `<tr class="click" data-h="#/escandallos/${r.id}" data-c="${esc(r.category || 'Sin categoría')}" data-n="${esc(norm(r.name + ' ' + (r.category || '')))}"><td>${esc(r.name)}${r.n_lines ? '' : ' <span class="pill warn">sin escandallo</span>'}</td><td>${esc(r.category || '')}</td>
       ${showCost ? `<td class="num">${r.n_lines ? eur(r.cost) : '—'}</td>` : ''}<td class="num">${eur(r.pvp)}</td>
-      ${showCost ? `<td class="num">${d.fc != null ? `<span class="${d.fc > target + 3 ? 'txt-bad' : d.fc <= target ? 'txt-ok' : 'txt-warn'}">${pct(d.fc)}</span>` : '—'}</td><td class="num">${d.gf != null ? eur(d.gf) : '—'}</td><td class="num">${d.profit != null ? `<span class="${d.profit < 0 ? 'txt-bad' : ''}">${eur(d.profit)}</span>` : '—'}</td>` : ''}
-      <td>${algIcons(al) || (r.n_lines ? '<span class="muted small">ninguno</span>' : '<span class="muted small">—</span>')}${r.alg_unchecked ? ` <span class="pill warn" title="${r.alg_unchecked} ingrediente(s) sin revisar">revisar</span>` : ''}</td></tr>`; }).join('') || `<tr><td colspan="8" class="empty">No hay platos. ${can('escandallos.editar') ? 'Importa tu carta de Qamarero o crea el primero.' : ''}</td></tr>`}
-    </tbody></table></div>${showCost ? `<p class="small muted">Coste MP = materia prima por ración, incluido el % de varios. % coste sobre PVP sin IVA (${num(S.settings.iva_pct)} %). Beneficio neto = PVP sin IVA − materia prima − gastos fijos imputados.</p>` : ''}</div>`;
+      ${showCost ? `<td class="num">${d.rec ? `<span class="${r.pvp < d.rec - 0.05 ? 'txt-bad' : 'muted'}" title="${r.pvp < d.rec - 0.05 ? `Faltan ${eur(d.rec - r.pvp)} para llegar al objetivo` : 'El PVP actual ya cumple el objetivo'}">${eur(d.rec)}</span>` : '—'}</td><td class="num">${d.fc != null ? `<span class="${d.fc > target + 3 ? 'txt-bad' : d.fc <= target ? 'txt-ok' : 'txt-warn'}">${pct(d.fc)}</span>` : '—'}</td><td class="num">${d.gf != null ? eur(d.gf) : '—'}</td><td class="num">${d.profit != null ? `<span class="${d.profit < 0 ? 'txt-bad' : ''}">${eur(d.profit)}</span>` : '—'}</td>` : ''}
+      <td>${algIcons(al) || (r.n_lines ? '<span class="muted small">ninguno</span>' : '<span class="muted small">—</span>')}${r.alg_unchecked ? ` <span class="pill warn" title="${r.alg_unchecked} ingrediente(s) sin revisar">revisar</span>` : ''}</td></tr>`; }).join('') || `<tr><td colspan="9" class="empty">No hay platos. ${can('escandallos.editar') ? 'Importa tu carta de Qamarero o crea el primero.' : ''}</td></tr>`}
+    </tbody></table></div>${showCost ? `<p class="small muted">Coste MP = materia prima por ración, incluido el % de varios. % coste sobre PVP sin IVA (${num(S.settings.iva_pct)} %). Beneficio neto = PVP sin IVA − materia prima − gastos fijos imputados. PVP recomendado = el precio con IVA para que la materia prima sea el ${num(target)} % (en rojo si el actual se queda por debajo).</p>` : ''}</div>`;
   bindRowLinks(v);
   const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value; $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', (q2 && !tr.dataset.n.includes(q2)) || (c && tr.dataset.c !== c))); };
   $('#search').oninput = filt; $('#fcat').onchange = filt;
   if ($('#exp')) $('#exp').onclick = (e) => act(e.target, exportCartaQamarero);
+  if ($('#impesc')) $('#impesc').onclick = () => escandallosImport();
   if ($('#imp')) $('#imp').onclick = () => importWizard({
     title: 'Importar carta (platos y precios)', sheetHint: ['carta', 'plato'],
     help: 'Sube el Excel o CSV de la carta exportado de Qamarero. Se crean los platos que no existan y se actualiza el PVP de los que sí. La app guarda las columnas del archivo para poder exportar la carta después en el mismo formato.',
@@ -1019,11 +1094,11 @@ async function cartaLista(v) {
         <span class="row"><input id="pct" type="number" step="any" placeholder="%" style="width:80px"><select id="rnd" style="width:auto"><option value="0.05">redondear a 0,05</option><option value="0.1">a 0,10</option><option value="0.5">a 0,50</option><option value="1">a 1 €</option><option value="0">sin redondeo</option></select><button type="button" id="apct">Cambiar PVP %</button></span>
         ${showCost ? '<button type="button" id="arec">Poner PVP recomendado</button>' : ''}
         <span class="row"><input id="ncat" list="dl-rcat" placeholder="Categoría" style="width:150px"><button type="button" id="acat">Poner categoría</button></span></div>
-      <div class="table-wrap"><table class="grid-edit"><thead><tr><th><input type="checkbox" id="all"></th><th>Plato</th><th>Categoría</th><th class="num">Raciones</th><th class="num">PVP con IVA</th>${showCost ? '<th class="num">Coste MP</th><th class="num">% coste</th><th class="num">Beneficio neto</th>' : ''}</tr></thead><tbody>
+      <div class="table-wrap"><table class="grid-edit"><thead><tr><th><input type="checkbox" id="all"></th><th>Plato</th><th>Categoría</th><th class="num">Raciones</th><th class="num">PVP con IVA</th>${showCost ? '<th class="num">Coste MP</th><th class="num">PVP recomendado</th><th class="num">% coste</th><th class="num">Beneficio neto</th>' : ''}</tr></thead><tbody>
       ${rows.map((r, i) => `<tr data-i="${i}" data-n="${esc(norm(r.name))}" data-c="${esc(r.category || '')}"><td><input type="checkbox" data-sel></td>
         <td><input data-k="name" value="${esc(r.name)}"></td><td><input data-k="category" list="dl-rcat" value="${esc(r.category || '')}"></td>
         <td class="num"><input class="qty" type="number" step="any" data-k="portions" value="${r.portions}"></td><td class="num"><input class="qty" type="number" step="0.01" data-k="pvp" value="${r.pvp}"></td>
-        ${showCost ? `<td class="num">${r.n_lines ? eur(r.cost) : '—'}</td><td class="num" data-fc></td><td class="num" data-pr></td>` : ''}</tr>`).join('')}</tbody></table></div>
+        ${showCost ? `<td class="num">${r.n_lines ? eur(r.cost) : '—'}</td><td class="num" data-rc></td><td class="num" data-fc></td><td class="num" data-pr></td>` : ''}</tr>`).join('')}</tbody></table></div>
       <div class="sticky-foot row between"><span class="small muted" id="nchg">Sin cambios</span><button class="primary" id="save" disabled>Guardar cambios</button></div></div>`;
   const tr = (i) => $(`tr[data-i="${i}"]`, v);
   const calc = (i) => {
@@ -1033,6 +1108,7 @@ async function cartaLista(v) {
     // si cambian las raciones, el coste por ración cambia en proporción
     const cost = r.n_lines ? (r.cost * r._o.portions) / (Number(r.portions) || 1) : null, d = dishNumbers({ ...r, cost });
     $('[data-fc]', t).innerHTML = d.fc != null ? `<span class="${d.fc > target + 3 ? 'txt-bad' : d.fc <= target ? 'txt-ok' : 'txt-warn'}">${pct(d.fc)}</span>` : '—';
+    $('[data-rc]', t).innerHTML = d.rec ? `<span class="${r.pvp < d.rec - 0.05 ? 'txt-bad' : 'muted'}">${eur(d.rec)}</span>` : '—';
     $('[data-pr]', t).innerHTML = d.profit != null ? `<span class="${d.profit < 0 ? 'txt-bad' : ''}">${eur(d.profit)}</span>` : '—';
   };
   const changed = () => rows.map((r, i) => [r, i]).filter(([r]) => ['name', 'category', 'portions', 'pvp'].some((k) => String(r[k] ?? '') !== String(r._o[k] ?? '')));
@@ -1405,12 +1481,16 @@ VIEWS.ventas = async (v, _id, q) => {
   }
 
   if (tab === 'historial') {
-    const imps = await api('sales/imports');
-    v.innerHTML = head + tableCard('Volcados de ventas', imps, ['Periodo', 'Origen', 'Platos', 'Ventas sin IVA', ''], (i) => [`${fdate(i.date_from)} → ${fdate(i.date_to)}`, esc(i.filename || ''), num(i.rows, 0), eur(i.revenue), `<button class="sm danger" data-del="${i.id}">Deshacer</button>`], 'Todavía no se han importado ventas');
+    const [imps, stale] = await Promise.all([api('sales/imports'), api('sales/stale')]);
+    v.innerHTML = head + (stale.ids.length ? `<div class="card row between" style="border-color:var(--accent)"><div><b>Has cambiado escandallos después de volcar ventas.</b><div class="small muted">${stale.ids.length} volcado(s) se calcularon con los escandallos anteriores. Recalcula para que el consumo y el stock teórico usen los de ahora (las ventas en euros no cambian).</div></div><button class="primary" id="recalc">Recalcular consumo</button></div>` : '') + tableCard('Volcados de ventas', imps, ['Periodo', 'Origen', 'Platos', 'Ventas sin IVA', ''], (i) => [`${fdate(i.date_from)} → ${fdate(i.date_to)}`, esc(i.filename || ''), num(i.rows, 0), eur(i.revenue), `<button class="sm danger" data-del="${i.id}">Deshacer</button>`], 'Todavía no se han importado ventas');
     $$('[data-del]', v).forEach((b) => (b.onclick = () => act(b, async () => {
       if (!(await confirmModal('Se borrarán esas ventas y su consumo teórico. Podrás volver a importarlas.', 'Deshacer'))) return;
       await api('sales/imports/' + b.dataset.del, { method: 'DELETE' }); toast('Importación deshecha'); route();
     })));
+    if ($('#recalc')) $('#recalc').onclick = (e) => act(e.target, async () => {
+      for (const [i, id] of stale.ids.entries()) { toast(`Recalculando ${i + 1}/${stale.ids.length}…`); await api('sales/recalc/' + id, { body: {} }); }
+      toast('Consumo recalculado con los escandallos actuales'); route();
+    });
     return;
   }
 
@@ -1471,7 +1551,7 @@ Content-Type: application/json
     if (!rows.length) throw new Error('No encuentro filas con producto y unidades');
     const { matched, pending } = await api('sales/match', { body: { rows } });
     $('#res').innerHTML = `<h3 style="margin-top:18px">Reconocidos (${matched.length})</h3>
-      ${matched.length ? `<div class="table-wrap"><table><thead><tr><th>Qamarero</th><th>Plato</th><th class="num">Uds</th><th class="num">Importe</th></tr></thead><tbody>${matched.map((m) => `<tr><td>${esc(m.pos_name)}</td><td>${esc(recById(m.recipe_id)?.name)}${m.factor !== 1 ? ` × ${num(m.factor, 3)}` : ''}</td><td class="num">${num(m.units)}</td><td class="num">${m.revenue != null ? eur(m.revenue) : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty small">Ninguno todavía.</div>'}
+      ${matched.length ? `<div class="table-wrap"><table><thead><tr><th>Qamarero</th><th>Plato</th><th class="num">Uds</th><th class="num">Importe</th></tr></thead><tbody>${matched.map((m) => `<tr><td>${esc(m.pos_name)}</td><td>${esc(recById(m.recipe_id)?.name)}${m.factor !== 1 ? ` × ${num(m.factor, 3)}` : ''}${m.auto ? ' <span class="pill warn" title="Vinculado por parecido: revisa que sea correcto">auto</span>' : ''}</td><td class="num">${num(m.units)}</td><td class="num">${m.revenue != null ? eur(m.revenue) : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty small">Ninguno todavía.</div>'}
       <h3 style="margin-top:18px">Nuevos: asígnalos (${pending.length})</h3>
       ${pending.length ? `<p class="small muted">Elige el plato de cada nombre. Las medias raciones vienen con factor 0,5 propuesto. Lo que dejes sin asignar queda en Pendientes para más tarde. Marca "No es comida" en bebidas sin control, suplementos, etc.</p>
       <div class="table-wrap"><table><thead><tr><th>Qamarero</th><th class="num">Uds</th><th>Plato</th><th class="num">Factor</th><th class="num">PVP variante</th><th>No es comida</th></tr></thead><tbody>
