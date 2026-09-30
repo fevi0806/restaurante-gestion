@@ -211,6 +211,17 @@ async function fixedShare(env, st) {
   return { monthly, revenue: revenue || null, pct: revenue ? (monthly / revenue) * 100 : null, source: revenue ? source : null, note };
 }
 
+// Cloudflare D1 admite como mucho 100 valores por consulta: las listas largas de ids se consultan por tandas
+async function allIn(env, sql, ids, pre = [], post = []) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const part = ids.slice(i, i + 90);
+    const { results } = await env.DB.prepare(sql.replace('(??)', `(${part.map(() => '?').join(',')})`)).bind(...pre, ...part, ...post).all();
+    out.push(...results);
+  }
+  return { results: out };
+}
+
 async function runBatch(env, stmts) {
   for (let i = 0; i < stmts.length; i += 80) await env.DB.batch(stmts.slice(i, i + 80));
 }
@@ -223,10 +234,9 @@ const SUBUNITS = { kg: { g: 0.001, kg: 1 }, l: { ml: 0.001, cl: 0.01, l: 1 }, ud
 async function unitCtx(env, productIds) {
   const ids = [...new Set(productIds.map(Number).filter(Boolean))];
   if (!ids.length) return { pmap: {}, fmap: {} };
-  const ph = ids.map(() => '?').join(',');
   const [{ results: prods }, { results: fmts }] = await Promise.all([
-    env.DB.prepare(`SELECT id, name, unit, price FROM products WHERE id IN (${ph})`).bind(...ids).all(),
-    env.DB.prepare(`SELECT * FROM product_formats WHERE product_id IN (${ph})`).bind(...ids).all(),
+    allIn(env, 'SELECT id, name, unit, price FROM products WHERE id IN (??)', ids),
+    allIn(env, 'SELECT * FROM product_formats WHERE product_id IN (??)', ids),
   ]);
   return { pmap: Object.fromEntries(prods.map((p) => [p.id, p])), fmap: Object.fromEntries(fmts.map((f) => [f.id, f])) };
 }
@@ -649,7 +659,10 @@ async function route(parts, method, request, env, url, ctx = {}) {
     need(user, 'productos.editar');
     const d = await body(request);
     const ids = (d.ids || []).map(Number).filter(Boolean);
-    const { results } = await env.DB.prepare(`SELECT id, name, allergens, allergens_checked FROM products WHERE active = 1 ${ids.length ? `AND id IN (${ids.map(() => '?').join(',')})` : 'AND COALESCE(allergens_checked, 0) = 0'} ORDER BY name LIMIT 300`).bind(...ids).all();
+    const { results } = ids.length
+      ? await allIn(env, 'SELECT id, name, allergens, allergens_checked FROM products WHERE active = 1 AND id IN (??)', ids.slice(0, 300))
+      : await env.DB.prepare('SELECT id, name, allergens, allergens_checked FROM products WHERE active = 1 AND COALESCE(allergens_checked, 0) = 0 ORDER BY name LIMIT 300').all();
+    results.sort((x, y) => x.name.localeCompare(y.name, 'es'));
     const rows = results.map((p) => ({ id: p.id, name: p.name, current: String(p.allergens || '').split(',').filter(Boolean), checked: !!p.allergens_checked, dict: dictAllergens(p.name), ai: null }));
     let aiUsed = false;
     if (d.use_ai !== false) {
@@ -1297,8 +1310,10 @@ async function inventoryImport(request, env, user) {
   const byName = new Map(prods.map((p) => [normName(p.name), p]));
   const canCreate = can(user, 'productos.editar');
   const rows = [], bad = [], unknownUnits = new Set();
+  let blank = 0;
   for (const [n, i] of raw.entries()) {
     const qty = numIn(i.qty);
+    if (String(i.qty ?? '').trim() === '') { blank++; continue; }   // sin contar: no se toca
     if (isNaN(qty) || qty < 0) { bad.push({ row: n + 2, name: i.name, why: 'cantidad no válida' }); continue; }
     const p = byName.get(normName(i.name));
     const u = String(i.unit ?? '').trim().toLowerCase();
@@ -1330,7 +1345,8 @@ async function inventoryImport(request, env, user) {
   const news = list.filter((r) => !r.p);
   const value = list.reduce((t, r) => t + r.qty * (r.price ?? r.p?.price ?? 0), 0);
   const firstInv = !(await env.DB.prepare('SELECT id FROM inventories LIMIT 1').first());
-  const preview = { rows: raw.length, first_inventory: firstInv, unknown_units: [...unknownUnits].slice(0, 10), articles: list.length, matched: list.length - news.length, dups, bad, value: r2(value), can_create: canCreate,
+  if (!rows.length) throw new HttpError(400, blank ? 'Ninguna fila tiene cantidad: rellena la columna de cantidad con lo que hayas contado' : 'No hay ninguna fila con cantidad válida');
+  const preview = { rows: raw.length, blank, first_inventory: firstInv, unknown_units: [...unknownUnits].slice(0, 10), articles: list.length, matched: list.length - news.length, dups, bad, value: r2(value), can_create: canCreate,
     new_items: news.map((r) => ({ name: r.name, unit: r.base, qty: r2(r.qty), price: r.price ? r2(r.price) : null })),
     price_changes: list.filter((r) => r.p && r.price && Math.abs(r.price - r.p.price) > 0.005).length,
     sample: list.slice(0, 8).map((r) => ({ name: r.p?.name || r.name, unit: r.base, qty: r2(r.qty), price: r2(r.price ?? r.p?.price ?? 0), is_new: !r.p, unit_note: r.unit_note })) };
@@ -1413,7 +1429,7 @@ async function productsBulkEdit(request, env, user) {
   const d = await body(request);
   const items = (d.items || []).filter((i) => Number(i.id));
   if (!items.length) return json({ ok: true, count: 0 });
-  const { results: cur } = await env.DB.prepare(`SELECT id, price FROM products WHERE id IN (${items.map(() => '?').join(',')})`).bind(...items.map((i) => i.id)).all();
+  const { results: cur } = await allIn(env, 'SELECT id, price FROM products WHERE id IN (??)', items.map((i) => Number(i.id)));
   const old = Object.fromEntries(cur.map((p) => [p.id, p.price]));
   const allowed = ['name', 'category', 'price', 'supplier_id', 'min_stock', 'allergens', 'allergens_checked'];
   const stmts = [];
@@ -1872,7 +1888,7 @@ async function importSales(env, userId, d) {
   }
 
   const ids = [...new Set(rows.map((r) => Number(r.recipe_id)))];
-  const { results: recs } = await env.DB.prepare(`SELECT id, name, pvp, portions FROM recipes WHERE id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all();
+  const { results: recs } = await allIn(env, 'SELECT id, name, pvp, portions FROM recipes WHERE id IN (??)', ids);
   const rmap = Object.fromEntries(recs.map((r) => [r.id, r]));
 
   // agrupar por plato: raciones equivalentes = unidades vendidas × factor
@@ -1888,10 +1904,9 @@ async function importSales(env, userId, d) {
     byRecipe[rec.id].units += units * factor;
     byRecipe[rec.id].revenue += gross / div;
   }
-  const { results: lines } = await env.DB.prepare(
+  const { results: lines } = await allIn(env,
     `SELECT rl.recipe_id, rl.product_id, rl.qty, rl.waste_pct, rl.cook_loss_pct, p.price FROM recipe_lines rl JOIN products p ON p.id = rl.product_id
-     WHERE rl.recipe_id IN (${ids.map(() => '?').join(',')})`
-  ).bind(...ids).all();
+     WHERE rl.recipe_id IN (??)`, ids);
 
   let totalRevenue = 0;
   const saleRows = [], consumption = {};
