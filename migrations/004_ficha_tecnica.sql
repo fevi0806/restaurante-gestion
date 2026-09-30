@@ -1,0 +1,13 @@
+ALTER TABLE products ADD COLUMN allergens TEXT;
+ALTER TABLE products ADD COLUMN allergens_checked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE recipes ADD COLUMN pos_raw TEXT;
+ALTER TABLE recipes ADD COLUMN plating TEXT;
+ALTER TABLE recipes ADD COLUMN conservation TEXT;
+ALTER TABLE recipes ADD COLUMN prep_time TEXT;
+ALTER TABLE recipes ADD COLUMN misc_pct REAL;
+ALTER TABLE recipes ADD COLUMN allergens_extra TEXT;
+ALTER TABLE recipes ADD COLUMN photo TEXT;
+ALTER TABLE recipes ADD COLUMN author TEXT;
+ALTER TABLE recipes ADD COLUMN updated_at TEXT;
+ALTER TABLE recipe_lines ADD COLUMN cook_loss_pct REAL NOT NULL DEFAULT 0;
+INSERT OR IGNORE INTO settings(key, value) VALUES ('misc_pct', '3');
