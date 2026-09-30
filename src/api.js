@@ -1,5 +1,7 @@
 // API de la aplicación de gestión del restaurante (Cloudflare Workers + D1)
 import { ensureSchema, SCHEMA_VERSION } from './migrate.js';
+import { turnos, publicSchedule } from './turnos.js';
+import { push, enqueuePush, pushUsersWith } from './push.js';
 
 const ALL = ['direccion', 'cocina', 'sala'];
 
@@ -52,7 +54,7 @@ ${names.map((x) => '- ' + x).join('\n')}`;
 }
 
 // tablas de módulos posteriores que también entran en la copia
-const BACKUP_EXTRA = ['appcc_equipment', 'appcc_temps', 'appcc_tasks', 'appcc_cleaning'];
+const BACKUP_EXTRA = ['appcc_equipment', 'appcc_temps', 'appcc_tasks', 'appcc_cleaning', 'staff', 'shift_templates', 'shifts', 'schedule_weeks'];
 
 // ---------- permisos ----------
 // El superusuario lo puede todo y decide con casillas qué puede hacer cada persona.
@@ -66,10 +68,11 @@ const PERMS = [
   'escandallos.ver', 'escandallos.editar', 'produccion.registrar',
   'productos.editar', 'ventas.gestionar', 'gastos.gestionar',
   'appcc.registrar', 'appcc.gestionar',
+  'turnos.ver', 'turnos.gestionar',
 ];
 const TEMPLATES = {
-  sala: ['caja.registrar', 'mermas.registrar', 'escandallos.ver', 'appcc.registrar'],
-  cocina: ['pedidos.ver', 'pedidos.crear', 'recepcion.ver', 'recepcion.crear', 'mermas.registrar', 'mermas.ver_todas', 'stock.ver', 'inventario.hacer', 'escandallos.ver', 'escandallos.editar', 'produccion.registrar', 'productos.editar', 'costes.ver', 'appcc.registrar', 'appcc.gestionar'],
+  sala: ['caja.registrar', 'mermas.registrar', 'escandallos.ver', 'appcc.registrar', 'turnos.ver'],
+  cocina: ['pedidos.ver', 'pedidos.crear', 'recepcion.ver', 'recepcion.crear', 'mermas.registrar', 'mermas.ver_todas', 'stock.ver', 'inventario.hacer', 'escandallos.ver', 'escandallos.editar', 'produccion.registrar', 'productos.editar', 'costes.ver', 'appcc.registrar', 'appcc.gestionar', 'turnos.ver'],
   direccion: PERMS,
 };
 const permsOf = (u) => {
@@ -358,7 +361,7 @@ export async function onRequest({ request, env, params, ctx: wctx }) {
 // ---------- registro de actividad ----------
 const ENTITY = { products: 'artículo', suppliers: 'proveedor', fixed_costs: 'gasto fijo', users: 'usuario', orders: 'pedido', receipts: 'recepción',
   movements: 'merma / consumo', inventory: 'inventario', recipes: 'plato', sales: 'ventas', 'pos-aliases': 'vínculo Qamarero', 'pos-pending': 'ventas pendientes',
-  settings: 'ajustes', cash: 'caja', allergens: 'alérgenos', appcc: 'APPCC', production: 'producción', backup: 'copia de seguridad', integrations: 'integración' };
+  settings: 'ajustes', cash: 'caja', allergens: 'alérgenos', appcc: 'APPCC', production: 'producción', backup: 'copia de seguridad', integrations: 'integración', turnos: 'turnos', push: 'avisos' };
 function cleanBody(raw) {
   let d = null;
   try { d = raw ? JSON.parse(raw) : null; } catch { return null; }
@@ -456,9 +459,14 @@ async function route(parts, method, request, env, url, ctx = {}) {
     return json(out);
   }
 
+  // cuadrante publicado: se ve con el enlace, sin entrar
+  if (a === 'public' && b === 'turnos' && c && method === 'GET') return publicSchedule(env, c);
+
   const user = await getUser(request, env);
   if (!user) throw new HttpError(401, 'Sesión caducada. Vuelve a entrar.');
   ctx.user = user;
+  if (a === 'turnos') return turnos(env, user, ctx, method, b, c, request, url);
+  if (a === 'push') return push(env, user, ctx, method, b, request, url);
   // las consultas masivas de lectura no se registran
   if (a === 'allergens' || (a === 'sales' && b === 'match')) ctx.audit = false;
 
@@ -549,7 +557,8 @@ async function route(parts, method, request, env, url, ctx = {}) {
       formats = formats.map(({ price, ...f }) => f);
     }
     const fixed = can(user, 'costes.ver') ? await fixedShare(env, st) : null;
-    return json({ user, settings: { ...st, qamarero_cols: undefined, has_qamarero_format: !!st.qamarero_cols }, suppliers: sup.results, products, recipes, formats, fixed, allergens: ALLERGENS });
+    const me = await env.DB.prepare('SELECT id, name, department, token FROM staff WHERE user_id = ? AND active = 1').bind(user.id).first();
+    return json({ user, settings: { ...st, qamarero_cols: undefined, has_qamarero_format: !!st.qamarero_cols }, suppliers: sup.results, products, recipes, formats, fixed, allergens: ALLERGENS, me_staff: me || null });
   }
 
   // --- vínculos Qamarero -> plato ---
@@ -783,6 +792,10 @@ async function route(parts, method, request, env, url, ctx = {}) {
         `INSERT INTO order_lines (order_id, product_id, qty, price, input_qty, input_unit, unit_label) VALUES (?,?,?,?,?,?,?)`
       ).bind(o.id, r.p.id, r2(r.base), r.p.price, r.qty, r.unit, r.label)));
       await runBatch(env, stmts);
+      if (status === 'pendiente' && (!prev || prev.status !== 'pendiente')) {
+        const sup = await env.DB.prepare('SELECT name FROM suppliers WHERE id = ?').bind(d.supplier_id).first();
+        await enqueuePush(env, (await approvers(env, user.id)).map((x) => x.id), { title: 'Pedido para aprobar', body: `${user.name} ha hecho un pedido a ${sup?.name || 'un proveedor'} (${rows.length} artículos)`, url: `/#/pedidos/${o.id}`, tag: 'pedido-' + o.id });
+      }
       return json({ id: o.id, status, approvers: status === 'pendiente' ? await approvers(env, user.id) : [] });
     }
     if (method === 'PUT' && b && c === 'status') {
@@ -798,6 +811,9 @@ async function route(parts, method, request, env, url, ctx = {}) {
       await env.DB.prepare(`UPDATE orders SET status = ?, approved_by = CASE WHEN ? = 'enviado' THEN ? ELSE approved_by END, approved_at = CASE WHEN ? = 'enviado' THEN datetime('now') ELSE approved_at END,
         notes = CASE WHEN ? <> '' THEN COALESCE(notes || char(10), '') || ? ELSE notes END WHERE id = ?`)
         .bind(d.status, d.status, user.id, d.status, reason, `Rechazado por ${user.name}: ${reason}`, b).run();
+      if (o.user_id && o.user_id !== user.id && ['enviado', 'cancelado'].includes(d.status))
+        await enqueuePush(env, [o.user_id], { title: d.status === 'enviado' ? 'Pedido aprobado' : 'Pedido rechazado', body: `Tu pedido #${b} ${d.status === 'enviado' ? 'ha sido aprobado y enviado al proveedor' : 'ha sido rechazado' + (reason ? ': ' + reason : '')} (${user.name})`, url: `/#/pedidos/${b}`, tag: 'pedido-' + b });
+      if (d.status === 'pendiente') await enqueuePush(env, (await approvers(env, user.id)).map((x) => x.id), { title: 'Pedido para aprobar', body: `${user.name} ha enviado el pedido #${b} a aprobación`, url: `/#/pedidos/${b}`, tag: 'pedido-' + b });
       ctx.audit = { action: d.status === 'enviado' ? 'aprobación' : d.status === 'cancelado' ? 'cancelación' : 'cambio de estado', id: b,
         summary: `Pedido #${b}: ${d.status === 'enviado' ? 'aprobado y enviado al proveedor' : d.status === 'cancelado' ? 'cancelado' + (reason ? ' (' + reason + ')' : '') : d.status === 'pendiente' ? 'enviado a aprobación' : d.status}` };
       return json({ ok: true, approvers: d.status === 'pendiente' ? await approvers(env, user.id) : [] });
@@ -954,32 +970,10 @@ async function route(parts, method, request, env, url, ctx = {}) {
       ).all();
       return json(results);
     }
+    if (method === 'POST' && b === 'import') return inventoryImport(request, env, user);
     if (method === 'POST') {
       const d = await body(request);
-      const counts = (d.counts || []).filter((x) => x.product_id && x.counted !== '' && x.counted !== null && !isNaN(Number(x.counted)));
-      if (!counts.length) throw new HttpError(400, 'No has contado ningún artículo');
-      const date = isDate(d.date) ? d.date : todayStr();
-      const { results: prods } = await env.DB.prepare(PRODUCTS_SQL).all();
-      const pmap = Object.fromEntries(prods.map((p) => [p.id, p]));
-      const inv = await env.DB.prepare('INSERT INTO inventories (inv_date, notes, user_id) VALUES (?,?,?) RETURNING id').bind(date, d.notes || null, user.id).first();
-      const stmts = [], diffs = [];
-      let totalDiff = 0;
-      for (const cnt of counts) {
-        const p = pmap[cnt.product_id];
-        if (!p) continue;
-        stmts.push(env.DB.prepare('INSERT INTO inventory_lines (inventory_id, product_id, expected, counted, detail) VALUES (?,?,?,?,?)')
-          .bind(inv.id, p.id, r2(p.stock), r2(Number(cnt.counted)), cnt.detail || null));
-        const delta = r2(Number(cnt.counted) - Number(p.stock));
-        if (Math.abs(delta) < 0.0001) continue;
-        totalDiff += delta * p.price;
-        diffs.push({ name: p.name, unit: p.unit, expected: p.stock, counted: Number(cnt.counted), delta, value: delta * p.price, detail: cnt.detail || null });
-        stmts.push(env.DB.prepare(
-          `INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`
-        ).bind(p.id, 'ajuste', delta, p.price, `Inventario ${date}`, uuid(), 'inventario', inv.id, user.id, date));
-      }
-      stmts.push(env.DB.prepare('UPDATE inventories SET total_diff_value = ? WHERE id = ?').bind(r2(totalDiff), inv.id));
-      await runBatch(env, stmts);
-      return json({ id: inv.id, diffs, total_diff_value: r2(totalDiff) });
+      return json(await saveInventory(env, user, d));
     }
   }
 
@@ -1253,6 +1247,121 @@ function normUnit(u) {
   return 'ud';
 }
 
+
+// Guarda un recuento: la diferencia con el stock teórico entra como ajuste
+async function saveInventory(env, user, d) {
+  const counts = (d.counts || []).filter((x) => x.product_id && x.counted !== '' && x.counted !== null && !isNaN(Number(x.counted)));
+  if (!counts.length) throw new HttpError(400, 'No has contado ningún artículo');
+  const date = isDate(d.date) ? d.date : todayStr();
+  const { results: prods } = await env.DB.prepare(PRODUCTS_SQL).all();
+  const pmap = Object.fromEntries(prods.map((p) => [p.id, p]));
+  const inv = await env.DB.prepare('INSERT INTO inventories (inv_date, notes, user_id) VALUES (?,?,?) RETURNING id').bind(date, d.notes || null, user.id).first();
+  const stmts = [], diffs = [];
+  let totalDiff = 0;
+  for (const cnt of counts) {
+    const p = pmap[cnt.product_id];
+    if (!p) continue;
+    stmts.push(env.DB.prepare('INSERT INTO inventory_lines (inventory_id, product_id, expected, counted, detail) VALUES (?,?,?,?,?)')
+      .bind(inv.id, p.id, r2(p.stock), r2(Number(cnt.counted)), cnt.detail || null));
+    const delta = r2(Number(cnt.counted) - Number(p.stock));
+    if (Math.abs(delta) < 0.0001) continue;
+    if (d.initial) {
+      // stock de arranque: entra como existencias, no como descuadre
+      stmts.push(env.DB.prepare(`INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .bind(p.id, 'entrada', delta, p.price, 'Stock inicial', uuid(), 'stock_inicial', inv.id, user.id, date));
+      continue;
+    }
+    totalDiff += delta * p.price;
+    diffs.push({ name: p.name, unit: p.unit, expected: p.stock, counted: Number(cnt.counted), delta, value: delta * p.price, detail: cnt.detail || null });
+    stmts.push(env.DB.prepare(
+      `INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`
+    ).bind(p.id, 'ajuste', delta, p.price, `Inventario ${date}`, uuid(), 'inventario', inv.id, user.id, date));
+  }
+  stmts.push(env.DB.prepare('UPDATE inventories SET total_diff_value = ? WHERE id = ?').bind(r2(totalDiff), inv.id));
+  await runBatch(env, stmts);
+  return { id: inv.id, diffs, total_diff_value: r2(totalDiff) };
+}
+
+// Inventario inicial (o cualquier recuento) desde un Excel: artículo, cantidad, unidad y, opcionalmente, precio, categoría y proveedor.
+// Da de alta los artículos que falten, actualiza precios y guarda el recuento. Con dry = true solo devuelve la vista previa.
+const normName = (x) => String(x || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ');
+const numIn = (v) => { if (typeof v === 'number') return v; let t = String(v ?? '').replace(/[€\s]/g, ''); if (!t) return NaN; if (t.includes(',') && t.includes('.')) t = t.lastIndexOf(',') > t.lastIndexOf('.') ? t.replace(/\./g, '').replace(',', '.') : t.replace(/,/g, ''); else t = t.replace(',', '.'); return Number(t); };
+const SUB_FACTOR = { g: 0.001, gr: 0.001, gramos: 0.001, ml: 0.001, cl: 0.01 };
+const KNOWN_UNITS = ['ud', 'uds', 'u', 'un', 'unidad', 'unidades', 'kg', 'kgs', 'kilo', 'kilos', 'g', 'gr', 'gramos', 'l', 'lt', 'litro', 'litros', 'ml', 'cl'];
+async function inventoryImport(request, env, user) {
+  const d = await body(request);
+  const raw = (d.items || []).filter((i) => String(i.name || '').trim());
+  if (!raw.length) throw new HttpError(400, 'El archivo no tiene filas con nombre de artículo');
+  const { results: prods } = await env.DB.prepare(PRODUCTS_SQL).all();
+  const { results: fmts } = await env.DB.prepare('SELECT * FROM product_formats WHERE active = 1').all();
+  const byName = new Map(prods.map((p) => [normName(p.name), p]));
+  const canCreate = can(user, 'productos.editar');
+  const rows = [], bad = [], unknownUnits = new Set();
+  for (const [n, i] of raw.entries()) {
+    const qty = numIn(i.qty);
+    if (isNaN(qty) || qty < 0) { bad.push({ row: n + 2, name: i.name, why: 'cantidad no válida' }); continue; }
+    const p = byName.get(normName(i.name));
+    const u = String(i.unit ?? '').trim().toLowerCase();
+    const base = p ? p.unit : unitIn(u) || 'ud';
+    let factor = 1, fmt = null;
+    if (SUB_FACTOR[u] && ((base === 'kg' && ['g', 'gr', 'gramos'].includes(u)) || (base === 'l' && ['ml', 'cl'].includes(u)))) factor = SUB_FACTOR[u];
+    else if (u && !KNOWN_UNITS.includes(u)) {
+      // "caja", "saco", "botella"… : se busca un formato del artículo con ese nombre
+      fmt = p ? fmts.find((f) => f.product_id === p.id && normName(f.name).includes(normName(u))) : null;
+      if (fmt) factor = Number(fmt.factor);
+      else unknownUnits.add(u);
+    }
+    const price = numIn(i.price);
+    rows.push({ name: String(i.name).trim(), p, base, qty: qty * factor, price: price > 0 ? price / factor : null, category: String(i.category || '').trim() || null,
+      supplier_name: String(i.supplier_name || '').trim() || null, unit_note: fmt ? fmt.name : null });
+  }
+  // artículos repetidos (p. ej. la misma harina en varias facturas): se suman o se queda la última fila
+  const merged = new Map();
+  let dups = 0;
+  for (const r of rows) {
+    const k = normName(r.name), m = merged.get(k);
+    if (!m) { merged.set(k, { ...r }); continue; }
+    dups++;
+    m.qty = d.dup === 'last' ? r.qty : m.qty + r.qty;
+    if (r.price) m.price = r.price;
+    m.category = r.category || m.category; m.supplier_name = r.supplier_name || m.supplier_name;
+  }
+  const list = [...merged.values()];
+  const news = list.filter((r) => !r.p);
+  const value = list.reduce((t, r) => t + r.qty * (r.price ?? r.p?.price ?? 0), 0);
+  const firstInv = !(await env.DB.prepare('SELECT id FROM inventories LIMIT 1').first());
+  const preview = { rows: raw.length, first_inventory: firstInv, unknown_units: [...unknownUnits].slice(0, 10), articles: list.length, matched: list.length - news.length, dups, bad, value: r2(value), can_create: canCreate,
+    new_items: news.map((r) => ({ name: r.name, unit: r.base, qty: r2(r.qty), price: r.price ? r2(r.price) : null })),
+    price_changes: list.filter((r) => r.p && r.price && Math.abs(r.price - r.p.price) > 0.005).length,
+    sample: list.slice(0, 8).map((r) => ({ name: r.p?.name || r.name, unit: r.base, qty: r2(r.qty), price: r2(r.price ?? r.p?.price ?? 0), is_new: !r.p, unit_note: r.unit_note })) };
+  if (d.dry) return json(preview);
+
+  // 1) alta de artículos nuevos y de sus proveedores
+  let created = 0;
+  if (news.length && canCreate) {
+    const { results: sups } = await env.DB.prepare('SELECT id, name FROM suppliers WHERE active = 1').all();
+    const smap = Object.fromEntries(sups.map((x) => [normName(x.name), x.id]));
+    for (const r of news) if (r.supplier_name && !smap[normName(r.supplier_name)])
+      smap[normName(r.supplier_name)] = (await env.DB.prepare('INSERT INTO suppliers (name) VALUES (?) RETURNING id').bind(r.supplier_name).first()).id;
+    await runBatch(env, news.map((r) => env.DB.prepare(`INSERT INTO products (name, category, unit, price, supplier_id) VALUES (?,?,?,?,?) ON CONFLICT(name) DO NOTHING`)
+      .bind(r.name, r.category, r.base, r2(r.price || 0), r.supplier_name ? smap[normName(r.supplier_name)] : null)));
+    created = news.length;
+  }
+  // 2) precios nuevos de los que ya existían (con historial)
+  const stmts = [];
+  if (canCreate && d.update_prices !== false) for (const r of list) if (r.p && r.price && Math.abs(r.price - r.p.price) > 0.00005) {
+    stmts.push(env.DB.prepare('UPDATE products SET price = ? WHERE id = ?').bind(r2(r.price), r.p.id));
+    stmts.push(env.DB.prepare('INSERT INTO price_history (product_id, old_price, new_price, receipt_id) VALUES (?,?,?,NULL)').bind(r.p.id, r.p.price, r2(r.price)));
+  }
+  if (stmts.length) await runBatch(env, stmts);
+  // 3) el recuento
+  const { results: now } = await env.DB.prepare('SELECT id, name FROM products WHERE active = 1').all();
+  const idOf = new Map(now.map((p) => [normName(p.name), p.id]));
+  const counts = list.map((r) => ({ product_id: idOf.get(normName(r.name)), counted: r2(r.qty), detail: 'Importado de Excel' })).filter((c) => c.product_id);
+  const res = await saveInventory(env, user, { counts, date: d.date, initial: !!d.initial, notes: d.notes || (d.initial ? 'Stock inicial importado desde Excel' : 'Inventario importado desde Excel') });
+  return json({ ...res, created, skipped: list.length - counts.length, prices: stmts.length / 2, counted: counts.length });
+}
+
 async function productsBulk(request, env, user) {
   need(user, 'productos.editar');
   const d = await body(request);
@@ -1346,6 +1455,19 @@ async function alerts(env, user) {
   const q1 = (sql, ...b) => env.DB.prepare(sql).bind(...b).first();
   const day = localDay();
   const st = await settings(env);
+  if (can(user, 'turnos.gestionar')) {
+    // a partir del jueves, recordar el cuadrante de la semana siguiente
+    const d = new Date(day + 'T12:00:00Z'), dow = (d.getUTCDay() + 6) % 7;
+    const staffN = await q1('SELECT COUNT(*) AS n FROM staff WHERE active = 1');
+    if (dow >= 3 && staffN.n) {
+      const next = new Date(d.getTime() + (7 - dow) * 86400000).toISOString().slice(0, 10);
+      const w = await q1(`SELECT status, changed FROM schedule_weeks WHERE week = ?`, next);
+      if (!w || w.status !== 'publicado') add(dow >= 5 ? 'bad' : 'warn', '🗓️', 'El cuadrante de la semana que viene aún no está publicado', `#/turnos?week=${next}`);
+    }
+    const cur = new Date(d.getTime() - dow * 86400000).toISOString().slice(0, 10);
+    const pend = await env.DB.prepare(`SELECT week, changed FROM schedule_weeks WHERE week >= ? AND status = 'publicado' AND changed IS NOT NULL AND changed <> '[]'`).bind(cur).all();
+    for (const w of pend.results) add('warn', '🗓️', `Hay cambios en el cuadrante de la semana del ${w.week.slice(8)}/${w.week.slice(5, 7)} sin avisar al personal`, `#/turnos?week=${w.week}`);
+  }
   if (can(user, 'caja.ver')) {
     const r = await q1(`SELECT COUNT(*) AS n, SUM((cash + card + bizum + other) - pos_total) AS diff FROM cash_days WHERE day >= date(?, '-7 days') AND pos_total IS NOT NULL AND (cash + card + bizum + other) - pos_total < -5`, day);
     if (r.n) add('bad', '💶', `Falta dinero en caja ${r.n} día(s) de la última semana (${Math.round(r.diff * 100) / 100} €)`, '#/panel?tab=caja');
@@ -2274,3 +2396,5 @@ async function ocrScan(request, env, user) {
     total_without_vat: raw.total_without_vat || null, total_with_vat: raw.total_with_vat || null, lines,
   });
 }
+
+export { json, HttpError, body, need, can, runBatch, r2, isDate, settings, localDay, permsOf, uuid, todayStr };
