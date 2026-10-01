@@ -275,6 +275,20 @@ async function syncFormats(env, productId, formats) {
   for (const e of existing) if (!keep.has(e.id)) stmts.push(env.DB.prepare('UPDATE product_formats SET active = 0, is_default = 0 WHERE id = ?').bind(e.id));
   if (stmts.length) await runBatch(env, stmts);
 }
+// Añade los formatos que aún no tiene el artículo, sin tocar ni quitar los que ya hay.
+async function addMissingFormats(env, productId, formats) {
+  const { results: existing } = await env.DB.prepare('SELECT id, name, active FROM product_formats WHERE product_id = ?').bind(productId).all();
+  const stmts = [];
+  for (const f of formats) {
+    const name = String(f.name || '').trim();
+    if (!name || !(Number(f.factor) > 0)) continue;
+    const ex = existing.find((e) => e.name.toLowerCase() === name.toLowerCase());
+    if (ex && ex.active) continue;
+    if (ex) stmts.push(env.DB.prepare('UPDATE product_formats SET factor = ?, active = 1 WHERE id = ?').bind(Number(f.factor), ex.id));
+    else stmts.push(env.DB.prepare('INSERT INTO product_formats (product_id, name, factor, price, is_default) VALUES (?,?,?,?,0)').bind(productId, name, Number(f.factor), Number(f.price) > 0 ? Number(f.price) : null));
+  }
+  if (stmts.length) await runBatch(env, stmts);
+}
 
 // ---------- CRUD genérico de maestros ----------
 const TABLES = {
@@ -296,7 +310,7 @@ async function crud(table, id, method, request, env, user, ctx = {}) {
     const { results } = await env.DB.prepare(`SELECT * FROM ${table} WHERE active = 1 ORDER BY 2`).all();
     return json(results);
   }
-  need(user, cfg.write);
+  need(user, (method === 'POST' && ctx.createPerm) || cfg.write);
   if (method === 'DELETE') {
     const old = await env.DB.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
     if (table === 'products' && old?.prep_recipe_id) throw new HttpError(400, 'Este artículo es una elaboración: se gestiona desde Carta → Elaboraciones');
@@ -308,6 +322,17 @@ async function crud(table, id, method, request, env, user, ctx = {}) {
   if (method === 'POST') {
     for (const c of cfg.required) if (!data[c]) throw new HttpError(400, `Falta el campo ${c}`);
     const keys = Object.keys(data);
+    // Un artículo dado de baja con el mismo nombre no se ve en ninguna lista: se reactiva en vez de dar "ya existe".
+    if (table === 'products') {
+      const ex = await env.DB.prepare('SELECT id, active, prep_recipe_id FROM products WHERE name = ? COLLATE NOCASE').bind(data.name).first();
+      if (ex && !ex.active && !ex.prep_recipe_id) {
+        await env.DB.prepare(`UPDATE products SET ${keys.map((k) => `${k} = ?`).join(', ')}, active = 1 WHERE id = ?`).bind(...keys.map((k) => data[k]), ex.id).run();
+        ctx.audit = { action: 'alta', summary: `Reactivación de ${ENTITY[table]} "${data.name}"` };
+        return json({ id: ex.id, reactivated: true });
+      }
+      // Desde la recepción: si ya existe, se usa ese artículo.
+      if (ex && ctx.reuseExisting) { ctx.audit = false; return json({ id: ex.id, existing: true }); }
+    }
     try {
       const row = await env.DB.prepare(
         `INSERT INTO ${table} (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')}) RETURNING id`
@@ -684,10 +709,15 @@ async function route(parts, method, request, env, url, ctx = {}) {
   if (a === 'products' && (method === 'POST' || method === 'PUT')) {
     const d = await request.clone().json().catch(() => ({}));
     if (d.unit && !['kg', 'l', 'ud'].includes(d.unit)) throw new HttpError(400, 'La unidad base debe ser kg, l o ud. Las cajas, botellas o sacos se añaden como formatos.');
+    // Quien recibe mercancía puede dar de alta un artículo nuevo que llega en el albarán (no modificar los existentes).
+    if (method === 'POST' && d.from_receipt) { ctx.createPerm = ['productos.editar', 'recepcion.crear']; ctx.reuseExisting = true; }
     const res = await crud(a, b, method, request, env, user, ctx);
     if (res.ok && Array.isArray(d.formats)) {
-      const id = method === 'POST' ? (await res.clone().json()).id : Number(b);
-      await syncFormats(env, id, d.formats);
+      const out = method === 'POST' ? await res.clone().json() : null;
+      const id = method === 'POST' ? out.id : Number(b);
+      // si ya existía, no se le tocan los formatos que tenga: solo se añade el que trae el albarán
+      if (!out?.existing) await syncFormats(env, id, d.formats);
+      else await addMissingFormats(env, id, d.formats);
     }
     return res;
   }

@@ -122,7 +122,9 @@ function modal(html, { onOpen } = {}) {
   return new Promise((resolve) => {
     const close = (v) => { dlg.close(); resolve(v); };
     form.onsubmit = (e) => { e.preventDefault(); close(e.submitter?.value || 'ok'); };
-    dlg.onclose = () => resolve(null);
+    // El aviso de "cerrado" del cuadro anterior llega con retraso: si ya se ha abierto otro (p. ej. "¿Darlo de alta?" → "Nuevo artículo"),
+    // no debe cerrar el nuevo. Solo cuenta si el cuadro está de verdad cerrado (Escape).
+    dlg.onclose = () => { if (!dlg.open) resolve(null); };
     $$('[data-close]', form).forEach((b) => (b.onclick = (e) => { e.preventDefault(); close(null); }));
     dlg.showModal();
     onOpen && onOpen(form);
@@ -547,13 +549,15 @@ async function newArticleModal(line, supplier_id) {
   if (fname && !(factor > 0)) throw new Error('Indica cuántas unidades trae el formato');
   const inFormat = fname && factor > 0;
   const price = Number(line.price) || 0;
-  const body = { name: val('name'), category: val('category') || null, unit: val('unit'), supplier_id: supplier_id || null,
+  const body = { name: val('name'), category: val('category') || null, unit: val('unit'), supplier_id: supplier_id || null, from_receipt: true,
     price: inFormat ? Math.round((price / factor) * 10000) / 10000 : price,
     formats: inFormat ? [{ name: fname, factor, price: price || null, is_default: 1 }] : [] };
   const res = await api('products', { body });
   await reload();
-  const fmt = S.formats.find((x) => x.product_id === res.id && x.name === fname);
-  return { product_id: res.id, unit: fmt ? 'f:' + fmt.id : body.unit };
+  if (res.existing) toast(`"${body.name}" ya estaba en Existencias: se usa ese artículo`);
+  const fmt = inFormat && S.formats.find((x) => x.product_id === res.id && norm(x.name) === norm(fname));
+  const p = prodById(res.id);
+  return { product_id: res.id, unit: fmt ? 'f:' + fmt.id : p && p.unit !== body.unit ? defaultBuyUnit(p) : body.unit };
 }
 
 // ---------- Recepción ----------
@@ -730,18 +734,25 @@ async function recepcionNueva(v, orderId, prefill) {
       <div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok">Crear todos</button></div>`);
     if (!ok) return;
     const names = $$('[data-n]', $('#modal-form')).map((i) => i.value.trim());
-    const existing = new Set(S.products.map((p) => norm(p.name)));
+    const existing = new Map(S.products.map((p) => [norm(p.name), p.id]));
     for (let i = 0; i < guesses.length; i++) {
       const { l, g } = guesses[i], name = names[i] || g.name;
-      if (existing.has(norm(name))) { const p = S.products.find((x) => norm(x.name) === norm(name)); l.product_id = p.id; l.unit = defaultBuyUnit(p); continue; }
+      if (!name) throw new Error('Pon un nombre a cada artículo');
+      // ya existe (o lo acabamos de crear para otra línea): se usa ese
+      if (existing.has(norm(name))) { l.product_id = existing.get(norm(name)); l._existing = true; l.warn = false; continue; }
       const inF = g.format && Number(g.format.factor) > 0, price = Number(l.price) || 0;
-      const res = await api('products', { body: { name, unit: g.unit, supplier_id: supplierNow(), price: inF ? Math.round((price / g.format.factor) * 10000) / 10000 : price,
+      const res = await api('products', { body: { name, unit: g.unit, supplier_id: supplierNow(), from_receipt: true, price: inF ? Math.round((price / g.format.factor) * 10000) / 10000 : price,
         formats: inF ? [{ name: g.format.name, factor: Number(g.format.factor), price: price || null, is_default: 1 }] : [] } });
-      existing.add(norm(name));
-      l.product_id = res.id; l.unit = g.unit; l._fmt = inF; l.warn = false;
+      existing.set(norm(name), res.id);
+      l.product_id = res.id; l.unit = g.unit; l._fmt = inF ? g.format.name : null; l._existing = !!res.existing; l.warn = false;
     }
     await reload();
-    for (const l of miss) if (l._fmt) { const fmt = S.formats.find((x) => x.product_id === l.product_id); if (fmt) l.unit = 'f:' + fmt.id; delete l._fmt; }
+    for (const l of miss) {
+      const p = prodById(l.product_id);
+      const fmt = l._fmt && S.formats.find((x) => x.product_id === l.product_id && norm(x.name) === norm(l._fmt));
+      if (fmt) l.unit = 'f:' + fmt.id; else if (p && (l._existing || p.unit !== l.unit)) l.unit = defaultBuyUnit(p);
+      delete l._fmt; delete l._existing;
+    }
     toast(miss.length === 1 ? 'Artículo creado' : `${miss.length} artículos creados`); draw();
   });
   $('#save').onclick = (e) => act(e.target, async () => {
@@ -2111,9 +2122,17 @@ const PERM_GROUPS = [
   ['Caja', [['caja.registrar', 'Registrar la caja del día (hasta 7 días atrás)'], ['caja.ver', 'Ver el histórico de caja y los descuadres']]],
   ['Compras', [['pedidos.ver', 'Ver pedidos'], ['pedidos.crear', 'Hacer pedidos (quedan pendientes de aprobar)'], ['pedidos.aprobar', 'Aprobar pedidos y enviarlos al proveedor'], ['recepcion.ver', 'Ver albaranes recibidos'], ['recepcion.crear', 'Recibir mercancía y escanear albaranes'], ['recepcion.anular', 'Anular albaranes']]],
   ['Mermas y personal', [['mermas.registrar', 'Registrar mermas y consumo de personal'], ['mermas.ver_todas', 'Ver los registros de todos (si no, solo los suyos)'], ['mermas.borrar', 'Borrar registros de otros']]],
-  ['Stock y cocina', [['stock.ver', 'Ver el stock'], ['inventario.hacer', 'Hacer inventarios'], ['escandallos.ver', 'Ver fichas técnicas (escandallos)'], ['escandallos.editar', 'Crear y cambiar platos de la carta y escandallos']]],
+  ['Stock y cocina', [['stock.ver', 'Ver el stock'], ['inventario.hacer', 'Hacer inventarios'], ['escandallos.ver', 'Ver fichas técnicas (escandallos)'], ['escandallos.editar', 'Crear y cambiar platos de la carta, elaboraciones y escandallos'], ['produccion.registrar', 'Registrar producción de elaboraciones (bechamel, sofrito…)']]],
+  ['APPCC', [['appcc.registrar', 'Apuntar temperaturas, limpiezas y controles del día'], ['appcc.gestionar', 'Configurar equipos y plan de limpieza, ver el histórico e informe para inspección']]],
+  ['Turnos', [['turnos.ver', 'Ver el cuadrante de todo el equipo (su propio horario lo ve siempre)'], ['turnos.gestionar', 'Hacer y publicar el cuadrante, personal y turnos tipo']]],
   ['Administración', [['productos.editar', 'Existencias (artículos), formatos y proveedores'], ['ventas.gestionar', 'Importar y vincular ventas de Qamarero'], ['gastos.gestionar', 'Gastos fijos']]],
 ];
+// Cualquier permiso que exista en el servidor y no esté arriba sale igualmente, en "Otros", para que nunca quede sin casilla.
+function permGroupsFor(all) {
+  const known = new Set(PERM_GROUPS.flatMap(([, ps]) => ps.map(([k]) => k)));
+  const rest = (all || []).filter((k) => !known.has(k));
+  return rest.length ? [...PERM_GROUPS, ['Otros', rest.map((k) => [k, k])]] : PERM_GROUPS;
+}
 VIEWS.usuarios = async (v, id) => {
   const res = await api('users');
   if (id) return usuarioEdit(v, id, res);
@@ -2142,7 +2161,7 @@ async function usuarioEdit(v, id, res) {
     <label class="check"><input type="checkbox" id="super" ${u.is_super ? 'checked' : ''} ${me ? 'disabled' : ''}> <span><b>Superusuario</b> — lo puede todo, incluidos usuarios, permisos y ajustes</span></label>
     <div id="permbox" style="margin-top:14px">
       <div class="row" style="margin-bottom:10px"><span class="small muted">Empezar desde plantilla:</span>${Object.keys(res.templates).map((t) => `<button type="button" class="sm" data-tpl="${t}">${ROLE_NAMES[t]}</button>`).join('')}<button type="button" class="sm" data-tpl="">Ninguno</button></div>
-      <div class="grid two">${PERM_GROUPS.map(([g, ps]) => `<div class="permgroup"><h3>${esc(g)}</h3>${ps.map(([k, t]) => `<label class="check"><input type="checkbox" data-p="${k}" ${u.perms.includes(k) ? 'checked' : ''}> <span>${esc(t)}</span></label>`).join('')}</div>`).join('')}</div>
+      <div class="grid two">${permGroupsFor(res.perms).map(([g, ps]) => `<div class="permgroup"><h3>${esc(g)}</h3>${ps.map(([k, t]) => `<label class="check"><input type="checkbox" data-p="${k}" ${u.perms.includes(k) ? 'checked' : ''}> <span>${esc(t)}</span></label>`).join('')}</div>`).join('')}</div>
     </div>
     <div class="sticky-foot row between" style="margin-top:14px"><a class="btn" href="#/usuarios">Volver</a><button class="primary">Guardar</button></div></form>`;
   const sync = () => { $('#permbox').style.opacity = $('#super').checked ? 0.4 : 1; $$('[data-p]', v).forEach((c) => (c.disabled = $('#super').checked)); };
