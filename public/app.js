@@ -1709,7 +1709,8 @@ const BASE_UNITS = [['kg', 'kg (se escandalla en g o kg)'], ['l', 'litro (se esc
 // ---------- repetidos: fusionar y dar de baja ----------
 const DUP_STOP = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'en', 'con', 'y', 'a', 'al', 'x', 'ud', 'uds', 'u', 'un', 'kg', 'kgs', 'gr', 'grs', 'g', 'l', 'lt', 'lts', 'cl', 'ml', 'caja', 'cj', 'cja', 'pack', 'bot', 'botella', 'saco', 'bandeja', 'bdj', 'unidad', 'unidades', 'paquete', 'paq']);
 // "Tomate pera L:2304 5kg" y "TOMATE PERA" dan la misma clave
-const dupKey = (name) => [...new Set(norm(cleanDesc(name)).replace(/[^a-z0-9ñ ]+/g, ' ').split(' ').filter((w) => w.length > 1 && !DUP_STOP.has(w) && !/^\d/.test(w)))].sort().join(' ');
+const singular = (w) => (w.length > 4 && /[lnrdj]es$/.test(w) ? w.slice(0, -2) : w.length > 3 && /[^s]s$/.test(w) ? w.slice(0, -1) : w);
+const dupKey = (name) => [...new Set(norm(cleanDesc(name)).replace(/[^a-z0-9ñ ]+/g, ' ').split(' ').filter((w) => w.length > 1 && !DUP_STOP.has(w) && !/^\d/.test(w)).map(singular))].sort().join(' ');
 const supKey = (n) => norm(n).replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\b(s ?l ?u?|s ?a ?u?|s ?l ?l|s ?coop( ?and)?|c ?b|sociedad (limitada|anonima)( unipersonal)?)\b/g, ' ').replace(/\s+/g, '');
 const cifK = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 // agrupa los elementos que comparten alguna clave
@@ -1722,12 +1723,22 @@ function dupGroups(list, keysOf) {
   for (const x of list) { const r = find(x.id); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(x); }
   return [...groups.values()].filter((g) => g.length > 1).sort((a, b) => byName(a[0], b[0]));
 }
+// se queda el del nombre más limpio (sin lote); a igualdad, el que tiene más stock / más artículos, y si no, el más antiguo
+function pickBest(kind, items) {
+  const score = (x) => [cleanDesc(x.name) === x.name ? 0 : 1, kind === 'products' ? -Math.abs(Number(x.stock) || 0) : -S.products.filter((p) => p.supplier_id === x.id).length, x.id];
+  return items.slice().sort((a, b) => { const A = score(a), B = score(b); return A[0] - B[0] || A[1] - B[1] || A[2] - B[2]; })[0];
+}
+const finalName = (kind, x) => (kind === 'products' ? cleanDesc(x.name) || x.name : x.name);
+async function doMerge(kind, items, keep, newname) {
+  const kept = items.find((x) => x.id === keep);
+  await api(`${kind}/merge`, { body: { target_id: keep, source_ids: items.map((x) => x.id).filter((id) => id !== keep) } });
+  if (newname && newname !== kept.name) await api(`${kind}/${keep}`, { method: 'PUT', body: { name: newname } }).catch(() => null); // si el nombre ya existe, se queda el que tenía
+}
 async function mergeDialog(kind, items) {
   const isP = kind === 'products';
   if (items.length < 2) throw new Error('Marca al menos dos para fusionarlos');
   if (isP && items.some((p) => p.prep_recipe_id)) throw new Error('Las elaboraciones no se fusionan aquí: quítalas de la selección');
-  // por defecto se queda el del nombre más limpio
-  const best = items.slice().sort((a, b) => (cleanDesc(a.name) === a.name ? 0 : 1) - (cleanDesc(b.name) === b.name ? 0 : 1) || cleanDesc(a.name).length - cleanDesc(b.name).length)[0];
+  const best = pickBest(kind, items);
   const units = new Set(items.map((p) => p.unit));
   const info = (x) => (isP ? `${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}${x.price != null ? ' · ' + eur(x.price) + '/' + esc(x.unit) : ''}`
     : `${x.cif ? 'CIF ' + esc(x.cif) : 'sin CIF'} · ${S.products.filter((p) => p.supplier_id === x.id).length} artículos`);
@@ -1735,7 +1746,7 @@ async function mergeDialog(kind, items) {
     <p class="small muted">Elige cuál se queda. ${isP ? 'Los albaranes, pedidos, stock, inventarios, mermas y escandallos de los demás pasan a él' : 'Sus artículos, pedidos y albaranes pasan a él'}; los demás desaparecen. Lo que le falte (categoría, proveedor, CIF, teléfono…) se completa con los datos de los otros.</p>
     ${isP && units.size > 1 ? '<p class="txt-warn">Hay artículos con distinta unidad de control: solo se pueden juntar los que se controlan igual (kg, l o ud).</p>' : ''}
     ${items.map((x) => `<label class="check" style="align-items:flex-start"><input type="radio" name="keep" value="${x.id}" ${x === best ? 'checked' : ''}> <span><b>${esc(x.name)}</b><br><span class="small muted">${info(x)}</span></span></label>`).join('')}
-    <div class="field" style="margin-top:10px"><label>Nombre con el que se queda</label><input name="newname" value="${esc(isP ? cleanDesc(best.name) || best.name : best.name)}" required></div>
+    <div class="field" style="margin-top:10px"><label>Nombre con el que se queda</label><input name="newname" value="${esc(finalName(kind, best))}" required></div>
     <p class="small txt-bad">No se puede deshacer (salvo restaurando una copia de seguridad).</p>
     <div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok">Fusionar</button></div>`, {
     onOpen: (f) => $$('[name=keep]', f).forEach((rb) => (rb.onchange = () => { const x = items.find((y) => y.id === Number(rb.value)); $('[name=newname]', f).value = isP ? cleanDesc(x.name) || x.name : x.name; })),
@@ -1744,8 +1755,7 @@ async function mergeDialog(kind, items) {
   const f = $('#modal-form');
   const keep = Number($('[name=keep]:checked', f).value), newname = $('[name=newname]', f).value.trim();
   const kept = items.find((x) => x.id === keep);
-  await api(`${kind}/merge`, { body: { target_id: keep, source_ids: items.map((x) => x.id).filter((id) => id !== keep) } });
-  if (newname && newname !== kept.name) await api(`${kind}/${keep}`, { method: 'PUT', body: { name: newname } });
+  await doMerge(kind, items, keep, newname);
   await reload();
   toast(`${items.length} ${isP ? 'artículos' : 'proveedores'} fusionados en "${newname || kept.name}"`);
   return true;
@@ -1771,9 +1781,36 @@ async function repetidos(v, kind) {
   v.innerHTML = `<div class="row between"><h1>${isP ? 'Artículos' : 'Proveedores'} repetidos</h1><a class="btn" href="${back}">Volver</a></div>
     <div class="card small">Estos ${isP ? 'artículos tienen el mismo nombre si se quitan lotes, fechas, cantidades y mayúsculas' : 'proveedores tienen el mismo CIF o casi el mismo nombre'}. Revisa cada grupo, desmarca lo que no sea lo mismo y pulsa <b>Fusionar</b>: todo su historial pasa al que se queda.
       <br>¿Falta alguno? ${isP ? 'En <a href="#/productos/lista">Existencias → Editar en lista</a>' : 'En la lista de proveedores'} márcalos con la casilla y pulsa <b>Fusionar</b>.</div>
-    ${groups.length ? groups.map((g, gi) => `<div class="card mergegrp" data-g="${gi}">${g.map((x) => `<label><input type="checkbox" data-id="${x.id}" checked> <span><b>${esc(x.name)}</b> <span class="small muted">${isP ? `${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}` : `${x.cif ? 'CIF ' + esc(x.cif) : 'sin CIF'} · ${S.products.filter((p) => p.supplier_id === x.id).length} artículos`}</span></span></label>`).join('')}
+    ${groups.length ? `<div class="card row between" style="border-color:var(--accent)"><div><b>${groups.length} grupos de repetidos (${groups.reduce((n, g) => n + g.length, 0)} ${isP ? 'artículos' : 'proveedores'})</b>
+      <div class="small muted">En cada grupo se queda el marcado con ★ ${isP ? 'y con el nombre sin lote' : ''}. Desmarca lo que no sea lo mismo y fusiona todo de una vez.${S.user.is_super ? ' Antes se descarga una copia de seguridad.' : ''}</div></div>
+      <button type="button" class="primary" id="mergeall">⚡ Fusionar todo</button> <span id="mprog" class="small muted"></span></div>` : ''}
+    ${groups.length ? groups.map((g, gi) => `<div class="card mergegrp" data-g="${gi}">${g.map((x) => `<label><input type="checkbox" data-id="${x.id}" checked> <span>${x === pickBest(kind, g) ? '★ ' : ''}<b>${esc(x.name)}</b>${x === pickBest(kind, g) && finalName(kind, x) !== x.name ? ` <span class="small">→ se quedará como <b>${esc(finalName(kind, x))}</b></span>` : ''} <span class="small muted">${isP ? `${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}` : `${x.cif ? 'CIF ' + esc(x.cif) : 'sin CIF'} · ${S.products.filter((p) => p.supplier_id === x.id).length} artículos`}</span></span></label>`).join('')}
+      ${isP && new Set(g.map((p) => p.unit)).size > 1 ? '<div class="small txt-warn">Se controlan en unidades distintas: solo se juntan los que van igual (kg, l o ud).</div>' : ''}
       <button type="button" class="primary sm" data-merge="${gi}" style="margin-top:6px">🔁 Fusionar marcados</button></div>`).join('')
       : `<div class="card empty">No se han encontrado ${isP ? 'artículos' : 'proveedores'} repetidos. 👍</div>`}`;
+  if ($('#mergeall')) $('#mergeall').onclick = (e) => act(e.target, async () => {
+    // lo marcado de cada grupo; los artículos solo se juntan con los que se controlan igual (kg, l, ud)
+    const sets = [];
+    groups.forEach((g, gi) => {
+      const box = $(`[data-g="${gi}"]`, v), sel = g.filter((x) => $(`[data-id="${x.id}"]`, box).checked);
+      const byUnit = isP ? [...new Set(sel.map((p) => p.unit))].map((u) => sel.filter((p) => p.unit === u)) : [sel];
+      byUnit.filter((x) => x.length > 1).forEach((x) => sets.push(x));
+    });
+    if (!sets.length) throw new Error('No hay nada marcado para fusionar');
+    const n = sets.reduce((a, x) => a + x.length, 0);
+    if (!(await confirmModal(`Se van a fusionar ${n} ${isP ? 'artículos' : 'proveedores'} en ${sets.length}. Todo su historial pasa al que se queda (★). No se puede deshacer${S.user.is_super ? ', salvo restaurando la copia que se descarga ahora' : ''}.`, 'Fusionar todo'))) return;
+    if (S.user.is_super) await downloadBackup(await api('backup'), (t) => ($('#mprog').textContent = t));
+    const errs = [];
+    for (let i = 0; i < sets.length; i++) {
+      const x = sets[i], best = pickBest(kind, x);
+      $('#mprog').textContent = `Fusionando ${i + 1} de ${sets.length}…`;
+      try { await doMerge(kind, x, best.id, finalName(kind, best)); } catch (err) { errs.push(`${best.name}: ${err.message}`); }
+    }
+    await reload();
+    if (errs.length) await modal(`<h2>Hecho, con ${errs.length} avisos</h2><p>Estos grupos no se han podido fusionar:</p><ul>${errs.map((x) => `<li>${esc(x)}</li>`).join('')}</ul><div class="actions"><button class="primary" value="ok">Entendido</button></div>`);
+    else toast(`Listo: ${n} ${isP ? 'artículos' : 'proveedores'} fusionados en ${sets.length}`);
+    repetidos(v, kind);
+  });
   $$('[data-merge]', v).forEach((b) => (b.onclick = () => act(b, async () => {
     const g = groups[b.dataset.merge], box = b.closest('.mergegrp');
     const sel = g.filter((x) => $(`[data-id="${x.id}"]`, box).checked);
