@@ -100,6 +100,8 @@ async function reload() {
   const d = await api('bootstrap');
   Object.assign(S, d);
   S.formats = d.formats || [];
+  // listas siempre en orden alfabético (con acentos y números bien colocados)
+  S.products.sort(byName); S.suppliers.sort(byName); d.recipes.sort(byName);
   // la carta son los platos; las elaboraciones (bechamel, sofrito…) van aparte
   S.allRecipes = d.recipes;
   S.recipes = d.recipes.filter((r) => (r.kind || 'plato') === 'plato');
@@ -288,6 +290,65 @@ async function route() {
   view.innerHTML = '<div class="boot">Cargando…</div>';
   window.scrollTo(0, 0);
   try { await VIEWS[r](view, id, q); } catch (e) { view.innerHTML = `<div class="card"><p class="txt-bad">${esc(e.message)}</p></div>`; }
+  // todas las tablas de la pantalla se pueden ordenar (clic en la cabecera) y filtrar, también las que se dibujan después
+  enhanceTables(view);
+  let pend = false;
+  new MutationObserver(() => { if (!pend) { pend = true; requestAnimationFrame(() => { pend = false; enhanceTables(view); }); } }).observe(view, { childList: true, subtree: true });
+}
+
+// ---------- ordenar y filtrar cualquier tabla ----------
+const collator = new Intl.Collator('es', { numeric: true, sensitivity: 'base' });
+const byName = (a, b) => collator.compare(a.name || '', b.name || '');
+const MONTHS = { ene: 1, feb: 2, mar: 3, abr: 4, may: 5, jun: 6, jul: 7, ago: 8, sep: 9, sept: 9, oct: 10, nov: 11, dic: 12 };
+function cellKey(td) {
+  if (!td) return { s: '' };
+  if (td.dataset.v != null) return isNaN(Number(td.dataset.v)) ? { s: td.dataset.v } : { n: Number(td.dataset.v) };
+  const inp = td.querySelector('input:not([type=checkbox]):not([type=radio]), select');
+  const t = String(inp ? (inp.tagName === 'SELECT' ? inp.selectedOptions[0]?.textContent : inp.value) : td.textContent).trim();
+  let m = t.match(/^(\d{1,2})[ /](\d{1,2}|[a-z]{3,4})\.?[ /](\d{2,4})\b/i);
+  if (m) { const mo = Number(m[2]) || MONTHS[m[2].toLowerCase()]; if (mo) return { n: Number((m[3].length === 2 ? '20' : '') + m[3]) * 10000 + mo * 100 + Number(m[1]) }; }
+  m = t.match(/^([−-]?)\s?(\d{1,3}(?:\.\d{3})+|\d+)(,\d+)?(?=\s|$|\s?[€%/a-z])/i);
+  if (m) return { n: Number((m[1] ? '-' : '') + m[2].replace(/\./g, '') + (m[3] ? '.' + m[3].slice(1) : '')) };
+  return { s: t };
+}
+const cmpKeys = (a, b) => (a.n != null && b.n != null ? a.n - b.n : a.n != null ? -1 : b.n != null ? 1 : collator.compare(a.s, b.s));
+const lsGetX = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSetX = (k, v) => { try { localStorage.setItem(k, v); } catch { /* sin almacenamiento */ } };
+function enhanceTables(root) {
+  $$('table', root).forEach((table) => {
+    if (table.dataset.enh || table.classList.contains('nosort') || table.classList.contains('sched')) return;
+    const head = table.tHead?.rows[table.tHead.rows.length - 1], body = table.tBodies[0];
+    if (!head || !body) return;
+    table.dataset.enh = '1';
+    const rows = () => [...body.rows];
+    // tablas con filas de detalle o de aviso (colspan) no se reordenan: se romperían
+    const sortable = () => rows().length > 1 && !rows().some((tr) => tr.querySelector('td[colspan]'));
+    const ths = [...head.cells];
+    const skey = 'orden:' + location.hash.split('?')[0] + ':' + ths.map((th) => th.textContent.trim()).join('|');
+    const sortBy = (i, dir) => {
+      if (!sortable()) return;
+      const keyed = rows().map((tr) => ({ tr, k: cellKey(tr.cells[i]) }));
+      keyed.sort((a, b) => cmpKeys(a.k, b.k) * dir);
+      keyed.forEach(({ tr }) => body.appendChild(tr));
+      ths.forEach((th) => th.removeAttribute('data-sort'));
+      ths[i].dataset.sort = dir > 0 ? 'asc' : 'desc';
+    };
+    ths.forEach((th, i) => {
+      if (!th.textContent.trim() || th.querySelector('input,button,select') || th.colSpan > 1) return;
+      th.classList.add('sortable'); th.title = 'Ordenar';
+      th.onclick = () => { if (!sortable()) return; const dir = th.dataset.sort === 'asc' ? -1 : 1; sortBy(i, dir); lsSetX(skey, i + ':' + dir); };
+    });
+    const saved = lsGetX(skey);
+    if (saved) { const [i, dir] = saved.split(':').map(Number); if (ths[i]?.classList.contains('sortable')) sortBy(i, dir); }
+    // buscador propio si la pantalla no tiene ya uno y la lista es larga
+    const card = table.closest('.card') || root;
+    if (rows().length >= 8 && !$('#search, .tfilter, input[placeholder^="Buscar"], input[placeholder^="Filtrar"]', card)) {
+      const f = document.createElement('input');
+      f.className = 'tfilter'; f.placeholder = 'Filtrar esta lista…'; f.type = 'search';
+      (table.closest('.table-wrap') || table).before(f);
+      f.oninput = () => { const s = norm(f.value); rows().forEach((tr) => tr.classList.toggle('fhide', !!s && !norm(tr.textContent + ' ' + $$('input,select', tr).map((x) => x.value).join(' ')).includes(s))); };
+    }
+  });
 }
 const go = (h) => { if (location.hash === h) route(); else location.hash = h; };
 
@@ -518,8 +579,18 @@ async function pedidoDetalle(v, id, q) {
 // ---------- Alta rápida de artículos (desde recepción) ----------
 const titleCase = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim().replace(/(^|\s|\()(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
 // Deduce unidad de control y formato a partir de lo impreso en el albarán ("KG", "CAJA 24", "PACK 6"…)
+// Lo que cambia en cada entrega (lote, caducidad, fechas, códigos de barras) no forma parte del nombre del artículo
+const LOT_RE = [
+  /\b(n[º°o]?\s*)?(lotes?|lot|lte)\b\s*[:.#º°nN-]*\s*[A-Za-z0-9/.-]*\d[A-Za-z0-9/.-]*/gi,
+  /\bl\s*[:.]\s*[A-Za-z0-9/.-]+/gi,
+  /\bl\d{3,}[A-Za-z0-9/-]*/gi,
+  /\b(f\.?\s*)?(cad(ucidad)?|cdd|f\.?\s*cad|c\.?\s*pref\w*|cons(umir)?\.?\s*pref\w*|exp|best before|bb)\b\.?\s*[:.]*\s*[\d/.-]{4,}/gi,
+  /\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b/g,
+  /\b\d{8,14}\b/g,
+];
+const cleanDesc = (t) => LOT_RE.reduce((x, re) => x.replace(re, ' '), String(t || '')).replace(/\s*[-–,;:/]\s*$/, '').replace(/\s+/g, ' ').trim();
 function guessArticle(line) {
-  const desc = String(line.description || line.source || '').trim();
+  const desc = cleanDesc(String(line.description || line.source || '').trim());
   const u = norm(line.printed_unit || '');
   const m = desc.match(/\b(caja|cj|cja|pack|paq|paquete|bandeja|bdj|saco|fardo|garrafa|barril)\s*(?:de\s*)?(\d+(?:[.,]\d+)?)\s*(kg|kgs|l|lt|lts|litros?|uds?|unidades|u)?\b/i);
   let unit = /^(kg|kgs|kilo|kilos|g|gr|grs)$/.test(u) ? 'kg' : /^(l|lt|lts|litro|litros|ml|cl)$/.test(u) ? 'l' : 'ud';
@@ -675,9 +746,10 @@ async function recepcionNueva(v, orderId, prefill) {
     <div class="small"><label class="check" style="margin:0 0 8px"><input type="checkbox" id="showlot"> <span>Anotar lote y caducidad de cada línea (trazabilidad APPCC)</span></label></div>
     <div class="field"><label>Incidencias / notas</label><textarea id="notes" placeholder="Género en mal estado, faltas, devoluciones…">${esc(prefill?.notes || '')}</textarea></div>
     <div class="sticky-foot row between"><b id="tot"></b><button class="primary" id="save">Registrar entrada</button></div></div>`;
-  let showLot = false;
+  let showLot = lines.some((l) => l.lot || l.expiry);
+  if (showLot) $('#showlot').checked = true;
   const draw = () => {
-    $('#lines').innerHTML = lines.length ? `<div class="table-wrap"><table><thead><tr><th>Artículo</th>${order ? '<th class="num">Pedido</th>' : ''}<th class="num">Recibido</th><th>Formato</th><th class="num">Precio</th><th class="num">Importe</th><th></th></tr></thead><tbody>
+    $('#lines').innerHTML = lines.length ? `<div class="table-wrap"><table class="nosort"><thead><tr><th>Artículo</th>${order ? '<th class="num">Pedido</th>' : ''}<th class="num">Recibido</th><th>Formato</th><th class="num">Precio</th><th class="num">Importe</th><th></th></tr></thead><tbody>
       ${lines.map((l, i) => { const p = prodById(l.product_id);
         if (!p) return `<tr class="flag"><td colspan="${order ? 3 : 2}"><div class="small">Albarán: <b>${esc(l.source || '')}</b> · ${num(l.qty, 3)} ${esc(l.printed_unit || '')} · ${eur(l.price)}</div><div class="row" style="flex-wrap:nowrap"><input list="dl-prod" data-pick="${i}" placeholder="¿Qué artículo es? Escribe para buscar…"><button type="button" class="sm" data-new="${i}" style="white-space:nowrap">+ Crear nuevo</button></div></td><td colspan="3" class="small muted">Sin artículo asignado</td><td><button class="sm" data-del="${i}" aria-label="Quitar">✕</button></td></tr>`;
         const f = unitFactor(p, l.unit); const basePrice = f ? Number(l.price) / f : 0;
@@ -772,7 +844,8 @@ async function recepcionNueva(v, orderId, prefill) {
     go('#/recepcion');
   });
   if ($('#newsup')) $('#newsup').onclick = (e) => act(e.target, async () => {
-    const r = await api('suppliers', { body: { name: prefill.supplier_name, cif: prefill.supplier_cif } });
+    const r = await api('suppliers', { body: { name: prefill.supplier_name, cif: prefill.supplier_cif, from_receipt: true } });
+    if (r.existing) toast(`Ya existía como "${r.name}": se usa ese proveedor`);
     await reload(); prefill.supplier_id = r.id; recepcionNueva(v, null, prefill);
   });
   $('#showlot').onchange = () => { showLot = $('#showlot').checked; draw(); };
@@ -880,7 +953,7 @@ VIEWS.stock = async (v, _id, q) => {
   const tab = q.get('tab') || 'stock';
   await reload();
   const tabs = `<div class="tabs">${[['stock', 'Stock actual'], ['inventario', 'Hacer inventario'], ['precios', 'Historial de precios']].map(([k, t]) => `<a href="#/stock?tab=${k}" class="${tab === k ? 'on' : ''}">${t}</a>`).join('')}</div>`;
-  const cats = [...new Set(S.products.map((p) => p.category || 'Sin categoría'))];
+  const cats = [...new Set(S.products.map((p) => p.category || 'Sin categoría'))].sort(collator.compare);
 
   if (tab === 'precios') {
     const ph = await api('price-history?days=180');
@@ -931,13 +1004,22 @@ VIEWS.stock = async (v, _id, q) => {
   }
 
   const totalVal = S.products.reduce((s, p) => s + Math.max(p.stock, 0) * (p.price || 0), 0);
+  const ed = can('productos.editar');
   v.innerHTML = `<h1>Stock e inventario</h1>${tabs}<div class="card">
-    <div class="row between"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar artículo…"></div><b>Valor total: ${eur(totalVal)}</b></div>
-    <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>Artículo</th><th>Categoría</th><th class="num">Stock teórico</th><th class="num">Mínimo</th><th class="num">Precio</th><th class="num">Valor</th></tr></thead><tbody>
-    ${S.products.map((p) => `<tr data-n="${esc(norm(p.name + ' ' + (p.category || '')))}" class="${p.min_stock > 0 && p.stock < p.min_stock ? 'flag' : ''}"><td>${esc(p.name)}<div class="small muted">${esc(p.supplier_name || '')}</div></td><td>${esc(p.category || '')}</td><td class="num ${p.stock < 0 ? 'txt-bad' : ''}">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)}</td><td class="num">${eur(p.price)}</td><td class="num">${eur(Math.max(p.stock, 0) * p.price)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">No hay artículos</td></tr>'}
+    <div class="row between"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar artículo…"></div>${ed ? '<button type="button" class="danger" id="baja">Dar de baja seleccionados</button>' : ''}<b>Valor total: ${eur(totalVal)}</b></div>
+    <div class="table-wrap" style="margin-top:10px"><table><thead><tr>${ed ? '<th><input type="checkbox" id="all" aria-label="Marcar todos"></th>' : ''}<th>Artículo</th><th>Categoría</th><th class="num">Stock teórico</th><th class="num">Mínimo</th><th class="num">Precio</th><th class="num">Valor</th></tr></thead><tbody>
+    ${S.products.map((p) => `<tr data-n="${esc(norm(p.name + ' ' + (p.category || '')))}" data-id="${p.id}" class="${p.min_stock > 0 && p.stock < p.min_stock ? 'flag' : ''}">${ed ? `<td><input type="checkbox" data-sel ${p.prep_recipe_id ? 'disabled title="Las elaboraciones se gestionan en Carta"' : ''}></td>` : ''}<td>${esc(p.name)}<div class="small muted">${esc(p.supplier_name || '')}</div></td><td>${esc(p.category || '')}</td><td class="num ${p.stock < 0 ? 'txt-bad' : ''}">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)}</td><td class="num">${eur(p.price)}</td><td class="num">${eur(Math.max(p.stock, 0) * p.price)}</td></tr>`).join('') || `<tr><td colspan="${ed ? 7 : 6}" class="empty">No hay artículos</td></tr>`}
     </tbody></table></div>
     <p class="small muted">Stock teórico = entradas − ventas según escandallo − mermas − consumo de personal ± ajustes de inventario. Un stock negativo suele indicar un albarán sin registrar o un escandallo con cantidades bajas.</p></div>`;
   $('#search').oninput = () => { const s = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', s && !tr.dataset.n.includes(s))); };
+  if (ed) {
+    const visible = () => $$('tr[data-id]', v).filter((tr) => !tr.classList.contains('hidden') && !tr.classList.contains('fhide'));
+    $('#all').onchange = () => visible().forEach((tr) => { const c = $('[data-sel]', tr); if (!c.disabled) c.checked = $('#all').checked; });
+    $('#baja').onclick = (e) => act(e.target, async () => {
+      const sel = visible().filter((tr) => $('[data-sel]', tr).checked).map((tr) => prodById(tr.dataset.id));
+      if (await bajaProducts(sel)) route();
+    });
+  }
 };
 
 // ---------- Escandallos ----------
@@ -1624,12 +1706,88 @@ VIEWS.gastos = async (v) => {
 
 // ---------- Artículos ----------
 const BASE_UNITS = [['kg', 'kg (se escandalla en g o kg)'], ['l', 'litro (se escandalla en ml, cl o l)'], ['ud', 'unidad (botellas, latas, piezas…)']];
+// ---------- repetidos: fusionar y dar de baja ----------
+const DUP_STOP = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'en', 'con', 'y', 'a', 'al', 'x', 'ud', 'uds', 'u', 'un', 'kg', 'kgs', 'gr', 'grs', 'g', 'l', 'lt', 'lts', 'cl', 'ml', 'caja', 'cj', 'cja', 'pack', 'bot', 'botella', 'saco', 'bandeja', 'bdj', 'unidad', 'unidades', 'paquete', 'paq']);
+// "Tomate pera L:2304 5kg" y "TOMATE PERA" dan la misma clave
+const dupKey = (name) => [...new Set(norm(cleanDesc(name)).replace(/[^a-z0-9ñ ]+/g, ' ').split(' ').filter((w) => w.length > 1 && !DUP_STOP.has(w) && !/^\d/.test(w)))].sort().join(' ');
+const supKey = (n) => norm(n).replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\b(s ?l ?u?|s ?a ?u?|s ?l ?l|s ?coop( ?and)?|c ?b|sociedad (limitada|anonima)( unipersonal)?)\b/g, ' ').replace(/\s+/g, '');
+const cifK = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+// agrupa los elementos que comparten alguna clave
+function dupGroups(list, keysOf) {
+  const parent = new Map(list.map((x) => [x.id, x.id]));
+  const find = (x) => (parent.get(x) === x ? x : find(parent.get(x)));
+  const seen = new Map();
+  for (const x of list) for (const k of keysOf(x).filter(Boolean)) { if (seen.has(k)) parent.set(find(x.id), find(seen.get(k))); else seen.set(k, x.id); }
+  const groups = new Map();
+  for (const x of list) { const r = find(x.id); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(x); }
+  return [...groups.values()].filter((g) => g.length > 1).sort((a, b) => byName(a[0], b[0]));
+}
+async function mergeDialog(kind, items) {
+  const isP = kind === 'products';
+  if (items.length < 2) throw new Error('Marca al menos dos para fusionarlos');
+  if (isP && items.some((p) => p.prep_recipe_id)) throw new Error('Las elaboraciones no se fusionan aquí: quítalas de la selección');
+  // por defecto se queda el del nombre más limpio
+  const best = items.slice().sort((a, b) => (cleanDesc(a.name) === a.name ? 0 : 1) - (cleanDesc(b.name) === b.name ? 0 : 1) || cleanDesc(a.name).length - cleanDesc(b.name).length)[0];
+  const units = new Set(items.map((p) => p.unit));
+  const info = (x) => (isP ? `${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}${x.price != null ? ' · ' + eur(x.price) + '/' + esc(x.unit) : ''}`
+    : `${x.cif ? 'CIF ' + esc(x.cif) : 'sin CIF'} · ${S.products.filter((p) => p.supplier_id === x.id).length} artículos`);
+  const r = await modal(`<h2>Fusionar ${items.length} ${isP ? 'artículos' : 'proveedores'}</h2>
+    <p class="small muted">Elige cuál se queda. ${isP ? 'Los albaranes, pedidos, stock, inventarios, mermas y escandallos de los demás pasan a él' : 'Sus artículos, pedidos y albaranes pasan a él'}; los demás desaparecen. Lo que le falte (categoría, proveedor, CIF, teléfono…) se completa con los datos de los otros.</p>
+    ${isP && units.size > 1 ? '<p class="txt-warn">Hay artículos con distinta unidad de control: solo se pueden juntar los que se controlan igual (kg, l o ud).</p>' : ''}
+    ${items.map((x) => `<label class="check" style="align-items:flex-start"><input type="radio" name="keep" value="${x.id}" ${x === best ? 'checked' : ''}> <span><b>${esc(x.name)}</b><br><span class="small muted">${info(x)}</span></span></label>`).join('')}
+    <div class="field" style="margin-top:10px"><label>Nombre con el que se queda</label><input name="newname" value="${esc(isP ? cleanDesc(best.name) || best.name : best.name)}" required></div>
+    <p class="small txt-bad">No se puede deshacer (salvo restaurando una copia de seguridad).</p>
+    <div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok">Fusionar</button></div>`, {
+    onOpen: (f) => $$('[name=keep]', f).forEach((rb) => (rb.onchange = () => { const x = items.find((y) => y.id === Number(rb.value)); $('[name=newname]', f).value = isP ? cleanDesc(x.name) || x.name : x.name; })),
+  });
+  if (!r) return false;
+  const f = $('#modal-form');
+  const keep = Number($('[name=keep]:checked', f).value), newname = $('[name=newname]', f).value.trim();
+  const kept = items.find((x) => x.id === keep);
+  await api(`${kind}/merge`, { body: { target_id: keep, source_ids: items.map((x) => x.id).filter((id) => id !== keep) } });
+  if (newname && newname !== kept.name) await api(`${kind}/${keep}`, { method: 'PUT', body: { name: newname } });
+  await reload();
+  toast(`${items.length} ${isP ? 'artículos' : 'proveedores'} fusionados en "${newname || kept.name}"`);
+  return true;
+}
+async function bajaProducts(items) {
+  const preps = items.filter((p) => p.prep_recipe_id);
+  items = items.filter((p) => !p.prep_recipe_id);
+  if (!items.length) throw new Error(preps.length ? 'Las elaboraciones se dan de baja desde Carta → Elaboraciones' : 'Marca primero los artículos');
+  const withStock = items.filter((p) => Math.abs(Number(p.stock) || 0) > 0.0005).length;
+  if (!(await confirmModal(`¿Dar de baja ${items.length === 1 ? `"${items[0].name}"` : `${items.length} artículos`}? Desaparecen de las listas y del stock, pero sus albaranes y movimientos pasados se conservan.${withStock ? ` Ojo: ${withStock === 1 ? 'uno tiene' : withStock + ' tienen'} stock, que dejará de contar en el valor del almacén.` : ''}${preps.length ? ` Las elaboraciones marcadas no se tocan.` : ''}`, 'Dar de baja'))) return false;
+  for (const p of items) await api('products/' + p.id, { method: 'DELETE' });
+  await reload();
+  toast(items.length === 1 ? 'Artículo dado de baja' : `${items.length} artículos dados de baja`);
+  return true;
+}
+async function repetidos(v, kind) {
+  if (!can('productos.editar')) throw new Error('No tienes permiso para editar existencias y proveedores');
+  await reload();
+  const isP = kind === 'products';
+  const list = isP ? S.products.filter((p) => !p.prep_recipe_id) : S.suppliers;
+  const groups = isP ? dupGroups(list, (p) => [dupKey(p.name)]) : dupGroups(list, (x) => [cifK(x.cif).length >= 8 ? 'c:' + cifK(x.cif) : '', 'n:' + supKey(x.name), 'k:' + dupKey(x.name)]);
+  const back = isP ? '#/productos' : '#/proveedores';
+  v.innerHTML = `<div class="row between"><h1>${isP ? 'Artículos' : 'Proveedores'} repetidos</h1><a class="btn" href="${back}">Volver</a></div>
+    <div class="card small">Estos ${isP ? 'artículos tienen el mismo nombre si se quitan lotes, fechas, cantidades y mayúsculas' : 'proveedores tienen el mismo CIF o casi el mismo nombre'}. Revisa cada grupo, desmarca lo que no sea lo mismo y pulsa <b>Fusionar</b>: todo su historial pasa al que se queda.
+      <br>¿Falta alguno? ${isP ? 'En <a href="#/productos/lista">Existencias → Editar en lista</a>' : 'En la lista de proveedores'} márcalos con la casilla y pulsa <b>Fusionar</b>.</div>
+    ${groups.length ? groups.map((g, gi) => `<div class="card mergegrp" data-g="${gi}">${g.map((x) => `<label><input type="checkbox" data-id="${x.id}" checked> <span><b>${esc(x.name)}</b> <span class="small muted">${isP ? `${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}` : `${x.cif ? 'CIF ' + esc(x.cif) : 'sin CIF'} · ${S.products.filter((p) => p.supplier_id === x.id).length} artículos`}</span></span></label>`).join('')}
+      <button type="button" class="primary sm" data-merge="${gi}" style="margin-top:6px">🔁 Fusionar marcados</button></div>`).join('')
+      : `<div class="card empty">No se han encontrado ${isP ? 'artículos' : 'proveedores'} repetidos. 👍</div>`}`;
+  $$('[data-merge]', v).forEach((b) => (b.onclick = () => act(b, async () => {
+    const g = groups[b.dataset.merge], box = b.closest('.mergegrp');
+    const sel = g.filter((x) => $(`[data-id="${x.id}"]`, box).checked);
+    if (await mergeDialog(kind, sel)) repetidos(v, kind);
+  })));
+}
+
 VIEWS.productos = async (v, id) => {
   await reload();
   if (id === 'lista') return existenciasLista(v);
   if (id === 'alergenos') return revisarAlergenos(v);
+  if (id === 'repetidos') return repetidos(v, 'products');
   if (id) return productoEdit(v, id);
-  v.innerHTML = `<div class="row between"><h1>Existencias</h1><div class="row"><button id="imp">Importar Excel</button><a class="btn" href="#/productos/alergenos">🧠 Revisar alérgenos${S.products.filter((p) => !p.allergens_checked).length ? ` <span class="badge-count">${S.products.filter((p) => !p.allergens_checked).length}</span>` : ''}</a><a class="btn" href="#/productos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/productos/nuevo">+ Nuevo artículo</a></div></div>
+  v.innerHTML = `<div class="row between"><h1>Existencias</h1><div class="row"><button id="imp">Importar Excel</button><a class="btn" href="#/productos/alergenos">🧠 Revisar alérgenos${S.products.filter((p) => !p.allergens_checked).length ? ` <span class="badge-count">${S.products.filter((p) => !p.allergens_checked).length}</span>` : ''}</a>${can('productos.editar') ? `<a class="btn" href="#/productos/repetidos">🔁 Repetidos${(() => { const n = dupGroups(S.products.filter((p) => !p.prep_recipe_id), (p) => [dupKey(p.name)]).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a>` : ''}<a class="btn" href="#/productos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/productos/nuevo">+ Nuevo artículo</a></div></div>
     <p class="small muted" style="margin-top:-6px">Existencias es todo lo que se compra a proveedores y se guarda en almacén: ingredientes, bebidas, limpieza… Lo que se vende está en <a href="#/escandallos">Carta</a>.</p>
     <div class="card"><div class="field"><input id="search" placeholder="Buscar…"></div><div class="table-wrap"><table><thead><tr><th>Artículo</th><th>Categoría</th><th>Proveedor</th><th>Control</th><th>Formatos</th><th class="num">Precio</th><th class="num">Mínimo</th><th>Alérgenos</th></tr></thead><tbody>
     ${S.products.map((p) => `<tr class="click" data-h="${p.prep_recipe_id ? '#/escandallos/' + p.prep_recipe_id : '#/productos/' + p.id}" data-n="${esc(norm(p.name + ' ' + (p.category || '') + ' ' + (p.supplier_name || '')))}"><td>${esc(p.name)}${p.prep_recipe_id ? ' <span class="pill">elaboración</span>' : ''}</td><td>${esc(p.category || '')}</td><td>${esc(p.supplier_name || '')}</td><td>${esc(p.unit)}</td><td class="small">${fmtsOf(p).map((f) => esc(f.name)).join(', ') || '<span class="muted">—</span>'}</td><td class="num">${eur(p.price)} / ${esc(p.unit)}</td><td class="num">${num(p.min_stock)}</td><td>${p.allergens_checked ? algIcons(splitList(p.allergens)) || '<span class="small muted">ninguno</span>' : '<span class="pill warn">sin revisar</span>'}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">Sin artículos. Impórtalos desde un Excel con tus tarifas de proveedor o créalos uno a uno.</td></tr>'}
@@ -1686,7 +1844,8 @@ async function existenciasLista(v) {
       <div class="row bulkbar"><b id="nsel">0 seleccionados</b>
         <span class="row"><input id="pct" type="number" step="any" placeholder="%" style="width:80px"><button type="button" id="apct">Cambiar precio %</button></span>
         <span class="row"><input id="ncat" list="dl-pcat" placeholder="Categoría" style="width:150px"><button type="button" id="acat">Poner categoría</button></span>
-        <span class="row"><select id="nsup" style="width:auto">${supOpts('')}</select><button type="button" id="asup">Poner proveedor</button></span></div>
+        <span class="row"><select id="nsup" style="width:auto">${supOpts('')}</select><button type="button" id="asup">Poner proveedor</button></span>
+        <span class="row"><button type="button" id="amerge">🔁 Fusionar</button><button type="button" class="danger" id="abaja">Dar de baja</button></span></div>
       <div class="table-wrap"><table class="grid-edit"><thead><tr><th><input type="checkbox" id="all"></th><th>Artículo</th><th>Categoría</th><th>Proveedor</th><th class="num">Precio sin IVA</th><th>Por</th><th class="num">Mínimo</th></tr></thead><tbody>
       ${rows.map((r, i) => `<tr data-i="${i}" data-n="${esc(norm(r.name))}" data-c="${esc(r.category)}" data-s="${r.supplier_id}"><td><input type="checkbox" data-sel></td>
         <td><input data-k="name" value="${esc(r.name)}"></td><td><input data-k="category" list="dl-pcat" value="${esc(r.category)}"></td>
@@ -1709,6 +1868,9 @@ async function existenciasLista(v) {
   $('#apct').onclick = () => act(null, async () => { const p2 = Number($('#pct').value); if (!p2) throw new Error('Indica el % (por ejemplo 5 o −3)'); need().forEach((i) => setVal(i, 'price', Math.round(rows[i].price * (1 + p2 / 100) * 10000) / 10000)); status(); });
   $('#acat').onclick = () => act(null, async () => { const c = $('#ncat').value.trim(); if (!c) throw new Error('Escribe la categoría'); need().forEach((i) => setVal(i, 'category', c)); status(); });
   $('#asup').onclick = () => act(null, async () => { const sp = $('#nsup').value; need().forEach((i) => setVal(i, 'supplier_id', sp)); status(); });
+  const noPending = () => { if (changed().length) throw new Error('Primero guarda (o descarta recargando) los cambios que has hecho en la lista'); };
+  $('#amerge').onclick = (e) => act(e.target, async () => { noPending(); if (await mergeDialog('products', need().map((i) => rows[i]))) route(); });
+  $('#abaja').onclick = (e) => act(e.target, async () => { noPending(); if (await bajaProducts(need().map((i) => rows[i]))) route(); });
   $('#save').onclick = (e) => act(e.target, async () => {
     const items = changed().map((r) => { const o = { id: r.id }; F.forEach((k) => { if (String(r[k] ?? '') !== String(r._o[k] ?? '')) o[k] = r[k]; }); return o; });
     await api('products/bulk-edit', { method: 'PUT', body: { items } });
@@ -1785,19 +1947,31 @@ async function productoEdit(v, id) {
 }
 
 // ---------- Proveedores ----------
-VIEWS.proveedores = async (v) => {
+VIEWS.proveedores = async (v, id) => {
+  if (id === 'repetidos') return repetidos(v, 'suppliers');
   await reload();
+  const ed = can('productos.editar');
   const F = [
     { name: 'name', label: 'Nombre', required: true }, { name: 'cif', label: 'CIF / NIF', help: 'Sirve para reconocer al proveedor al escanear sus albaranes y facturas' }, { name: 'contact', label: 'Persona de contacto' },
     { name: 'phone', label: 'Teléfono / WhatsApp', type: 'tel' }, { name: 'email', label: 'Email', type: 'email' },
     { name: 'order_days', label: 'Días de pedido y reparto', help: 'Ej.: pedir lunes y jueves antes de las 12; reparte al día siguiente' },
     { name: 'notes', label: 'Notas', type: 'textarea' },
   ];
-  v.innerHTML = `<div class="row between"><h1>Proveedores</h1><div class="row"><button id="imp">Importar Excel</button><button class="primary" id="add">+ Nuevo proveedor</button></div></div>
-    <div class="card"><div class="field"><input id="search" placeholder="Buscar por nombre o CIF…"></div><div class="table-wrap"><table><thead><tr><th>Proveedor</th><th>CIF</th><th>Contacto</th><th>Teléfono</th><th>Días de pedido</th><th class="num">Artículos</th></tr></thead><tbody>
-    ${S.suppliers.map((s) => `<tr class="click" data-id="${s.id}" data-n="${esc(norm(s.name + ' ' + (s.cif || '')))}"><td>${esc(s.name)}</td><td>${s.cif ? esc(s.cif) : '<span class="muted small">falta</span>'}</td><td>${esc(s.contact || '')}</td><td>${esc(s.phone || '')}</td><td>${esc(s.order_days || '')}</td><td class="num">${S.products.filter((p) => p.supplier_id === s.id).length}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Sin proveedores. Impórtalos desde Excel o créalos uno a uno.</td></tr>'}
+  const nrep = dupGroups(S.suppliers, (x) => [cifK(x.cif).length >= 8 ? 'c:' + cifK(x.cif) : '', 'n:' + supKey(x.name), 'k:' + dupKey(x.name)]).length;
+  v.innerHTML = `<div class="row between"><h1>Proveedores</h1><div class="row">${ed ? `<a class="btn" href="#/proveedores/repetidos">🔁 Repetidos${nrep ? ` <span class="badge-count">${nrep}</span>` : ''}</a>` : ''}<button id="imp">Importar Excel</button><button class="primary" id="add">+ Nuevo proveedor</button></div></div>
+    <div class="card"><div class="row"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar por nombre o CIF…"></div>${ed ? '<button type="button" id="merge">🔁 Fusionar seleccionados</button>' : ''}</div><div class="table-wrap"><table><thead><tr>${ed ? '<th><input type="checkbox" id="all" aria-label="Marcar todos"></th>' : ''}<th>Proveedor</th><th>CIF</th><th>Contacto</th><th>Teléfono</th><th>Días de pedido</th><th class="num">Artículos</th></tr></thead><tbody>
+    ${S.suppliers.map((s) => `<tr class="click" data-id="${s.id}" data-n="${esc(norm(s.name + ' ' + (s.cif || '')))}">${ed ? '<td class="selcell"><input type="checkbox" data-sel></td>' : ''}<td>${esc(s.name)}</td><td>${s.cif ? esc(s.cif) : '<span class="muted small">falta</span>'}</td><td>${esc(s.contact || '')}</td><td>${esc(s.phone || '')}</td><td>${esc(s.order_days || '')}</td><td class="num">${S.products.filter((p) => p.supplier_id === s.id).length}</td></tr>`).join('') || `<tr><td colspan="${ed ? 7 : 6}" class="empty">Sin proveedores. Impórtalos desde Excel o créalos uno a uno.</td></tr>`}
     </tbody></table></div></div>`;
   $('#search').oninput = () => { const q2 = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', q2 && !tr.dataset.n.includes(q2))); };
+  if (ed) {
+    const visible = () => $$('tr[data-id]', v).filter((tr) => !tr.classList.contains('hidden') && !tr.classList.contains('fhide'));
+    $$('.selcell', v).forEach((td) => (td.onclick = (e) => e.stopPropagation()));
+    $('#all').onchange = () => visible().forEach((tr) => ($('[data-sel]', tr).checked = $('#all').checked));
+    $('#merge').onclick = (e) => act(e.target, async () => {
+      const sel = visible().filter((tr) => $('[data-sel]', tr).checked).map((tr) => S.suppliers.find((x) => x.id === Number(tr.dataset.id)));
+      if (await mergeDialog('suppliers', sel)) route();
+    });
+  }
   $('#imp').onclick = () => importWizard({
     title: 'Importar proveedores', sheetHint: ['proveedor'],
     help: 'Sube un Excel o CSV con tus proveedores. Si ya existe uno con el mismo CIF (o, si no hay CIF, con el mismo nombre), se actualizan sus datos; si no, se crea. Las columnas vacías no borran lo que ya había.',
@@ -2356,6 +2530,24 @@ VIEWS.actividad = async (v, _id, q) => {
 };
 
 // ---------- Copias de seguridad ----------
+// Descarga una copia completa (por partes) y la guarda en el dispositivo
+async function downloadBackup(info, onProgress = () => {}) {
+  const total = Object.values(info.counts).reduce((a, b) => a + b, 0);
+  const data = { app: 'gestion-restaurante', version: info.version, created_at: new Date().toISOString(), restaurant: S.settings.restaurant_name, tables: {} };
+  for (const t of info.tables) {
+    data.tables[t] = [];
+    for (let off = 0; off < info.counts[t]; off += 500) {
+      data.tables[t].push(...(await api(`backup/table/${t}?offset=${off}`)));
+      onProgress(`Descargando copia… ${Math.round((Object.values(data.tables).reduce((a, b) => a + b.length, 0) / Math.max(total, 1)) * 100)} %`);
+    }
+  }
+  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `copia_${(S.settings.restaurant_name || 'restaurante').replace(/\W+/g, '_')}_${today()}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  await api('backup/done', { body: {} }); await reload();
+}
+
 VIEWS.copias = async (v) => {
   const info = await api('backup');
   const total = Object.values(info.counts).reduce((a, b) => a + b, 0);
@@ -2370,19 +2562,7 @@ VIEWS.copias = async (v) => {
       <div class="field"><label>Archivo de copia (.json)</label><input type="file" id="rf" accept=".json,application/json"></div>
       <button class="danger" id="rs" disabled>Restaurar esta copia</button> <span id="rprog" class="small muted"></span></div>`;
   $('#dl').onclick = (e) => act(e.target, async () => {
-    const data = { app: 'gestion-restaurante', version: info.version, created_at: new Date().toISOString(), restaurant: S.settings.restaurant_name, tables: {} };
-    let done = 0;
-    for (const t of info.tables) {
-      data.tables[t] = [];
-      for (let off = 0; off < info.counts[t]; off += 500) {
-        data.tables[t].push(...(await api(`backup/table/${t}?offset=${off}`)));
-        done = Math.min(done + 500, total); $('#prog').textContent = `Descargando… ${Math.round((Object.values(data.tables).reduce((a, b) => a + b.length, 0) / Math.max(total, 1)) * 100)} %`;
-      }
-    }
-    const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `copia_${(S.settings.restaurant_name || 'restaurante').replace(/\W+/g, '_')}_${today()}.json`; a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
-    await api('backup/done', { body: {} }); await reload();
+    await downloadBackup(info, (t) => ($('#prog').textContent = t));
     $('#prog').textContent = 'Copia descargada ✓';
   });
   $('#rf').onchange = () => ($('#rs').disabled = !$('#rf').files[0]);
@@ -2418,8 +2598,31 @@ VIEWS.ajustes = async (v) => {
     ${fieldHtml({ name: 'misc_pct', label: '% de varios por defecto', type: 'number', help: 'Sal, especias, aceite de fritura y pequeños ingredientes que no se pesan. Se suma al coste de cada plato (cada ficha puede cambiarlo)' }, S.settings.misc_pct)}
     ${fieldHtml({ name: 'expected_revenue', label: 'Facturación mensual prevista, sin IVA (€)', type: 'number', help: 'Para repartir los gastos fijos entre los platos. Si lo dejas vacío, se usa la media real de ventas (Qamarero) o de caja de los últimos 90 días' }, S.settings.expected_revenue ?? '')}
     <div class="small muted" style="margin-bottom:12px">${S.fixed?.pct != null ? `Ahora mismo: gastos fijos ${eur(S.fixed.monthly)}/mes ÷ ${eur(S.fixed.revenue)}/mes (${esc(S.fixed.source)}) = <b>${pct(S.fixed.pct)}</b> que se imputa a cada plato.` : `Todavía no se pueden imputar los gastos fijos: ${esc(S.fixed?.note || 'falta la facturación')}.`}</div>
-    <button class="primary">Guardar</button></form>`;
+    <button class="primary">Guardar</button></form>
+    ${S.user.is_super ? `<div class="card danger-zone"><h2>Empezar de cero</h2>
+      <p>Borra los datos para volver a empezar, por ejemplo para rehacer las listas de compras sin repetidos. Antes se descarga automáticamente una copia de seguridad completa a este dispositivo.</p>
+      <p class="small muted">Si solo hay unos cuantos artículos o proveedores repetidos, es mejor <a href="#/productos/repetidos">fusionarlos</a>: no se pierde ningún albarán.</p>
+      <button type="button" class="danger" id="reset">Reset de datos…</button> <span id="rprog" class="small muted"></span></div>` : ''}`;
   $('#f').onsubmit = (e) => { e.preventDefault(); act(e.submitter, async () => { await api('settings', { method: 'PUT', body: Object.fromEntries(new FormData(e.target)) }); await reload(); renderShell(); toast('Ajustes guardados'); }); };
+  if ($('#reset')) $('#reset').onclick = (e) => act(e.target, async () => {
+    const info = await api('backup');
+    const c = (t) => num(info.counts[t] || 0, 0);
+    const ok = await modal(`<h2>Reset de datos</h2>
+      <label class="check" style="align-items:flex-start"><input type="radio" name="scope" value="compras" checked> <span><b>Solo compras y existencias</b><br><span class="small">Borra artículos (${c('products')}), proveedores (${c('suppliers')}), pedidos (${c('orders')}), albaranes (${c('receipts')}), stock, mermas, inventarios, las elaboraciones y los ingredientes de los escandallos.
+        <br>Se quedan los platos de la carta (nombre, precio y vínculo con Qamarero) pero <b>sin ingredientes</b>, y también las ventas, la caja, el APPCC, los turnos, los gastos fijos, los usuarios y los ajustes.</span></span></label>
+      <label class="check" style="align-items:flex-start;margin-top:10px"><input type="radio" name="scope" value="todo"> <span><b>Todo (reset de fábrica)</b><br><span class="small">Borra todos los datos: compras, carta, ventas, caja, APPCC, turnos y personal, gastos fijos… Solo se quedan los usuarios, los ajustes y el registro de actividad.</span></span></label>
+      <p class="txt-bad" style="margin-top:12px">No se puede deshacer, salvo restaurando la copia que se va a descargar ahora. Escribe <b>BORRAR</b> para confirmar.</p>
+      <input id="cf" autocomplete="off"><div class="actions"><button data-close>Cancelar</button><button class="primary danger" value="ok">Descargar copia y borrar</button></div>`);
+    if (!ok) return;
+    const f = $('#modal-form');
+    const scope = $('[name=scope]:checked', f).value;
+    if ($('#cf', f).value.trim().toUpperCase() !== 'BORRAR') throw new Error('No has escrito BORRAR: no se ha borrado nada');
+    await downloadBackup(info, (t) => ($('#rprog').textContent = t));
+    $('#rprog').textContent = 'Copia descargada. Borrando…';
+    await api('reset', { body: { scope, confirm: 'BORRAR' } });
+    await reload(); renderShell();
+    toast(scope === 'todo' ? 'Datos borrados. La app está como recién instalada.' : 'Compras y existencias borradas. Ya puedes importar las listas limpias.');
+  });
 };
 
 // se arranca cuando están cargados todos los scripts (turnos.js añade vistas)

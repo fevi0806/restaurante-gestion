@@ -290,6 +290,110 @@ async function addMissingFormats(env, productId, formats) {
   if (stmts.length) await runBatch(env, stmts);
 }
 
+// ---------- repetidos: fusionar artículos y proveedores ----------
+// Todo el historial (albaranes, pedidos, movimientos, inventarios, escandallos…) pasa al que se queda; los otros desaparecen.
+const PRODUCT_REFS = ['price_history', 'order_lines', 'receipt_lines', 'movements', 'inventory_lines', 'recipe_lines', 'ocr_aliases'];
+async function productsMerge(request, env, user, ctx) {
+  need(user, 'productos.editar');
+  const d = await body(request);
+  const target = Number(d.target_id);
+  const sources = [...new Set((d.source_ids || []).map(Number))].filter((x) => x && x !== target);
+  if (!target || !sources.length) throw new HttpError(400, 'Elige el artículo que se queda y al menos otro para juntar con él');
+  const { results: ps } = await allIn(env, 'SELECT * FROM products WHERE id IN (??)', [target, ...sources]);
+  const T = ps.find((p) => p.id === target);
+  const src = sources.map((id) => ps.find((p) => p.id === id));
+  if (!T || src.some((p) => !p)) throw new HttpError(404, 'Algún artículo ya no existe. Recarga la página.');
+  if ([T, ...src].some((p) => p.prep_recipe_id)) throw new HttpError(400, 'Las elaboraciones (bechamel, sofrito…) no se fusionan aquí: se gestionan desde Carta → Elaboraciones.');
+  const bad = src.filter((p) => p.unit !== T.unit);
+  if (bad.length) throw new HttpError(400, `No se pueden juntar artículos que se controlan en unidades distintas: "${T.name}" va en ${T.unit} y ${bad.map((p) => `"${p.name}" en ${p.unit}`).join(', ')}. Deja como principal uno con la misma unidad o fusiónalos por separado.`);
+  const { results: tf } = await env.DB.prepare('SELECT id, name, active FROM product_formats WHERE product_id = ?').bind(target).all();
+  const stmts = [];
+  let allergens = new Set(String(T.allergens || '').split(',').filter(Boolean));
+  for (const s of src) {
+    const { results: sf } = await env.DB.prepare('SELECT id, name, active FROM product_formats WHERE product_id = ?').bind(s.id).all();
+    for (const f of sf) {
+      const ex = tf.find((x) => x.name.toLowerCase() === f.name.toLowerCase());
+      if (ex) {
+        // mismo formato en los dos: las líneas que lo usaban pasan al del principal
+        for (const t of ['order_lines', 'receipt_lines', 'recipe_lines']) stmts.push(env.DB.prepare(`UPDATE ${t} SET input_unit = ? WHERE product_id = ? AND input_unit = ?`).bind('f:' + ex.id, s.id, 'f:' + f.id));
+        if (f.active && !ex.active) { stmts.push(env.DB.prepare('UPDATE product_formats SET active = 1 WHERE id = ?').bind(ex.id)); ex.active = 1; }
+        stmts.push(env.DB.prepare('DELETE FROM product_formats WHERE id = ?').bind(f.id));
+      } else {
+        stmts.push(env.DB.prepare('UPDATE product_formats SET product_id = ?, is_default = 0 WHERE id = ?').bind(target, f.id));
+        tf.push(f);
+      }
+    }
+    for (const t of PRODUCT_REFS) stmts.push(env.DB.prepare(`UPDATE ${t} SET product_id = ? WHERE product_id = ?`).bind(target, s.id));
+    stmts.push(env.DB.prepare('DELETE FROM products WHERE id = ?').bind(s.id));
+    String(s.allergens || '').split(',').filter(Boolean).forEach((a) => allergens.add(a));
+  }
+  // lo que le falte al principal se completa con los datos de los otros
+  const first = (k) => src.map((p) => p[k]).find((x) => x != null && x !== '' && x !== 0) ?? null;
+  stmts.push(env.DB.prepare(`UPDATE products SET category = COALESCE(NULLIF(category, ''), ?), supplier_id = COALESCE(supplier_id, ?), price = CASE WHEN price > 0 THEN price ELSE COALESCE(?, price) END,
+    min_stock = MAX(min_stock, ?), allergens = ?, active = 1 WHERE id = ?`)
+    .bind(first('category'), first('supplier_id'), first('price'), Math.max(0, ...src.map((p) => Number(p.min_stock) || 0)), [...allergens].join(',') || null, target));
+  await runBatch(env, stmts);
+  ctx.audit = { action: 'fusión', entity: 'artículo', id: target, summary: `Fusión de artículos: ${src.map((p) => `"${p.name}"`).join(', ')} → "${T.name}"`, detail: { queda: T, fusionados: src } };
+  return json({ ok: true, merged: src.length });
+}
+
+// "Distribuciones Pérez, S.L." = "DISTRIBUCIONES PEREZ SL"
+const supplierKey = (n) => normText(n).replace(/\b(s ?l ?u?|s ?a ?u?|s ?l ?l|s ?coop( ?and)?|c ?b|sociedad (limitada|anonima)( unipersonal)?)\b/g, ' ').replace(/\s+/g, '');
+async function suppliersMerge(request, env, user, ctx) {
+  need(user, 'productos.editar');
+  const d = await body(request);
+  const target = Number(d.target_id);
+  const sources = [...new Set((d.source_ids || []).map(Number))].filter((x) => x && x !== target);
+  if (!target || !sources.length) throw new HttpError(400, 'Elige el proveedor que se queda y al menos otro para juntar con él');
+  const { results: ss } = await allIn(env, 'SELECT * FROM suppliers WHERE id IN (??)', [target, ...sources]);
+  const T = ss.find((s) => s.id === target);
+  const src = sources.map((id) => ss.find((s) => s.id === id));
+  if (!T || src.some((s) => !s)) throw new HttpError(404, 'Algún proveedor ya no existe. Recarga la página.');
+  const stmts = [];
+  for (const s of src) {
+    for (const t of ['products', 'orders', 'receipts', 'ocr_scans']) stmts.push(env.DB.prepare(`UPDATE ${t} SET supplier_id = ? WHERE supplier_id = ?`).bind(target, s.id));
+    // lo aprendido del escáner: si el principal ya conoce esa línea, gana la suya
+    stmts.push(env.DB.prepare('UPDATE OR IGNORE ocr_aliases SET supplier_id = ? WHERE supplier_id = ?').bind(target, s.id));
+    stmts.push(env.DB.prepare('DELETE FROM ocr_aliases WHERE supplier_id = ?').bind(s.id));
+    stmts.push(env.DB.prepare('DELETE FROM suppliers WHERE id = ?').bind(s.id));
+  }
+  const first = (k) => src.map((s) => s[k]).find((x) => x != null && String(x).trim() !== '') ?? null;
+  stmts.push(env.DB.prepare(`UPDATE suppliers SET cif = COALESCE(NULLIF(cif, ''), ?), contact = COALESCE(NULLIF(contact, ''), ?), phone = COALESCE(NULLIF(phone, ''), ?),
+    email = COALESCE(NULLIF(email, ''), ?), order_days = COALESCE(NULLIF(order_days, ''), ?), notes = COALESCE(NULLIF(notes, ''), ?), active = 1 WHERE id = ?`)
+    .bind(first('cif'), first('contact'), first('phone'), first('email'), first('order_days'), first('notes'), target));
+  await runBatch(env, stmts);
+  ctx.audit = { action: 'fusión', entity: 'proveedor', id: target, summary: `Fusión de proveedores: ${src.map((s) => `"${s.name}"`).join(', ')} → "${T.name}"`, detail: { queda: T, fusionados: src } };
+  return json({ ok: true, merged: src.length });
+}
+
+// ---------- reset (solo superusuario, con copia descargada justo antes) ----------
+const RESET_COMPRAS = ['product_formats', 'price_history', 'order_lines', 'orders', 'receipt_lines', 'receipts', 'movements', 'inventory_lines', 'inventories', 'ocr_aliases', 'ocr_scans'];
+const RESET_KEEP = ['settings', 'users', 'sessions', 'audit_log', 'login_attempts', 'push_subs', 'sqlite_sequence', '_cf_KV', 'd1_migrations'];
+async function factoryReset(request, env, user, ctx) {
+  need(user, 'super');
+  const d = await body(request);
+  if (d.confirm !== 'BORRAR') throw new HttpError(400, 'Falta la confirmación');
+  if (!['compras', 'todo'].includes(d.scope)) throw new HttpError(400, 'Indica qué quieres borrar');
+  const last = (await env.DB.prepare(`SELECT value FROM settings WHERE key = 'last_backup'`).first())?.value;
+  if (!last || Date.now() - new Date(last.replace(' ', 'T') + 'Z').getTime() > 30 * 60000) throw new HttpError(400, 'Antes de borrar hay que descargar una copia de seguridad (hace menos de 30 minutos).');
+  const existing = new Set((await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all()).results.map((r) => r.name));
+  const stmts = [];
+  if (d.scope === 'compras') {
+    for (const t of RESET_COMPRAS) if (existing.has(t)) stmts.push(env.DB.prepare(`DELETE FROM ${t}`));
+    // los escandallos apuntan a artículos: los platos se quedan (nombre, PVP, Qamarero) pero sin ingredientes; las elaboraciones se borran
+    stmts.push(env.DB.prepare('DELETE FROM recipe_lines'));
+    stmts.push(env.DB.prepare(`DELETE FROM recipes WHERE kind = 'elaboracion'`));
+    stmts.push(env.DB.prepare('UPDATE recipes SET product_id = NULL'));
+    stmts.push(env.DB.prepare('DELETE FROM products'));
+    stmts.push(env.DB.prepare('DELETE FROM suppliers'));
+  } else {
+    for (const t of existing) if (!RESET_KEEP.includes(t) && !t.startsWith('sqlite_')) stmts.push(env.DB.prepare(`DELETE FROM ${t}`));
+  }
+  await runBatch(env, stmts);
+  ctx.audit = { action: 'reset', entity: 'datos', summary: d.scope === 'compras' ? 'Reset de compras y existencias (artículos, proveedores, pedidos, albaranes, stock, inventarios e ingredientes de escandallos)' : 'Reset de fábrica: borrados todos los datos menos usuarios y ajustes' };
+  return json({ ok: true });
+}
+
 // ---------- CRUD genérico de maestros ----------
 const TABLES = {
   suppliers: { cols: ['name', 'contact', 'phone', 'email', 'order_days', 'notes', 'cif'], read: null, write: 'productos.editar', required: ['name'] },
@@ -332,6 +436,17 @@ async function crud(table, id, method, request, env, user, ctx = {}) {
       }
       // Desde la recepción: si ya existe, se usa ese artículo.
       if (ex && ctx.reuseExisting) { ctx.audit = false; return json({ id: ex.id, existing: true }); }
+    }
+    // Proveedores: mismo CIF o mismo nombre (sin "S.L.", puntos ni acentos) = el mismo proveedor
+    if (table === 'suppliers') {
+      const { results: sups } = await env.DB.prepare('SELECT id, name, cif FROM suppliers WHERE active = 1').all();
+      const ex = (cifKey(data.cif).length >= 8 && sups.find((s) => cifKey(s.cif) === cifKey(data.cif))) || sups.find((s) => supplierKey(s.name) && supplierKey(s.name) === supplierKey(data.name));
+      if (ex && ctx.reuseExisting) {
+        if (data.cif) await env.DB.prepare(`UPDATE suppliers SET cif = ? WHERE id = ? AND (cif IS NULL OR cif = '')`).bind(data.cif, ex.id).run();
+        ctx.audit = false;
+        return json({ id: ex.id, existing: true, name: ex.name });
+      }
+      if (ex) throw new HttpError(409, `Ya existe el proveedor "${ex.name}"${ex.cif && cifKey(ex.cif) === cifKey(data.cif) ? ' con ese CIF' : ''}.`);
     }
     try {
       const row = await env.DB.prepare(
@@ -706,6 +821,14 @@ async function route(parts, method, request, env, url, ctx = {}) {
   if (a === 'recipes' && b === 'bulk-edit' && method === 'PUT') return recipesBulkEdit(request, env, user);
   if (a === 'recipes' && b === 'export') return recipesExport(env, user);
   if (a === 'suppliers' && b === 'bulk' && method === 'POST') return suppliersBulk(request, env, user);
+  if (a === 'products' && b === 'merge' && method === 'POST') return productsMerge(request, env, user, ctx);
+  if (a === 'suppliers' && b === 'merge' && method === 'POST') return suppliersMerge(request, env, user, ctx);
+  if (a === 'reset' && method === 'POST') return factoryReset(request, env, user, ctx);
+  if (a === 'suppliers' && method === 'POST' && !b) {
+    const d = await request.clone().json().catch(() => ({}));
+    if (d.from_receipt) { ctx.createPerm = ['productos.editar', 'recepcion.crear']; ctx.reuseExisting = true; }
+    return crud(a, b, method, request, env, user, ctx);
+  }
   if (a === 'products' && (method === 'POST' || method === 'PUT')) {
     const d = await request.clone().json().catch(() => ({}));
     if (d.unit && !['kg', 'l', 'ud'].includes(d.unit)) throw new HttpError(400, 'La unidad base debe ser kg, l o ud. Las cajas, botellas o sacos se añaden como formatos.');
@@ -932,7 +1055,7 @@ async function route(parts, method, request, env, url, ctx = {}) {
         stmts.push(env.DB.prepare(
           `INSERT INTO ocr_aliases (supplier_id, source, product_id, unit) VALUES (?,?,?,?)
            ON CONFLICT(supplier_id, source) DO UPDATE SET product_id = excluded.product_id, unit = excluded.unit`
-        ).bind(d.supplier_id, normText(l.source), l.product_id, l.unit || null));
+        ).bind(d.supplier_id, aliasKey(l.source), l.product_id, l.unit || null));
       }
       if (d.ocr_id) stmts.push(env.DB.prepare('UPDATE ocr_scans SET receipt_id = ? WHERE id = ?').bind(rec.id, d.ocr_id));
       if (d.supplier_cif) stmts.push(env.DB.prepare(`UPDATE suppliers SET cif = ? WHERE id = ? AND (cif IS NULL OR cif = '')`).bind(d.supplier_cif, d.supplier_id));
@@ -1267,14 +1390,14 @@ async function suppliersBulk(request, env, user) {
   const items = (d.items || []).filter((i) => clean(i.name));
   const { results: sups } = await env.DB.prepare('SELECT id, name, cif FROM suppliers WHERE active = 1').all();
   const byCif = Object.fromEntries(sups.filter((x) => x.cif).map((x) => [cifKey(x.cif), x.id]));
-  const byName = Object.fromEntries(sups.map((x) => [clean(x.name).toLowerCase(), x.id]));
+  const byName = Object.fromEntries(sups.map((x) => [supplierKey(x.name), x.id]));
   const F = ['name', 'cif', 'contact', 'phone', 'email', 'order_days', 'notes'];
   let created = 0, updated = 0;
   const stmts = [];
   for (const i of items) {
     const v = Object.fromEntries(F.map((k) => [k, clean(i[k]) || null]));
     if (v.cif) v.cif = v.cif.toUpperCase().replace(/[\s.-]/g, '');
-    const id = (v.cif && byCif[cifKey(v.cif)]) || byName[v.name.toLowerCase()];
+    const id = (v.cif && byCif[cifKey(v.cif)]) || byName[supplierKey(v.name)];
     if (id === -1) continue; // repetido dentro del mismo archivo
     if (id) {
       const keys = F.filter((k) => v[k] != null); // no borra lo que ya había si la columna viene vacía
@@ -1282,7 +1405,7 @@ async function suppliersBulk(request, env, user) {
       updated++;
     } else {
       stmts.push(env.DB.prepare(`INSERT INTO suppliers (${F.join(',')}) VALUES (${F.map(() => '?').join(',')})`).bind(...F.map((k) => v[k])));
-      byName[v.name.toLowerCase()] = -1; // evita duplicados dentro del mismo archivo
+      byName[supplierKey(v.name)] = -1; // evita duplicados dentro del mismo archivo
       if (v.cif) byCif[cifKey(v.cif)] = -1;
       created++;
     }
@@ -2501,6 +2624,17 @@ async function report(env, url, type, user) {
 
 // ---------- OCR ----------
 const normText = (t) => String(t || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+// Quita de la descripción lo que cambia en cada entrega (lote, caducidad, fechas, códigos de barras) para que el mismo artículo se reconozca siempre
+const LOT_RE = [
+  /\b(n[º°o]?\s*)?(lotes?|lot|lte)\b\s*[:.#º°nN-]*\s*[A-Za-z0-9/.-]*\d[A-Za-z0-9/.-]*/gi,
+  /\bl\s*[:.]\s*[A-Za-z0-9/.-]+/gi,
+  /\bl\d{3,}[A-Za-z0-9/-]*/gi,
+  /\b(f\.?\s*)?(cad(ucidad)?|cdd|f\.?\s*cad|c\.?\s*pref\w*|cons(umir)?\.?\s*pref\w*|exp|best before|bb)\b\.?\s*[:.]*\s*[\d/.-]{4,}/gi,
+  /\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b/g,
+  /\b\d{8,14}\b/g,
+];
+const cleanDesc = (t) => LOT_RE.reduce((x, re) => x.replace(re, ' '), String(t || '')).replace(/\s*[-–,;:/]\s*$/, '').replace(/\s+/g, ' ').trim();
+const aliasKey = (t) => normText(cleanDesc(t));
 const STOP = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'en', 'con', 'y', 'a', 'al', 'x', 'ud', 'uds', 'kg', 'gr', 'g', 'l', 'lt', 'cl', 'ml', 'caja', 'cj', 'pack', 'bot', 'botella']);
 const tokens = (t) => new Set(normText(t).split(' ').filter((w) => w.length > 1 && !STOP.has(w) && !/^\d+$/.test(w)));
 function similarity(a, b) {
@@ -2525,13 +2659,15 @@ const OCR_SCHEMA = {
         type: 'object',
         properties: {
           code: { type: 'string', description: 'Código o referencia del artículo, si aparece' },
-          description: { type: 'string', description: 'Descripción del artículo tal como está escrita' },
+          description: { type: 'string', description: 'Nombre del artículo tal como está escrito, SIN lote, caducidad, fechas ni códigos de barras' },
+          lot: { type: 'string', description: 'Número de lote de esa línea, si aparece; vacío si no' },
+          expiry: { type: 'string', description: 'Fecha de caducidad o consumo preferente de esa línea en formato AAAA-MM-DD, si aparece; vacío si no' },
           quantity: { type: 'number', description: 'Cantidad facturada' },
           unit: { type: 'string', description: 'Unidad tal como aparece: KG, UD, CAJ, BOT, L…; vacío si no aparece' },
           unit_price: { type: 'number', description: 'Precio unitario sin IVA, después de descuentos' },
           line_total: { type: 'number', description: 'Importe de la línea sin IVA' },
         },
-        required: ['description', 'quantity', 'unit', 'unit_price', 'line_total', 'code'],
+        required: ['description', 'quantity', 'unit', 'unit_price', 'line_total', 'code', 'lot', 'expiry'],
         additionalProperties: false,
       },
     },
@@ -2545,6 +2681,7 @@ const OCR_PROMPT = `Eres un asistente de un restaurante en España. Lee este alb
 - Una línea por artículo; ignora portes, envases retornables con importe 0, subtotales y líneas de IVA.
 - Precios y totales SIN IVA. Si hay descuento en la línea, unit_price ya descontado.
 - Usa punto decimal. Si un número no se lee, pon 0. Si un texto no aparece, cadena vacía.
+- El lote y la caducidad van en sus campos (lot, expiry), nunca dentro de la descripción.
 - Si el documento está escrito a mano, haz tu mejor lectura.`;
 
 // Por defecto, la IA incluida gratis en Cloudflare (sin tarjeta, bloquea al pasar el cupo diario, no cobra).
@@ -2623,7 +2760,7 @@ async function ocrScan(request, env, user) {
   const { results: prods } = await env.DB.prepare('SELECT id, name, unit, price, supplier_id FROM products WHERE active = 1').all();
   const { results: fmts } = await env.DB.prepare('SELECT * FROM product_formats WHERE active = 1').all();
   const aliases = supplier ? (await env.DB.prepare('SELECT source, product_id, unit FROM ocr_aliases WHERE supplier_id = ?').bind(supplier.id).all()).results : [];
-  const amap = Object.fromEntries(aliases.map((x) => [x.source, x]));
+  const amap = Object.fromEntries(aliases.flatMap((x) => [[aliasKey(x.source), x], [x.source, x]]).reverse());
   const unitGuess = (p, printed) => {
     const u = normText(printed);
     if (p.unit === 'kg' && /^(kg|kgs|kilo|kilos)$/.test(u)) return 'kg';
@@ -2637,15 +2774,19 @@ async function ocrScan(request, env, user) {
   const lines = (raw.lines || []).filter((l) => l.description && Number(l.quantity)).map((l) => {
     const qty = Number(l.quantity);
     const price = Number(l.line_total) > 0 ? Number(l.line_total) / qty : Number(l.unit_price) || 0;
-    const source = [l.code, l.description].filter(Boolean).join(' ').trim();
-    const learned = amap[normText(source)];
+    // si el lote se ha colado en la descripción, se separa
+    const rawDesc = String(l.description || '');
+    const desc = cleanDesc(rawDesc) || rawDesc;
+    const lotIn = !l.lot && rawDesc.match(/\b(?:lotes?|lot|lte|l)\s*[:.#º°]?\s*([A-Za-z0-9/.-]*\d[A-Za-z0-9/.-]*)/i);
+    const source = [l.code, desc].filter(Boolean).join(' ').trim();
+    const learned = amap[aliasKey(source)] || amap[normText([l.code, rawDesc].filter(Boolean).join(' '))];
     let product = learned ? prods.find((p) => p.id === learned.product_id) : null, confidence = learned ? 'aprendido' : null;
     if (!product) {
-      const cands = prods.map((p) => ({ p, sc: similarity(p.name, l.description) + (supplier && p.supplier_id === supplier.id ? 0.1 : 0) })).sort((a1, b1) => b1.sc - a1.sc);
+      const cands = prods.map((p) => ({ p, sc: similarity(p.name, desc) + (supplier && p.supplier_id === supplier.id ? 0.1 : 0) })).sort((a1, b1) => b1.sc - a1.sc);
       if (cands[0] && cands[0].sc >= 0.45) { product = cands[0].p; confidence = cands[0].sc >= 0.75 ? 'alta' : 'revisar'; }
     }
     return {
-      source, description: l.description || '', printed_unit: l.unit || '', qty, price: Math.round(price * 10000) / 10000, line_total: Number(l.line_total) || qty * price,
+      source, description: desc, lot: String(l.lot || (lotIn ? lotIn[1] : '')).trim(), expiry: isDate(l.expiry) ? l.expiry : '', printed_unit: l.unit || '', qty, price: Math.round(price * 10000) / 10000, line_total: Number(l.line_total) || qty * price,
       product_id: product?.id || null, unit: product ? (learned?.unit || unitGuess(product, l.unit)) : null, confidence,
     };
   });

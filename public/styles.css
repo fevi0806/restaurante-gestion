@@ -291,3 +291,15 @@ table.sched tr.cov td.lack { color: var(--bad); font-weight: 700; }
   .dayview .myday { margin-top: 6px; grid-template-columns: 90px 1fr; }
 }
 @media print { .dayview { display: none !important; } .wide-only { display: block !important; } }
+
+/* ordenar y filtrar listas */
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--text, inherit); }
+th[data-sort="asc"]::after { content: " ▲"; font-size: .7em; }
+th[data-sort="desc"]::after { content: " ▼"; font-size: .7em; }
+tr.fhide { display: none; }
+input.tfilter { margin: 0 0 10px; max-width: 360px; }
+.mergegrp { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+.mergegrp label { display: flex; gap: 10px; align-items: flex-start; padding: 4px 0; font-weight: 500; cursor: pointer; }
+.mergegrp label input, td > input[data-sel], th > input#all { width: 20px; min-height: 20px; flex: none; margin: 1px 0 0; }
+.danger-zone { border-color: var(--bad, #c0392b); }
