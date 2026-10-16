@@ -1134,6 +1134,7 @@ async function route(parts, method, request, env, url, ctx = {}) {
   // --- inventario ---
   if (a === 'inventory') {
     need(user, 'inventario.hacer');
+    if (b === 'opening') return inventoryOpening(parts.slice(2), method, request, env, user, ctx);
     if (method === 'GET') {
       const { results } = await env.DB.prepare(
         `SELECT i.*, u.name AS user_name FROM inventories i LEFT JOIN users u ON u.id = i.user_id ORDER BY i.id DESC LIMIT 50`
@@ -1426,6 +1427,86 @@ function normUnit(u) {
 
 
 // Guarda un recuento: la diferencia con el stock teórico entra como ajuste
+// ---------- inventario de arranque ----------
+// Varias personas cuentan a la vez por zonas y guardan su parte (no toca el stock). Si un artículo sale en varias zonas, se suma.
+// Al cerrar, el stock de cada artículo pasa a ser lo contado y lo que nadie ha contado queda a 0.
+// La regularización se registra como stock inicial, no como descuadre.
+const OPEN_TAG = '[arranque]';
+async function openingState(env) {
+  const since = (await env.DB.prepare(`SELECT value FROM settings WHERE key = 'opening_since'`).first())?.value || null;
+  if (!since) return { active: false };
+  const { results: parts } = await env.DB.prepare(`SELECT i.id, i.notes, i.user_id, i.created_at, u.name AS user_name, (SELECT COUNT(*) FROM inventory_lines l WHERE l.inventory_id = i.id) AS n
+    FROM inventories i LEFT JOIN users u ON u.id = i.user_id WHERE i.notes LIKE ? AND i.created_at >= ? ORDER BY i.id`).bind(OPEN_TAG + '%', since).all();
+  const { results: lines } = await env.DB.prepare(`SELECT l.product_id, SUM(l.counted) AS counted, GROUP_CONCAT(REPLACE(i.notes, ?, ''), ' +') AS zones
+    FROM inventory_lines l JOIN inventories i ON i.id = l.inventory_id WHERE i.notes LIKE ? AND i.created_at >= ? GROUP BY l.product_id`).bind(OPEN_TAG + ' ', OPEN_TAG + '%', since).all();
+  return { active: true, since, parts, counts: Object.fromEntries(lines.map((l) => [l.product_id, { counted: l.counted, zones: (l.zones || '').trim() }])) };
+}
+async function inventoryOpening([op, id], method, request, env, user, ctx) {
+  if (method === 'GET') { ctx.audit = false; return json(await openingState(env)); }
+  const st = await openingState(env);
+  if (op === 'start' && method === 'POST') {
+    need(user, 'super');
+    if (st.active) return json(st);
+    await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('opening_since', datetime('now', '-1 second')) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run();
+    ctx.audit = { action: 'inicio', entity: 'inventario', summary: 'Empieza el inventario de arranque' };
+    return json(await openingState(env));
+  }
+  if (!st.active) throw new HttpError(400, 'No hay ningún inventario de arranque en marcha. Lo empieza el responsable desde Stock → Hacer inventario.');
+  if (op === 'part' && method === 'POST') {
+    const d = await body(request);
+    const zone = String(d.zone || '').trim().slice(0, 60);
+    if (!zone) throw new HttpError(400, 'Indica la zona que has contado (cámara, almacén, barra…)');
+    const counts = (d.counts || []).filter((x) => x.product_id && x.counted !== '' && x.counted != null && !isNaN(Number(x.counted)) && Number(x.counted) >= 0);
+    if (!counts.length) throw new HttpError(400, 'No has apuntado ningún recuento');
+    const inv = await env.DB.prepare('INSERT INTO inventories (inv_date, notes, user_id) VALUES (?,?,?) RETURNING id').bind(isDate(d.date) ? d.date : todayStr(), `${OPEN_TAG} ${zone}`, user.id).first();
+    await runBatch(env, counts.map((c) => env.DB.prepare('INSERT INTO inventory_lines (inventory_id, product_id, expected, counted, detail) VALUES (?,?,NULL,?,?)').bind(inv.id, Number(c.product_id), r2(Number(c.counted)), c.detail || null)));
+    ctx.audit = { action: 'recuento', entity: 'inventario', id: inv.id, summary: `Inventario de arranque: zona "${zone}" (${counts.length} artículos)` };
+    return json({ ok: true, id: inv.id, n: counts.length });
+  }
+  if (op === 'part' && method === 'DELETE') {
+    const part = st.parts.find((x) => x.id === Number(id));
+    if (!part) throw new HttpError(404, 'Esa parte ya no existe');
+    if (part.user_id !== user.id && !user.is_super) throw new HttpError(403, 'Solo puedes quitar las zonas que has guardado tú');
+    await runBatch(env, [env.DB.prepare('DELETE FROM inventory_lines WHERE inventory_id = ?').bind(part.id), env.DB.prepare('DELETE FROM inventories WHERE id = ?').bind(part.id)]);
+    ctx.audit = { action: 'baja', entity: 'inventario', id: part.id, summary: `Inventario de arranque: quitada la zona "${part.notes.replace(OPEN_TAG, '').trim()}"` };
+    return json({ ok: true });
+  }
+  if (op === 'cancel' && method === 'POST') {
+    need(user, 'super');
+    const stmts = st.parts.flatMap((x) => [env.DB.prepare('DELETE FROM inventory_lines WHERE inventory_id = ?').bind(x.id), env.DB.prepare('DELETE FROM inventories WHERE id = ?').bind(x.id)]);
+    stmts.push(env.DB.prepare(`DELETE FROM settings WHERE key = 'opening_since'`));
+    await runBatch(env, stmts);
+    ctx.audit = { action: 'cancelación', entity: 'inventario', summary: 'Cancelado el inventario de arranque (sin tocar el stock)' };
+    return json({ ok: true });
+  }
+  if (op === 'close' && method === 'POST') {
+    need(user, 'super');
+    const d = await body(request);
+    if (d.confirm !== 'CERRAR') throw new HttpError(400, 'Falta la confirmación');
+    const date = isDate(d.date) ? d.date : todayStr();
+    const { results: prods } = await env.DB.prepare(PRODUCTS_SQL).all();
+    const inv = await env.DB.prepare('INSERT INTO inventories (inv_date, notes, user_id, total_diff_value) VALUES (?,?,?,0) RETURNING id').bind(date, 'Regularización: inventario de arranque', user.id).first();
+    const stmts = [];
+    let counted = 0, zeroed = 0, value = 0;
+    for (const p of prods) {
+      const c = st.counts[p.id];
+      const target = c ? r2(Number(c.counted)) : 0;
+      if (c) counted++; else if (Math.abs(p.stock) > 0.0001) zeroed++;
+      value += target * (Number(p.price) || 0);
+      stmts.push(env.DB.prepare('INSERT INTO inventory_lines (inventory_id, product_id, expected, counted, detail) VALUES (?,?,?,?,?)').bind(inv.id, p.id, r2(p.stock), target, c ? c.zones : 'no contado → 0'));
+      const delta = r2(target - Number(p.stock));
+      if (Math.abs(delta) < 0.0001) continue;
+      stmts.push(env.DB.prepare(`INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .bind(p.id, 'entrada', delta, p.price || 0, 'Regularización inventario de arranque', uuid(), 'stock_inicial', inv.id, user.id, date));
+    }
+    stmts.push(env.DB.prepare(`DELETE FROM settings WHERE key = 'opening_since'`));
+    await runBatch(env, stmts);
+    ctx.audit = { action: 'regularización', entity: 'inventario', id: inv.id, summary: `Inventario de arranque cerrado: ${counted} artículos con lo contado, ${zeroed} a cero. Valor del almacén: ${r2(value)} €` };
+    return json({ ok: true, counted, zeroed, value: r2(value) });
+  }
+  throw new HttpError(404, 'Acción desconocida');
+}
+
 async function saveInventory(env, user, d) {
   const counts = (d.counts || []).filter((x) => x.product_id && x.counted !== '' && x.counted !== null && !isNaN(Number(x.counted)));
   if (!counts.length) throw new HttpError(400, 'No has contado ningún artículo');

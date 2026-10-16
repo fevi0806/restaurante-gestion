@@ -962,41 +962,114 @@ VIEWS.stock = async (v, _id, q) => {
   }
 
   if (tab === 'inventario') {
-    const invs = await api('inventory');
-    v.innerHTML = `<h1>Stock e inventario</h1>${tabs}
-      <div class="card row between" style="${invs.length ? '' : 'border-color:var(--accent)'}"><div><b>${invs.length ? '¿Tienes el recuento en un Excel?' : '¿Arrancas con el stock en un Excel?'}</b>
-        <div class="small muted">Súbelo y la app da de alta los artículos que falten, actualiza precios y carga las cantidades${invs.length ? '' : ' como stock inicial'}.</div></div>
-        <button class="primary" id="impinv">⬆ Importar desde Excel</button></div>
+    const [invs, op] = await Promise.all([api('inventory'), api('inventory/opening')]);
+    const open = op.active, sup = S.user.is_super;
+    const counted = op.counts || {};
+    const nCounted = Object.keys(counted).length;
+    const DKEY = 'inv-draft:' + S.user.id;
+    let draft = {}; try { draft = JSON.parse(lsGetX(DKEY) || '{}') || {}; } catch { draft = {}; }
+    const since = op.since ? new Date(op.since.replace(' ', 'T') + 'Z').toLocaleString('es-ES', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+    const openCard = open ? `<div class="card" style="border-color:var(--accent)">
+        <div class="row between"><div><h2 style="margin:0">Inventario de arranque en marcha</h2><div class="small muted">Desde ${esc(since)} · <b>${nCounted}</b> de ${S.products.length} artículos contados</div></div>
+        ${sup ? '<div class="row"><button type="button" id="opcancel">Cancelar</button><button type="button" class="primary" id="opclose">✅ Cerrar y regularizar…</button></div>' : ''}</div>
+        <p class="small" style="margin:8px 0">Cuenta <b>tu zona</b>, pon su nombre abajo y pulsa <b>Guardar mi zona</b>. Varias personas a la vez, cada una desde su móvil. Si un artículo está en varias zonas, se suma. ${sup ? 'Cuando terminéis, pulsa <b>Cerrar y regularizar</b>: el stock queda como lo contado y <b>lo no contado, a 0</b>.' : 'Al terminar, el responsable lo cierra.'}</p>
+        ${op.parts.length ? `<div class="table-wrap"><table class="nosort"><thead><tr><th>Zona</th><th>Quién</th><th>Hora</th><th class="num">Artículos</th><th></th></tr></thead><tbody>${op.parts.map((x) => `<tr><td>${esc(x.notes.replace('[arranque]', '').trim())}</td><td>${esc(x.user_name || '')}</td><td>${esc(new Date(x.created_at.replace(' ', 'T') + 'Z').toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }))}</td><td class="num">${x.n}</td><td>${sup || x.user_id === S.user.id ? `<button class="sm" data-delpart="${x.id}" aria-label="Quitar">✕</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="small muted">Aún no se ha guardado ninguna zona.</div>'}</div>`
+      : `<div class="card"><div class="row between"><div><b>¿Empezar de cero con un inventario?</b><div class="small muted">Inventario de arranque: contáis por zonas (varias personas a la vez) y al cerrar, el stock queda exactamente como lo contado y todo lo demás a 0. No borra artículos, escandallos ni albaranes, y no cuenta como descuadre.</div></div>
+        ${sup ? '<button type="button" class="primary" id="opstart">Empezar inventario de arranque</button>' : '<span class="small muted">Lo empieza el responsable.</span>'}</div></div>`;
+    v.innerHTML = `<h1>Stock e inventario</h1>${tabs}${openCard}
+      ${open ? '' : `<div class="card row between"><div><b>¿Tienes el recuento en un Excel?</b>
+        <div class="small muted">Súbelo y la app da de alta los artículos que falten, actualiza precios y carga las cantidades.</div></div>
+        <button id="impinv">⬆ Importar desde Excel</button></div>`}
       <div class="card">
-      <p class="small muted">Cuenta lo que hay físicamente y apúntalo. Deja en blanco lo que no cuentes. La app compara con el stock teórico y registra la diferencia como descuadre.</p>
-      <div class="row"><div class="field"><label>Fecha del recuento</label><input type="date" id="date" value="${today()}"></div><div class="field" style="flex:2 1 240px"><label>Buscar</label><input id="search" placeholder="Filtrar artículos…"></div></div>
-      ${cats.map((c) => `<h3 style="margin-top:14px">${esc(c)}</h3><div class="table-wrap"><table><tbody>${S.products.filter((p) => (p.category || 'Sin categoría') === c).map((p) => {
-        const fm = fmtsOf(p).slice().sort((a, b) => b.factor - a.factor);
-        return `<tr data-n="${esc(norm(p.name))}" data-row="${p.id}"><td>${esc(p.name)}<div class="small muted">Teórico ${stockText(p, p.stock)}</div></td>
-        <td class="num"><div class="row" style="justify-content:flex-end;gap:6px">${fm.map((f) => `<label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="${f.factor}" data-l="${esc(f.name)}"><span>${esc(f.name)}</span></label>`).join('')}
-        <label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="1" data-l="${esc(p.unit)}"><span>${fm.length ? 'sueltos ' : ''}${esc(p.unit)}</span></label></div>
-        <div class="small muted" data-total></div></td></tr>`; }).join('')}</tbody></table></div>`).join('') || '<div class="empty">No hay artículos.</div>'}
-      <div class="field" style="margin-top:12px"><label>Notas</label><input id="notes"></div>
-      <div class="sticky-foot row between"><span class="small muted" id="cnt">0 contados</span><button class="primary" id="save">Guardar inventario</button></div></div>
-      ${tableCard('Inventarios anteriores', invs, ['Fecha', 'Quién', 'Descuadre'], (i) => [fdate(i.inv_date), esc(i.user_name || ''), `<span class="${i.total_diff_value < 0 ? 'txt-bad' : ''}">${eur(i.total_diff_value)}</span>`], 'Aún no se ha hecho ningún inventario')}`;
-    $('#search').oninput = () => { const s = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', s && !tr.dataset.n.includes(s))); };
-    $('#impinv').onclick = () => inventarioImport($('#date').value);
+      <p class="small muted">${open ? 'Apunta lo que hay en tu zona en cajas, botellas o sueltos: la app hace la suma. Deja en blanco lo que no esté en tu zona.' : 'Cuenta lo que hay físicamente y apúntalo. Deja en blanco lo que no cuentes. La app compara con el stock teórico y registra la diferencia como descuadre.'} Lo que escribes se guarda en este móvil hasta que pulses Guardar.</p>
+      <div class="row">${open ? '<div class="field"><label>Zona que cuentas</label><input id="zone" list="dl-zones" placeholder="Cámara, congelador, almacén, barra…"><datalist id="dl-zones">' + ['Cámara', 'Congelador', 'Almacén seco', 'Bebidas', 'Barra', 'Cocina', 'Bodega'].map((z) => `<option value="${z}">`).join('') + '</datalist></div>' : ''}
+        <div class="field"><label>Fecha del recuento</label><input type="date" id="date" value="${today()}"></div>
+        <div class="field"><label>Categoría</label><select id="fcat"><option value="">Todas</option>${cats.map((c) => `<option>${esc(c)}</option>`).join('')}</select></div>
+        <div class="field" style="flex:2 1 200px"><label>Buscar</label><input id="search" placeholder="Filtrar artículos…"></div></div>
+      ${open ? '<label class="check"><input type="checkbox" id="pend"> <span>Ver solo los que nadie ha contado todavía</span></label>' : ''}
+      ${cats.map((c) => `<div data-cat="${esc(c)}"><h3 style="margin-top:14px">${esc(c)}</h3><div class="table-wrap"><table class="nosort"><tbody>${S.products.filter((p) => (p.category || 'Sin categoría') === c).map((p) => {
+        const fm = fmtsOf(p).slice().sort((a, b) => b.factor - a.factor), dr = draft[p.id] || {}, done = counted[p.id];
+        return `<tr data-n="${esc(norm(p.name))}" data-row="${p.id}" class="${done ? 'done' : ''}"><td>${esc(p.name)}<div class="small muted">${open ? (done ? `✓ contado: ${num(done.counted, 3)} ${esc(p.unit)} <span class="muted">(${esc(done.zones)})</span>` : 'sin contar') : `Teórico ${stockText(p, p.stock)}`}</div></td>
+        <td class="num"><div class="row" style="justify-content:flex-end;gap:6px">${fm.map((f) => `<label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="${f.factor}" data-l="${esc(f.name)}" value="${esc(dr[f.factor] ?? '')}"><span>${esc(f.name)}</span></label>`).join('')}
+        <label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="1" data-l="${esc(p.unit)}" value="${esc(dr[1] ?? '')}"><span>${fm.length ? 'sueltos ' : ''}${esc(p.unit)}</span></label></div>
+        <div class="small muted" data-total></div></td></tr>`; }).join('')}</tbody></table></div></div>`).join('') || '<div class="empty">No hay artículos.</div>'}
+      ${open ? '' : '<div class="field" style="margin-top:12px"><label>Notas</label><input id="notes"></div>'}
+      <div class="sticky-foot row between"><span class="small muted" id="cnt">0 contados</span><button class="primary" id="save">${open ? 'Guardar mi zona' : 'Guardar inventario'}</button></div></div>
+      ${tableCard('Inventarios anteriores', invs.filter((i) => !String(i.notes || '').startsWith('[arranque]')), ['Fecha', 'Quién', 'Descuadre'], (i) => [`${fdate(i.inv_date)}${i.notes ? `<div class="small muted">${esc(i.notes)}</div>` : ''}`, esc(i.user_name || ''), `<span class="${i.total_diff_value < 0 ? 'txt-bad' : ''}">${eur(i.total_diff_value)}</span>`], 'Aún no se ha hecho ningún inventario')}`;
+    const filt = () => {
+      const s = norm($('#search').value), c = $('#fcat').value, pend = $('#pend')?.checked;
+      $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', (s && !tr.dataset.n.includes(s)) || (pend && tr.classList.contains('done'))));
+      $$('[data-cat]', v).forEach((d) => d.classList.toggle('hidden', (c && d.dataset.cat !== c) || !$$('tr[data-n]', d).some((tr) => !tr.classList.contains('hidden'))));
+    };
+    $('#search').oninput = filt; $('#fcat').onchange = filt; if ($('#pend')) $('#pend').onchange = filt;
+    if ($('#impinv')) $('#impinv').onclick = () => inventarioImport($('#date').value);
     const rowCount = (tr) => {
       const ins = $$('input[data-f]', tr).filter((i) => i.value !== '');
       if (!ins.length) return null;
       return { product_id: Number(tr.dataset.row), counted: ins.reduce((s, i) => s + Number(i.value) * Number(i.dataset.f), 0), detail: ins.map((i) => `${num(Number(i.value), 3)} ${i.dataset.l}`).join(' + ') };
     };
+    const showRow = (tr) => { const c = rowCount(tr), p = prodById(tr.dataset.row); $('[data-total]', tr).textContent = c ? (open ? `= ${num(c.counted, 3)} ${p.unit}` : `Total ${num(c.counted, 3)} ${p.unit} · diferencia ${c.counted - p.stock > 0 ? '+' : ''}${num(c.counted - p.stock, 3)}`) : ''; };
+    const refresh = () => { $('#cnt').textContent = $$('tr[data-row]', v).filter((t) => rowCount(t)).length + ' contados'; };
+    $$('tr[data-row]', v).forEach(showRow); refresh();
     v.addEventListener('input', (e) => {
       const tr = e.target.closest('tr[data-row]');
-      if (tr) { const c = rowCount(tr), p = prodById(tr.dataset.row); $('[data-total]', tr).textContent = c ? `Total ${num(c.counted, 3)} ${p.unit} · diferencia ${c.counted - p.stock > 0 ? '+' : ''}${num(c.counted - p.stock, 3)}` : ''; }
-      $('#cnt').textContent = $$('tr[data-row]', v).filter((t) => rowCount(t)).length + ' contados';
+      if (tr) {
+        showRow(tr);
+        const d2 = {}; $$('input[data-f]', tr).forEach((i) => { if (i.value !== '') d2[i.dataset.f] = i.value; });
+        if (Object.keys(d2).length) draft[tr.dataset.row] = d2; else delete draft[tr.dataset.row];
+        lsSetX(DKEY, JSON.stringify(draft));
+      }
+      refresh();
+    });
+    if ($('#opstart')) $('#opstart').onclick = (e) => act(e.target, async () => {
+      if (!(await confirmModal('Empieza el inventario de arranque. El stock no cambia hasta que lo cierres; mientras, cada persona guarda su zona. ¿Empezamos?', 'Empezar'))) return;
+      await api('inventory/opening/start', { body: {} }); route();
+    });
+    $$('[data-delpart]', v).forEach((b2) => (b2.onclick = () => act(b2, async () => {
+      if (!(await confirmModal('¿Quitar esta zona? Lo que se contó en ella deja de sumar (habrá que volver a contarla).', 'Quitar'))) return;
+      await api('inventory/opening/part/' + b2.dataset.delpart, { method: 'DELETE' }); route();
+    })));
+    if ($('#opcancel')) $('#opcancel').onclick = (e) => act(e.target, async () => {
+      if (!(await confirmModal('¿Cancelar el inventario de arranque? Se borran las zonas guardadas y el stock no cambia.', 'Cancelar inventario'))) return;
+      await api('inventory/opening/cancel', { body: {} }); route();
+    });
+    if ($('#opclose')) $('#opclose').onclick = (e) => act(e.target, async () => {
+      const st = await api('inventory/opening');
+      const cnt = st.counts || {};
+      const zero = S.products.filter((p) => !cnt[p.id] && Math.abs(p.stock) > 0.0001);
+      const value = S.products.reduce((a2, p) => a2 + (cnt[p.id] ? cnt[p.id].counted * (p.price || 0) : 0), 0);
+      const pendingHere = $$('tr[data-row]', v).filter((t) => rowCount(t)).length;
+      const ok = await modal(`<h2>Cerrar y regularizar</h2>
+        ${pendingHere ? `<p class="txt-bad">En este móvil hay ${pendingHere} artículos apuntados sin guardar. Guárdalos antes como una zona o se perderán.</p>` : ''}
+        <ul><li><b>${Object.keys(cnt).length}</b> artículos quedan con lo contado (${st.parts.length} zonas).</li>
+        <li><b>${S.products.length - Object.keys(cnt).length}</b> no contados quedan a <b>0</b>${zero.length ? ` (${zero.length} tenían stock)` : ''}.</li>
+        ${can('costes.ver') ? `<li>Valor del almacén después: <b>${eur(value)}</b></li>` : ''}</ul>
+        ${zero.length ? `<details><summary class="small">Ver los que tenían stock y quedan a 0</summary><div class="small">${zero.map((p) => esc(p.name)).join(', ')}</div></details>` : ''}
+        <p class="small muted">Antes se descarga una copia de seguridad. La regularización cuenta como stock inicial, no como descuadre.</p>
+        <p>Escribe <b>CERRAR</b> para confirmar.</p><input id="cf" autocomplete="off">
+        <div class="actions"><button data-close>Volver</button><button class="primary" value="ok">Regularizar</button></div>`);
+      if (!ok) return;
+      if ($('#cf', $('#modal-form')).value.trim().toUpperCase() !== 'CERRAR') throw new Error('No has escrito CERRAR: no se ha tocado nada');
+      await downloadBackup(await api('backup'));
+      const r = await api('inventory/opening/close', { body: { confirm: 'CERRAR', date: $('#date').value } });
+      lsSetX(DKEY, '{}');
+      await reload();
+      await modal(`<h2>Inventario regularizado ✓</h2><p>${r.counted} artículos con lo contado y ${r.zeroed} puestos a 0.${can('costes.ver') ? ` Valor del almacén: <b>${eur(r.value)}</b>.` : ''}</p><p class="small muted">A partir de ahora el stock parte de este recuento.</p><div class="actions"><button class="primary" value="ok">Ver el stock</button></div>`);
+      go('#/stock?tab=stock');
     });
     $('#save').onclick = (e) => act(e.target, async () => {
       const counts = $$('tr[data-row]', v).map(rowCount).filter(Boolean);
       if (!counts.length) throw new Error('No has apuntado ningún recuento');
+      if (open) {
+        const zone = $('#zone').value.trim();
+        if (!zone) { $('#zone').focus(); throw new Error('Escribe arriba qué zona has contado'); }
+        const r = await api('inventory/opening/part', { body: { zone, date: $('#date').value, counts } });
+        lsSetX(DKEY, '{}'); toast(`Zona "${zone}" guardada: ${r.n} artículos`); route(); return;
+      }
       const r = await api('inventory', { body: { date: $('#date').value, notes: $('#notes').value, counts } });
+      lsSetX(DKEY, '{}');
       await modal(`<h2>Inventario guardado</h2>${r.diffs.length ? `<p>Descuadre total: <b class="${r.total_diff_value < 0 ? 'txt-bad' : 'txt-ok'}">${eur(r.total_diff_value)}</b> <span class="small muted">(negativo = falta género)</span></p>
-        <div class="table-wrap"><table><thead><tr><th>Artículo</th><th class="num">Teórico</th><th class="num">Contado</th><th class="num">Valor</th></tr></thead><tbody>${r.diffs.sort((a, b) => a.value - b.value).map((d) => `<tr><td>${esc(d.name)}${d.detail ? `<div class="small muted">${esc(d.detail)}</div>` : ''}</td><td class="num">${num(d.expected)}</td><td class="num">${num(d.counted)} ${esc(d.unit)}</td><td class="num ${d.value < 0 ? 'txt-bad' : 'txt-ok'}">${eur(d.value)}</td></tr>`).join('')}</tbody></table></div>` : '<p>Todo cuadra con el stock teórico. 👍</p>'}
+        <div class="table-wrap"><table><thead><tr><th>Artículo</th><th class="num">Teórico</th><th class="num">Contado</th><th class="num">Valor</th></tr></thead><tbody>${r.diffs.sort((a2, b2) => a2.value - b2.value).map((d) => `<tr><td>${esc(d.name)}${d.detail ? `<div class="small muted">${esc(d.detail)}</div>` : ''}</td><td class="num">${num(d.expected)}</td><td class="num">${num(d.counted)} ${esc(d.unit)}</td><td class="num ${d.value < 0 ? 'txt-bad' : 'txt-ok'}">${eur(d.value)}</td></tr>`).join('')}</tbody></table></div>` : '<p>Todo cuadra con el stock teórico. 👍</p>'}
         <div class="actions"><button class="primary" value="ok">Cerrar</button></div>`);
       go('#/stock?tab=stock');
     });
