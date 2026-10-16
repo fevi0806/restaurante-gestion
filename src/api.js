@@ -1152,6 +1152,7 @@ async function route(parts, method, request, env, url, ctx = {}) {
   if (a === 'recipes') {
     if (b === 'bulk' && method === 'POST') return recipesBulk(request, env, user);
     if (b === 'lines-import' && method === 'POST') return recipeLinesImport(request, env, user);
+    if (b === 'ai-suggest' && method === 'POST') { ctx.audit = false; return recipesAiSuggest(request, env, user); }
     if (method === 'GET' && b) {
       need(user, 'escandallos.ver');
       const r = await env.DB.prepare('SELECT * FROM recipes WHERE id = ?').bind(b).first();
@@ -1744,6 +1745,92 @@ async function receiptsImport(request, env, user) {
 }
 
 // Escandallos desde Excel: una fila por ingrediente (plato, ingrediente, cantidad, unidad, mermas)
+// ---------- escandallos propuestos por la IA ----------
+// Texto a JSON con la IA disponible: Claude si está configurado; si no, la IA gratuita de Cloudflare.
+async function aiJson(env, prompt, maxTokens = 3000) {
+  let text = '';
+  if (env.OCR_PROVIDER === 'claude' && env.ANTHROPIC_API_KEY) {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: env.OCR_MODEL || 'claude-sonnet-5-5', max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error?.message || 'IA ' + res.status);
+    text = (data.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('');
+  } else if (env.AI) {
+    const out = await env.AI.run(env.RECIPE_MODEL || env.OCR_CF_MODEL || '@cf/meta/llama-4-scout-17b-16e-instruct', { messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens });
+    if (out && typeof out.response === 'object' && out.response) return out.response;
+    text = String(out?.response ?? '');
+  } else throw new HttpError(501, 'La IA no está activada en Cloudflare (falta el enlace "AI" del Worker).');
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error('respuesta sin JSON');
+  try { return JSON.parse(m[0]); } catch { return JSON.parse(m[0].replace(/,\s*([}\]])/g, '$1')); }
+}
+async function recipesAiSuggest(request, env, user) {
+  need(user, 'escandallos.editar');
+  const d = await body(request);
+  const ids = (d.ids || []).map(Number).filter(Boolean).slice(0, 6);
+  if (!ids.length) throw new HttpError(400, 'Elige al menos un plato');
+  const { results: recs } = await allIn(env, 'SELECT id, name, category, pvp, portions, notes, kind, yield_qty, yield_unit, product_id FROM recipes WHERE id IN (??)', ids);
+  const { results: prods } = await env.DB.prepare('SELECT id, name, unit, price, prep_recipe_id FROM products WHERE active = 1 ORDER BY name').all();
+  const hints = d.hints || {};
+  const dishes = recs.map((r) => {
+    const isPrep = r.kind === 'elaboracion';
+    const what = isPrep ? `ELABORACIÓN para ${num2(r.yield_qty)} ${r.yield_unit} en total` : `PLATO, cantidades para ${num2(r.portions || 1)} ración(es)${r.pvp ? `, PVP ${num2(r.pvp)} €` : ''}`;
+    return `- id ${r.id}: "${r.name}"${r.category ? ` (${r.category})` : ''} · ${what}${r.notes ? ` · notas: ${String(r.notes).slice(0, 200)}` : ''}${hints[r.id] ? ` · INDICACIONES DEL COCINERO: ${String(hints[r.id]).slice(0, 400)}` : ''}`;
+  }).join('\n');
+  const prompt = `Eres jefe de cocina y escandallista en un restaurante de España. Propón el escandallo (ficha técnica de costes) de cada plato o elaboración.
+Reglas:
+- Cantidades NETAS que lleva el plato, realistas para hostelería española (ración estándar). Unidad: "g", "ml" o "ud".
+- Usa la unidad de control de cada artículo: si va en "kg" da gramos; si va en "l", mililitros; si va en "ud", unidades (1 huevo = 1 ud, media lechuga = 0.5 ud, una lata = 1 ud).
+- Usa SOLO artículos de la lista de EXISTENCIAS y escribe su nombre EXACTAMENTE como aparece. Si un ingrediente principal no está en la lista, ponlo igualmente con "en_lista": false y un nombre genérico.
+- Si en la lista hay una elaboración (salsa, fondo, masa…) que encaje, úsala en lugar de sus ingredientes por separado.
+- No incluyas sal, pimienta, especias ni aceite de fritura en cantidades pequeñas: van en el % de varios.
+- "merma": % de pérdida al limpiar (pescado entero ~45, carne con hueso ~25, verdura ~10-20, 0 si se usa tal cual). "coccion": % que pierde al cocinar si la cantidad es en crudo (0 si no aplica).
+- Si algo no está claro, pon la opción más habitual y explícalo en "nota" (muy breve).
+Responde SOLO con JSON: {"platos":[{"id":0,"ingredientes":[{"articulo":"","en_lista":true,"cantidad":0,"unidad":"g","merma":0,"coccion":0}],"nota":""}]}
+
+PLATOS:
+${dishes}
+
+EXISTENCIAS (nombre · unidad de control):
+${prods.filter((p) => !recs.some((r) => r.product_id === p.id)).map((p) => `${p.name} · ${p.unit}`).join('\n')}`;
+  let raw;
+  try { raw = await aiJson(env, prompt, 1200 * ids.length + 500); } catch (e) {
+    const msg = String(e.message || e);
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(502, /limit|quota|neuron|429|capacity/i.test(msg) ? 'Se ha agotado el cupo gratuito de IA de hoy. Mañana vuelve a funcionar.' : 'La IA no ha respondido bien. Vuelve a intentarlo.');
+  }
+  const byName = new Map(prods.map((p) => [normName(p.name), p]));
+  const conv = { kg: { g: ['g', 1], kg: ['kg', 1], ml: ['g', 1], l: ['kg', 1] }, l: { ml: ['ml', 1], l: ['l', 1], g: ['ml', 1], kg: ['l', 1], cl: ['cl', 1] }, ud: { ud: ['ud', 1], unidad: ['ud', 1], unidades: ['ud', 1] } };
+  const out = {};
+  for (const pl of raw?.platos || []) {
+    const r = recs.find((x) => x.id === Number(pl.id));
+    if (!r) continue;
+    const lines = [];
+    for (const ing of pl.ingredientes || []) {
+      const name = String(ing.articulo || '').trim();
+      if (!name) continue;
+      let p = byName.get(normName(name)), match = p ? 'exacto' : null;
+      if (!p) {
+        const best = prods.filter((x) => x.id !== r.product_id).map((x) => ({ x, sc: similarity(x.name, name) })).sort((a1, b1) => b1.sc - a1.sc)[0];
+        if (best && best.sc >= 0.5) { p = best.x; match = 'parecido'; }
+      }
+      const u = String(ing.unidad || '').toLowerCase().trim();
+      let qty = Number(ing.cantidad) || 0, unit = null, review = null;
+      if (p) {
+        const c = conv[p.unit]?.[u];
+        if (c) unit = c[0];
+        else { unit = p.unit === 'kg' ? 'g' : p.unit === 'l' ? 'ml' : 'ud'; review = `La IA lo puso en ${u || '?'} y el artículo se controla en ${p.unit}: indica la cantidad`; qty = 0; }
+      }
+      lines.push({ product_id: p?.id || null, product_name: p?.name || null, ai_name: name, match: p ? match : 'falta', qty: Math.round(qty * 1000) / 1000, unit, waste_pct: Math.min(Math.max(Number(ing.merma) || 0, 0), 95), cook_loss_pct: Math.min(Math.max(Number(ing.coccion) || 0, 0), 95), review });
+    }
+    out[r.id] = { lines, note: String(pl.nota || '').slice(0, 300) };
+  }
+  return json({ suggestions: out, missing: ids.filter((id) => !out[id]) });
+}
+const num2 = (x) => Math.round((Number(x) || 0) * 100) / 100;
+
 async function recipeLinesImport(request, env, user) {
   need(user, 'escandallos.editar');
   const d = await body(request);
