@@ -267,7 +267,9 @@ async function syncFormats(env, productId, formats) {
     const ex = existing.find((e) => (f.id && e.id === Number(f.id)) || e.name.toLowerCase() === name.toLowerCase());
     if (ex) {
       keep.add(ex.id);
-      stmts.push(env.DB.prepare('UPDATE product_formats SET name = ?, factor = ?, price = ?, is_default = ?, active = 1 WHERE id = ?').bind(name, Number(f.factor), price, isDef, ex.id));
+      // sin precio en la petición (quien no ve costes) se conserva el que tenía
+      if (f.price === undefined) stmts.push(env.DB.prepare('UPDATE product_formats SET name = ?, factor = ?, is_default = ?, active = 1 WHERE id = ?').bind(name, Number(f.factor), isDef, ex.id));
+      else stmts.push(env.DB.prepare('UPDATE product_formats SET name = ?, factor = ?, price = ?, is_default = ?, active = 1 WHERE id = ?').bind(name, Number(f.factor), price, isDef, ex.id));
     } else {
       stmts.push(env.DB.prepare('INSERT INTO product_formats (product_id, name, factor, price, is_default) VALUES (?,?,?,?,?)').bind(productId, name, Number(f.factor), price, isDef));
     }
@@ -420,6 +422,7 @@ async function crud(table, id, method, request, env, user, ctx = {}) {
     if (table === 'products' && old?.prep_recipe_id) throw new HttpError(400, 'Este artículo es una elaboración: se gestiona desde Carta → Elaboraciones');
     if (old) ctx.audit = { action: 'baja', summary: `Baja de ${ENTITY[table]} "${old.name || old.concept}"`, detail: old };
     await env.DB.prepare(`UPDATE ${table} SET active = 0 WHERE id = ?`).bind(id).run();
+    if (table === 'suppliers') await env.DB.prepare('UPDATE products SET supplier_id = NULL WHERE supplier_id = ?').bind(id).run();
     return json({ ok: true });
   }
   const data = pick(await body(request), cfg.cols);
@@ -834,6 +837,8 @@ async function route(parts, method, request, env, url, ctx = {}) {
     if (d.unit && !['kg', 'l', 'ud'].includes(d.unit)) throw new HttpError(400, 'La unidad base debe ser kg, l o ud. Las cajas, botellas o sacos se añaden como formatos.');
     // Quien recibe mercancía puede dar de alta un artículo nuevo que llega en el albarán (no modificar los existentes).
     if (method === 'POST' && d.from_receipt) { ctx.createPerm = ['productos.editar', 'recepcion.crear']; ctx.reuseExisting = true; }
+    // quien hace inventario puede dar de alta lo que encuentra y no está en la lista
+    if (method === 'POST' && d.from_inventory) { ctx.createPerm = ['productos.editar', 'inventario.hacer']; ctx.reuseExisting = true; }
     const res = await crud(a, b, method, request, env, user, ctx);
     if (res.ok && Array.isArray(d.formats)) {
       const out = method === 'POST' ? await res.clone().json() : null;

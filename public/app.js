@@ -1061,6 +1061,16 @@ VIEWS.stock = async (v, _id, q) => {
         ${op.parts.length ? `<div class="table-wrap"><table class="nosort"><thead><tr><th>Zona</th><th>Quién</th><th>Hora</th><th class="num">Artículos</th><th></th></tr></thead><tbody>${op.parts.map((x) => `<tr><td>${esc(x.notes.replace('[arranque]', '').trim())}</td><td>${esc(x.user_name || '')}</td><td>${esc(new Date(x.created_at.replace(' ', 'T') + 'Z').toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }))}</td><td class="num">${x.n}</td><td>${sup || x.user_id === S.user.id ? `<button class="sm" data-delpart="${x.id}" aria-label="Quitar">✕</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="small muted">Aún no se ha guardado ninguna zona.</div>'}</div>`
       : `<div class="card"><div class="row between"><div><b>¿Empezar de cero con un inventario?</b><div class="small muted">Inventario de arranque: contáis por zonas (varias personas a la vez) y al cerrar, el stock queda exactamente como lo contado y todo lo demás a 0. No borra artículos, escandallos ni albaranes, y no cuenta como descuadre.</div></div>
         ${sup ? '<button type="button" class="primary" id="opstart">Empezar inventario de arranque</button>' : '<span class="small muted">Lo empieza el responsable.</span>'}</div></div>`;
+    const canEdit = can('productos.editar'), canAdd = canAny('productos.editar', 'inventario.hacer');
+    const invRow = (p) => {
+      const fm = fmtsOf(p).slice().sort((a, b) => b.factor - a.factor), dr = draft[p.id] || {}, done = counted[p.id];
+      return `<tr data-n="${esc(norm(p.name))}" data-row="${p.id}" class="${done ? 'done' : ''}"><td>${esc(p.name)}${canEdit && !p.prep_recipe_id ? ` <button type="button" class="sm ghost" data-edit="${p.id}" title="Corregir unidades, formatos, precio…" aria-label="Editar">✏️</button>` : ''}
+        <div class="small muted">${open ? (done ? `✓ contado: ${num(done.counted, 3)} ${esc(p.unit)} <span class="muted">(${esc(done.zones)})</span>` : 'sin contar') : `Teórico ${stockText(p, p.stock)}`}${can('costes.ver') && p.price ? ` · ${eur(p.price)}/${esc(p.unit)}` : ''}</div></td>
+        <td class="num"><div class="row" style="justify-content:flex-end;gap:6px">${fm.map((f) => `<label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="${f.factor}" data-l="${esc(f.name)}" value="${esc(dr[f.factor] ?? '')}"><span>${esc(f.name)}</span></label>`).join('')}
+        <label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="1" data-l="${esc(p.unit)}" value="${esc(dr[1] ?? '')}"><span>${fm.length ? 'sueltos ' : ''}${esc(p.unit)}</span></label></div>
+        <div class="small muted" data-total></div></td></tr>`;
+    };
+    const catBlock = (c, ps) => `<div data-cat="${esc(c)}"><h3 style="margin-top:14px">${esc(c)}</h3><div class="table-wrap"><table class="nosort"><tbody>${ps.map(invRow).join('')}</tbody></table></div></div>`;
     v.innerHTML = `<h1>Stock e inventario</h1>${tabs}${openCard}
       ${open ? '' : `<div class="card row between"><div><b>¿Tienes el recuento en un Excel?</b>
         <div class="small muted">Súbelo y la app da de alta los artículos que falten, actualiza precios y carga las cantidades.</div></div>
@@ -1071,13 +1081,9 @@ VIEWS.stock = async (v, _id, q) => {
         <div class="field"><label>Fecha del recuento</label><input type="date" id="date" value="${today()}"></div>
         <div class="field"><label>Categoría</label><select id="fcat"><option value="">Todas</option>${cats.map((c) => `<option>${esc(c)}</option>`).join('')}</select></div>
         <div class="field" style="flex:2 1 200px"><label>Buscar</label><input id="search" placeholder="Filtrar artículos…"></div></div>
-      ${open ? '<label class="check"><input type="checkbox" id="pend"> <span>Ver solo los que nadie ha contado todavía</span></label>' : ''}
-      ${cats.map((c) => `<div data-cat="${esc(c)}"><h3 style="margin-top:14px">${esc(c)}</h3><div class="table-wrap"><table class="nosort"><tbody>${S.products.filter((p) => (p.category || 'Sin categoría') === c).map((p) => {
-        const fm = fmtsOf(p).slice().sort((a, b) => b.factor - a.factor), dr = draft[p.id] || {}, done = counted[p.id];
-        return `<tr data-n="${esc(norm(p.name))}" data-row="${p.id}" class="${done ? 'done' : ''}"><td>${esc(p.name)}<div class="small muted">${open ? (done ? `✓ contado: ${num(done.counted, 3)} ${esc(p.unit)} <span class="muted">(${esc(done.zones)})</span>` : 'sin contar') : `Teórico ${stockText(p, p.stock)}`}</div></td>
-        <td class="num"><div class="row" style="justify-content:flex-end;gap:6px">${fm.map((f) => `<label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="${f.factor}" data-l="${esc(f.name)}" value="${esc(dr[f.factor] ?? '')}"><span>${esc(f.name)}</span></label>`).join('')}
-        <label class="cnt"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-f="1" data-l="${esc(p.unit)}" value="${esc(dr[1] ?? '')}"><span>${fm.length ? 'sueltos ' : ''}${esc(p.unit)}</span></label></div>
-        <div class="small muted" data-total></div></td></tr>`; }).join('')}</tbody></table></div></div>`).join('') || '<div class="empty">No hay artículos.</div>'}
+      <div class="row between">${open ? '<label class="check"><input type="checkbox" id="pend"> <span>Ver solo los que nadie ha contado todavía</span></label>' : '<span></span>'}
+        ${canAdd ? '<button type="button" id="newart">+ Artículo que no está en la lista</button>' : ''}</div>
+      ${cats.map((c) => catBlock(c, S.products.filter((p) => (p.category || 'Sin categoría') === c))).join('') || '<div class="empty" data-noprod>No hay artículos.</div>'}
       ${open ? '' : '<div class="field" style="margin-top:12px"><label>Notas</label><input id="notes"></div>'}
       <div class="sticky-foot row between"><span class="small muted" id="cnt">0 contados</span><button class="primary" id="save">${open ? 'Guardar mi zona' : 'Guardar inventario'}</button></div></div>
       ${tableCard('Inventarios anteriores', invs.filter((i) => !String(i.notes || '').startsWith('[arranque]')), ['Fecha', 'Quién', 'Descuadre'], (i) => [`${fdate(i.inv_date)}${i.notes ? `<div class="small muted">${esc(i.notes)}</div>` : ''}`, esc(i.user_name || ''), `<span class="${i.total_diff_value < 0 ? 'txt-bad' : ''}">${eur(i.total_diff_value)}</span>`], 'Aún no se ha hecho ningún inventario')}`;
@@ -1087,7 +1093,34 @@ VIEWS.stock = async (v, _id, q) => {
       $$('[data-cat]', v).forEach((d) => d.classList.toggle('hidden', (c && d.dataset.cat !== c) || !$$('tr[data-n]', d).some((tr) => !tr.classList.contains('hidden'))));
     };
     $('#search').oninput = filt; $('#fcat').onchange = filt; if ($('#pend')) $('#pend').onchange = filt;
+    if ($('#zone')) { $('#zone').value = lsGetX(DKEY + ':zona') || ''; $('#zone').oninput = () => lsSetX(DKEY + ':zona', $('#zone').value); }
     if ($('#impinv')) $('#impinv').onclick = () => inventarioImport($('#date').value);
+    // crear o corregir un artículo sin salir del inventario: solo se redibuja su fila
+    const placeRow = (p, focus) => {
+      const old2 = $(`tr[data-row="${p.id}"]`, v), c = p.category || 'Sin categoría';
+      let block = $$('[data-cat]', v).find((d) => d.dataset.cat === c);
+      if (old2 && old2.closest('[data-cat]') === block) { old2.outerHTML = invRow(p); } else {
+        if (old2) { const ob = old2.closest('[data-cat]'); old2.remove(); if (ob && !$('tr', ob)) ob.remove(); }
+        if (!block) { $('[data-noprod]', v)?.remove(); const anchor = $$('[data-cat]', v).find((d) => collator.compare(d.dataset.cat, c) > 0); const html = catBlock(c, []); if (anchor) anchor.insertAdjacentHTML('beforebegin', html); else (($$('[data-cat]', v).pop()) || $('#newart').closest('.row')).insertAdjacentHTML('afterend', html); block = $$('[data-cat]', v).find((d) => d.dataset.cat === c); }
+        const rows = $$('tr[data-row]', block), after = rows.find((r) => collator.compare(prodById(r.dataset.row)?.name || '', p.name) > 0);
+        if (after) after.insertAdjacentHTML('beforebegin', invRow(p)); else $('tbody', block).insertAdjacentHTML('beforeend', invRow(p));
+      }
+      if (!$$('#fcat option', v).some((o) => o.value === c)) $('#fcat').insertAdjacentHTML('beforeend', `<option>${esc(c)}</option>`);
+      const tr = $(`tr[data-row="${p.id}"]`, v); showRow(tr); refresh();
+      if (focus) { tr.classList.remove('hidden'); tr.closest('[data-cat]').classList.remove('hidden'); tr.scrollIntoView({ block: 'center' }); $('input[data-f]', tr)?.focus(); }
+    };
+    if ($('#newart')) $('#newart').onclick = (e) => act(e.target, async () => {
+      const r = await productQuick(null, { name: $('#search').value.trim(), from_inventory: true });
+      if (r?.id) { placeRow(prodById(r.id), true); toast(r.existing ? 'Ya existía: te lo dejo listo para contar' : 'Artículo creado: apunta su cantidad'); }
+    });
+    v.addEventListener('click', (e) => {
+      const b2 = e.target.closest('[data-edit]'); if (!b2) return;
+      act(b2, async () => {
+        const r = await productQuick(prodById(b2.dataset.edit));
+        if (r?.deleted) { const tr = $(`tr[data-row="${b2.dataset.edit}"]`, v); const ob = tr?.closest('[data-cat]'); tr?.remove(); if (ob && !$('tr', ob)) ob.remove(); delete draft[b2.dataset.edit]; lsSetX(DKEY, JSON.stringify(draft)); refresh(); toast('Artículo dado de baja'); return; }
+        if (r?.id) { placeRow(prodById(r.id)); toast('Artículo corregido'); }
+      });
+    });
     const rowCount = (tr) => {
       const ins = $$('input[data-f]', tr).filter((i) => i.value !== '');
       if (!ins.length) return null;
@@ -1149,7 +1182,7 @@ VIEWS.stock = async (v, _id, q) => {
         const zone = $('#zone').value.trim();
         if (!zone) { $('#zone').focus(); throw new Error('Escribe arriba qué zona has contado'); }
         const r = await api('inventory/opening/part', { body: { zone, date: $('#date').value, counts } });
-        lsSetX(DKEY, '{}'); toast(`Zona "${zone}" guardada: ${r.n} artículos`); route(); return;
+        lsSetX(DKEY, '{}'); lsSetX(DKEY + ':zona', ''); toast(`Zona "${zone}" guardada: ${r.n} artículos`); route(); return;
       }
       const r = await api('inventory', { body: { date: $('#date').value, notes: $('#notes').value, counts } });
       lsSetX(DKEY, '{}');
@@ -2030,6 +2063,46 @@ VIEWS.gastos = async (v) => {
 
 // ---------- Artículos ----------
 const BASE_UNITS = [['kg', 'kg (se escandalla en g o kg)'], ['l', 'litro (se escandalla en ml, cl o l)'], ['ud', 'unidad (botellas, latas, piezas…)']];
+// ---------- crear o corregir un artículo en un momento (desde inventario u otras pantallas) ----------
+async function productQuick(p, opts = {}) {
+  const isNew = !p, showPrice = can('costes.ver');
+  const fm = isNew ? [] : fmtsOf(p).map((f) => ({ id: f.id, name: f.name, factor: f.factor, price: f.price, is_default: f.is_default }));
+  const fRow = (f) => `<div class="row fmt" style="gap:6px;flex-wrap:nowrap;margin:4px 0"><input data-fn placeholder="Caja 24, Saco 25 kg…" value="${esc(f.name || '')}" style="flex:2"><input data-ff type="number" step="any" placeholder="trae" value="${esc(f.factor ?? '')}" style="width:80px">${showPrice ? `<input data-fp type="number" step="any" placeholder="€ formato" value="${esc(f.price ?? '')}" style="width:96px">` : ''}<label class="small" title="Formato habitual de compra"><input type="radio" name="fdef" ${f.is_default ? 'checked' : ''}> habitual</label><button type="button" class="sm" data-fdel aria-label="Quitar">✕</button>${f.id ? `<input type="hidden" data-fid value="${f.id}">` : ''}</div>`;
+  const supOpts = [['', '—'], ...S.suppliers.map((x) => [String(x.id), x.name])];
+  const r = await modal(`<h2>${isNew ? 'Nuevo artículo' : 'Corregir: ' + esc(p.name)}</h2>
+    ${fieldHtml({ name: 'name', label: 'Nombre', required: true }, isNew ? opts.name || '' : p.name)}
+    <div class="row">${fieldHtml({ name: 'category', label: 'Categoría', list: 'dl-pcat' }, isNew ? opts.category || '' : p.category || '')}
+      ${fieldHtml({ name: 'unit', label: 'Se controla en', type: 'select', options: BASE_UNITS }, isNew ? 'kg' : p.unit)}</div>
+    ${!isNew && Math.abs(p.stock) > 0.0001 ? `<div class="small txt-warn hidden" id="unitwarn">Tiene ${stockText(p, p.stock)} registrados: si cambias la unidad, esas cantidades no se convierten (revisa su stock al contarlo).</div>` : ''}
+    <div class="row">${showPrice ? fieldHtml({ name: 'price', label: 'Precio sin IVA por kg / l / ud', type: 'number' }, isNew ? '' : p.price) : ''}
+      ${fieldHtml({ name: 'min_stock', label: 'Stock mínimo', type: 'number' }, isNew ? '' : p.min_stock)}
+      ${fieldHtml({ name: 'supplier_id', label: 'Proveedor', type: 'select', options: supOpts }, isNew ? '' : String(p.supplier_id || ''))}</div>
+    <div class="field"><label>Formatos en que llega o se guarda (caja, saco, botella…)</label><div id="fmts">${fm.map(fRow).join('')}</div>
+      <button type="button" class="sm" id="fadd">+ Formato</button><div class="small muted">"Trae" = cuántos kg, l o ud lleva. Ej.: Caja 24 → 24 (ud); Saco → 25 (kg).</div></div>
+    <div class="actions">${!isNew && can('productos.editar') ? '<button class="danger" value="del" formnovalidate>Dar de baja</button>' : ''}<button data-close>Cancelar</button><button class="primary" value="ok">${isNew ? 'Crear' : 'Guardar'}</button></div>`, {
+    onOpen: (f) => {
+      $('#fadd', f).onclick = () => $('#fmts', f).insertAdjacentHTML('beforeend', fRow({}));
+      $('#fmts', f).onclick = (e) => { if (e.target.matches('[data-fdel]')) e.target.closest('.fmt').remove(); };
+      if ($('#unitwarn', f)) $('[name=unit]', f).onchange = () => $('#unitwarn', f).classList.toggle('hidden', $('[name=unit]', f).value === p.unit);
+      $('[name=name]', f).focus();
+    },
+  });
+  if (!r) return null;
+  if (r === 'del') { if (!(await bajaProducts([p]))) return null; return { deleted: true }; }
+  const f = $('#modal-form'), val = (n) => $(`[name=${n}]`, f)?.value.trim();
+  const formats = $$('.fmt', f).map((row) => ({ id: Number($('[data-fid]', row)?.value) || undefined, name: $('[data-fn]', row).value.trim(), factor: Number($('[data-ff]', row).value),
+    price: showPrice ? (Number($('[data-fp]', row).value) || null) : undefined, is_default: $('input[type=radio]', row).checked ? 1 : 0 })).filter((x) => x.name || x.factor);
+  if (formats.some((x) => !x.name || !(x.factor > 0))) throw new Error('Cada formato necesita nombre y cuántas unidades trae');
+  const body = { name: val('name'), category: val('category') || null, unit: val('unit'), min_stock: Number(val('min_stock')) || 0, supplier_id: Number(val('supplier_id')) || null, formats };
+  if (showPrice) body.price = Number(val('price')) || 0;
+  if (!body.name) throw new Error('Pon un nombre');
+  let res;
+  if (isNew) res = await api('products', { body: { ...body, from_inventory: !!opts.from_inventory } });
+  else { await api('products/' + p.id, { method: 'PUT', body }); res = { id: p.id }; }
+  await reload();
+  return res;
+}
+
 // ---------- repetidos: fusionar y dar de baja ----------
 const DUP_STOP = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'en', 'con', 'y', 'a', 'al', 'x', 'ud', 'uds', 'u', 'un', 'kg', 'kgs', 'gr', 'grs', 'g', 'l', 'lt', 'lts', 'cl', 'ml', 'caja', 'cj', 'cja', 'pack', 'bot', 'botella', 'saco', 'bandeja', 'bdj', 'unidad', 'unidades', 'paquete', 'paq']);
 // "Tomate pera L:2304 5kg" y "TOMATE PERA" dan la misma clave
@@ -2108,9 +2181,10 @@ async function repetidos(v, kind) {
     ${groups.length ? `<div class="card row between" style="border-color:var(--accent)"><div><b>${groups.length} grupos de repetidos (${groups.reduce((n, g) => n + g.length, 0)} ${isP ? 'artículos' : 'proveedores'})</b>
       <div class="small muted">En cada grupo se queda el marcado con ★ ${isP ? 'y con el nombre sin lote' : ''}. Desmarca lo que no sea lo mismo y fusiona todo de una vez.${S.user.is_super ? ' Antes se descarga una copia de seguridad.' : ''}</div></div>
       <button type="button" class="primary" id="mergeall">⚡ Fusionar todo</button> <span id="mprog" class="small muted"></span></div>` : ''}
-    ${groups.length ? groups.map((g, gi) => `<div class="card mergegrp" data-g="${gi}">${g.map((x) => `<label><input type="checkbox" data-id="${x.id}" checked> <span>${x === pickBest(kind, g) ? '★ ' : ''}<b>${esc(x.name)}</b>${x === pickBest(kind, g) && finalName(kind, x) !== x.name ? ` <span class="small">→ se quedará como <b>${esc(finalName(kind, x))}</b></span>` : ''} <span class="small muted">${isP ? `${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}` : `${x.cif ? 'CIF ' + esc(x.cif) : 'sin CIF'} · ${S.products.filter((p) => p.supplier_id === x.id).length} artículos`}</span></span></label>`).join('')}
+    ${groups.length ? groups.map((g, gi) => `<div class="card mergegrp" data-g="${gi}">${g.map((x) => `<div class="row between" style="flex-wrap:nowrap"><label><input type="checkbox" data-id="${x.id}" checked> <span>${x === pickBest(kind, g) ? '★ ' : ''}<b>${esc(x.name)}</b>${x === pickBest(kind, g) && finalName(kind, x) !== x.name ? ` <span class="small">→ se quedará como <b>${esc(finalName(kind, x))}</b></span>` : ''} <span class="small muted">${isP ? `${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}` : `${x.cif ? 'CIF ' + esc(x.cif) : 'sin CIF'} · ${S.products.filter((p) => p.supplier_id === x.id).length} artículos`}</span></span></label>
+      <span class="row" style="gap:4px;flex-wrap:nowrap">${isP ? `<button type="button" class="sm ghost" data-edit="${x.id}" aria-label="Corregir">✏️</button>` : ''}<button type="button" class="sm" data-del1="${x.id}" title="Dar de baja este (no se fusiona)">🗑</button></span></div>`).join('')}
       ${isP && new Set(g.map((p) => p.unit)).size > 1 ? '<div class="small txt-warn">Se controlan en unidades distintas: solo se juntan los que van igual (kg, l o ud).</div>' : ''}
-      <button type="button" class="primary sm" data-merge="${gi}" style="margin-top:6px">🔁 Fusionar marcados</button></div>`).join('')
+      <div class="row" style="margin-top:6px"><button type="button" class="primary sm" data-merge="${gi}">🔁 Fusionar marcados</button><button type="button" class="sm" data-delg="${gi}">🗑 Dar de baja marcados</button></div></div>`).join('')
       : `<div class="card empty">No se han encontrado ${isP ? 'artículos' : 'proveedores'} repetidos. 👍</div>`}`;
   if ($('#mergeall')) $('#mergeall').onclick = (e) => act(e.target, async () => {
     // lo marcado de cada grupo; los artículos solo se juntan con los que se controlan igual (kg, l, ud)
@@ -2135,6 +2209,25 @@ async function repetidos(v, kind) {
     else toast(`Listo: ${n} ${isP ? 'artículos' : 'proveedores'} fusionados en ${sets.length}`);
     repetidos(v, kind);
   });
+  const bajaSup = async (items) => {
+    const nArt = items.reduce((t, x) => t + S.products.filter((p) => p.supplier_id === x.id).length, 0);
+    if (!(await confirmModal(`¿Dar de baja ${items.length === 1 ? `"${items[0].name}"` : items.length + ' proveedores'}?${nArt ? ` Sus ${nArt} artículos se quedan sin proveedor (si es el mismo que otro, mejor Fusionar: pasan al otro).` : ''} Sus albaranes pasados se conservan.`, 'Dar de baja'))) return false;
+    for (const x of items) await api('suppliers/' + x.id, { method: 'DELETE' });
+    await reload(); toast('Dado de baja'); return true;
+  };
+  const baja = (items) => (isP ? bajaProducts(items) : bajaSup(items));
+  $$('[data-del1]', v).forEach((b) => (b.onclick = () => act(b, async () => {
+    const x = list.find((y) => y.id === Number(b.dataset.del1));
+    if (await baja([x])) repetidos(v, kind);
+  })));
+  $$('[data-delg]', v).forEach((b) => (b.onclick = () => act(b, async () => {
+    const g = groups[b.dataset.delg], box = b.closest('.mergegrp');
+    const sel = g.filter((x) => $(`[data-id="${x.id}"]`, box).checked);
+    if (!sel.length) throw new Error('Marca los que quieres dar de baja');
+    if (sel.length === g.length && !(await confirmModal('Has marcado todos los del grupo: no quedará ninguno. ¿Seguro?', 'Sí, todos'))) return;
+    if (await baja(sel)) repetidos(v, kind);
+  })));
+  $$('[data-edit]', v).forEach((b) => (b.onclick = () => act(b, async () => { const r = await productQuick(prodById(b.dataset.edit)); if (r) repetidos(v, kind); })));
   $$('[data-merge]', v).forEach((b) => (b.onclick = () => act(b, async () => {
     const g = groups[b.dataset.merge], box = b.closest('.mergegrp');
     const sel = g.filter((x) => $(`[data-id="${x.id}"]`, box).checked);

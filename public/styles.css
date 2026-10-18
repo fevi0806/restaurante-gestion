@@ -305,3 +305,4 @@ input.tfilter { margin: 0 0 10px; max-width: 360px; }
 .danger-zone { border-color: var(--bad, #c0392b); }
 tr.done td:first-child { color: var(--ok, #2e7d4f); }
 .card.flagcard { border-color: var(--warn, #c98a1a); }
+button.ghost { background: none; border: none; box-shadow: none; padding: 2px 4px; min-height: 0; }
