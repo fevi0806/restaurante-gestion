@@ -2079,7 +2079,7 @@ async function productQuick(p, opts = {}) {
   const r = await modal(`<h2>${isNew ? 'Nuevo artículo' : 'Corregir: ' + esc(p.name)}</h2>
     ${fieldHtml({ name: 'name', label: 'Nombre', required: true }, isNew ? opts.name || '' : p.name)}
     <div class="row">${fieldHtml({ name: 'category', label: 'Categoría', list: 'dl-pcat' }, isNew ? opts.category || '' : p.category || '')}
-      ${fieldHtml({ name: 'unit', label: 'Se controla en', type: 'select', options: BASE_UNITS }, isNew ? 'kg' : p.unit)}</div>
+      ${fieldHtml({ name: 'unit', label: 'Se controla en', type: 'select', options: BASE_UNITS }, isNew ? (/\b(kg|kilo|granel)\b/i.test(opts.name || '') ? 'kg' : 'ud') : p.unit)}</div>
     ${!isNew && Math.abs(p.stock) > 0.0001 ? `<div class="small txt-warn hidden" id="unitwarn">Tiene ${stockText(p, p.stock)} registrados: si cambias la unidad, esas cantidades no se convierten (revisa su stock al contarlo).</div>` : ''}
     <div class="row">${showPrice ? fieldHtml({ name: 'price', label: 'Precio sin IVA por kg / l / ud', type: 'number' }, isNew ? '' : p.price) : ''}
       ${fieldHtml({ name: 'min_stock', label: 'Stock mínimo', type: 'number' }, isNew ? '' : p.min_stock)}
