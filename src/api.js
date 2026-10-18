@@ -1,5 +1,5 @@
 // API de la aplicación de gestión del restaurante (Cloudflare Workers + D1)
-import { ensureSchema, SCHEMA_VERSION } from './migrate.js';
+import { ensureSchema, SCHEMA_VERSION, recomputeStock } from './migrate.js';
 import { turnos, publicSchedule } from './turnos.js';
 import { push, enqueuePush, pushUsersWith } from './push.js';
 
@@ -152,7 +152,7 @@ async function settings(env) {
 // ---------- consultas reutilizables ----------
 const PRODUCTS_SQL = `
   SELECT p.id, p.name, p.category, p.unit, p.price, p.supplier_id, p.min_stock, p.allergens, p.allergens_checked, p.prep_recipe_id, s.name AS supplier_name,
-         COALESCE((SELECT SUM(m.qty) FROM movements m WHERE m.product_id = p.id), 0) AS stock
+         p.stock_cache AS stock
   FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id
   WHERE p.active = 1 ORDER BY p.category, p.name`;
 
@@ -392,6 +392,7 @@ async function factoryReset(request, env, user, ctx) {
     for (const t of existing) if (!RESET_KEEP.includes(t) && !t.startsWith('sqlite_')) stmts.push(env.DB.prepare(`DELETE FROM ${t}`));
   }
   await runBatch(env, stmts);
+  await recomputeStock(env);
   ctx.audit = { action: 'reset', entity: 'datos', summary: d.scope === 'compras' ? 'Reset de compras y existencias (artículos, proveedores, pedidos, albaranes, stock, inventarios e ingredientes de escandallos)' : 'Reset de fábrica: borrados todos los datos menos usuarios y ajustes' };
   return json({ ok: true });
 }
@@ -499,6 +500,7 @@ export async function onRequest({ request, env, params, ctx: wctx }) {
   try {
     const res = await route(parts, request.method, request, env, url, ctx);
     if (res.ok && (ctx.afterPrices || (mutating && ['products', 'receipts'].includes(parts[0])))) await refreshPrepCosts(env);
+    if (res.ok && mutating && ['orders', 'receipts', 'suppliers'].includes(parts[0])) await env.DB.prepare(`DELETE FROM settings WHERE key = 'sug_alert'`).run().catch(() => null);
     // las ventas ya volcadas se calcularon con los escandallos de entonces: se apunta que han cambiado
     if (res.ok && mutating && parts[0] === 'recipes' && !(parts[1] === 'bulk-edit'))
       await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('recipes_changed_at', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run();
@@ -684,6 +686,7 @@ async function route(parts, method, request, env, url, ctx = {}) {
         const ids = (d.user_ids || []).map(Number).filter(Boolean);
         if (ids.length) await env.DB.prepare(`DELETE FROM users WHERE id NOT IN (${ids.map(() => '?').join(',')}) AND id <> ?`).bind(...ids, user.id).run();
         await env.DB.prepare(`UPDATE users SET is_super = 1, active = 1 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM users WHERE is_super = 1 AND active = 1)`).bind(user.id).run();
+        await recomputeStock(env);
         ctx.audit = false;
         return json({ ok: true });
       }
@@ -2018,14 +2021,20 @@ async function alerts(env, user) {
     if (inv && inv.total_diff_value < -50) add('warn', '📋', `El último inventario (${inv.inv_date}) descuadró ${Math.round(inv.total_diff_value)} €`, '#/panel?tab=descuadres');
   }
   if (can(user, 'stock.ver') || can(user, 'pedidos.crear')) {
-    const r = await q1(`SELECT COUNT(*) AS n FROM (SELECT p.id, p.min_stock, COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id), 0) AS s FROM products p WHERE p.active = 1 AND p.min_stock > 0) WHERE s < min_stock`);
+    const r = await q1(`SELECT COUNT(*) AS n FROM products WHERE active = 1 AND min_stock > 0 AND stock_cache < min_stock`);
     if (r.n) add('warn', '📦', `${r.n} artículo(s) por debajo del stock mínimo`, can(user, 'pedidos.crear') ? '#/pedidos/nuevo' : '#/stock');
   }
   if (can(user, 'pedidos.crear')) {
     // los proveedores a los que toca pedir hoy, con su pedido sugerido
     try {
-      const sug = (await suggestAll(env)).filter((x) => x.plan.today && x.lines.some((l) => l.qty > 0) && !x.open_orders.some((o) => o.order_date === localDay() || o.status !== 'enviado'));
-      if (sug.length) add('warn', '✨', `Hoy toca pedir a ${sug.map((x) => x.name).join(', ')}: tienes el pedido sugerido listo para revisar`, '#/pedidos/sugeridos');
+      const c = await q1(`SELECT value FROM settings WHERE key = 'sug_alert'`);
+      let cached = null; try { cached = JSON.parse(c?.value || 'null'); } catch { cached = null; }
+      if (!cached || cached.day !== localDay() || Date.now() - cached.at > 3600000) {
+        const sug = (await suggestAll(env)).filter((x) => x.plan.today && x.lines.some((l) => l.qty > 0) && !x.open_orders.some((o) => o.order_date === localDay() || o.status !== 'enviado'));
+        cached = { day: localDay(), at: Date.now(), names: sug.map((x) => x.name) };
+        await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('sug_alert', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(JSON.stringify(cached)).run();
+      }
+      if (cached.names.length) add('warn', '✨', `Hoy toca pedir a ${cached.names.join(', ')}: tienes el pedido sugerido listo para revisar`, '#/pedidos/sugeridos');
     } catch (e) { console.error('sugeridos', e); }
   }
   if (can(user, 'pedidos.aprobar')) {
@@ -2132,14 +2141,18 @@ function coverPlan(orderDaysText, defDays) {
 }
 async function suggestAll(env, { supplierId = null, days = null, defDays = 3 } = {}) {
   const since = new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10);
-  const { results: prods } = await env.DB.prepare(`
-    SELECT p.id, p.name, p.unit, p.min_stock, p.price, p.supplier_id, p.category,
-      COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id), 0) AS stock,
-      COALESCE((SELECT -SUM(qty) FROM movements WHERE product_id = p.id AND mov_date >= ?1 AND (type IN ('venta', 'merma', 'consumo_personal') OR (type = 'produccion' AND qty < 0))), 0) AS used,
-      COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id AND mov_date >= ?1 AND type = 'entrada' AND ref_type = 'albaran'), 0) AS bought,
-      (SELECT MIN(mov_date) FROM movements WHERE product_id = p.id AND COALESCE(ref_type, '') <> 'stock_inicial') AS first_mov
-    FROM products p WHERE p.active = 1 AND p.supplier_id IS NOT NULL AND p.prep_recipe_id IS NULL ${supplierId ? 'AND p.supplier_id = ?2' : ''}
-    ORDER BY p.category, p.name`).bind(...(supplierId ? [since, supplierId] : [since])).all();
+  const { results: prods0 } = await env.DB.prepare(`
+    SELECT p.id, p.name, p.unit, p.min_stock, p.price, p.supplier_id, p.category, p.stock_cache AS stock
+    FROM products p WHERE p.active = 1 AND p.supplier_id IS NOT NULL AND p.prep_recipe_id IS NULL ${supplierId ? 'AND p.supplier_id = ?' : ''}
+    ORDER BY p.category, p.name`).bind(...(supplierId ? [supplierId] : [])).all();
+  // solo se leen los movimientos de las últimas 4 semanas (índice por fecha)
+  const { results: use } = await env.DB.prepare(`SELECT product_id,
+      -SUM(CASE WHEN type IN ('venta', 'merma', 'consumo_personal') OR (type = 'produccion' AND qty < 0) THEN qty ELSE 0 END) AS used,
+      SUM(CASE WHEN type = 'entrada' AND ref_type = 'albaran' THEN qty ELSE 0 END) AS bought,
+      MIN(CASE WHEN COALESCE(ref_type, '') <> 'stock_inicial' THEN mov_date END) AS first_mov
+    FROM movements WHERE mov_date >= ? GROUP BY product_id`).bind(since).all();
+  const umap = Object.fromEntries(use.map((u) => [u.product_id, u]));
+  const prods = prods0.map((p) => ({ ...p, used: umap[p.id]?.used || 0, bought: umap[p.id]?.bought || 0, first_mov: umap[p.id]?.first_mov || null }));
   const { results: inc } = await env.DB.prepare(`SELECT ol.product_id, SUM(ol.qty) AS q FROM order_lines ol JOIN orders o ON o.id = ol.order_id WHERE o.status IN ('pendiente', 'enviado') GROUP BY ol.product_id`).all();
   const incoming = Object.fromEntries(inc.map((x) => [x.product_id, x.q]));
   const { results: openOrders } = await env.DB.prepare(`SELECT id, supplier_id, status, order_date FROM orders WHERE status IN ('borrador', 'pendiente', 'enviado') ORDER BY id DESC`).all();
@@ -2549,7 +2562,7 @@ async function dashboard(env, url) {
     q(`SELECT COALESCE(SUM(total), 0) AS v, COUNT(*) AS n FROM receipts WHERE receipt_date BETWEEN ? AND ?`, from, to).first(),
     q(`SELECT COALESCE(SUM(revenue), 0) AS v, COALESCE(SUM(units), 0) AS units FROM sales WHERE sale_date BETWEEN ? AND ?`, from, to).first(),
     env.DB.prepare(`SELECT concept, category, amount, frequency FROM fixed_costs WHERE active = 1`).all(),
-    env.DB.prepare(`SELECT COALESCE(SUM(s.stock * p.price), 0) AS v FROM (SELECT product_id, SUM(qty) AS stock FROM movements GROUP BY product_id) s JOIN products p ON p.id = s.product_id WHERE p.active = 1 AND s.stock > 0`).first(),
+    env.DB.prepare(`SELECT COALESCE(SUM(stock_cache * price), 0) AS v FROM products WHERE active = 1 AND stock_cache > 0`).first(),
     q(`SELECT p.name, p.unit, -SUM(m.qty) AS qty, -SUM(m.qty * m.unit_cost) AS value FROM movements m JOIN products p ON p.id = m.product_id
        WHERE m.type IN ('merma') AND m.mov_date BETWEEN ? AND ? GROUP BY p.id ORDER BY value DESC LIMIT 8`, from, to).all(),
     q(`SELECT r.name, SUM(s.units) AS units, SUM(s.revenue) AS revenue FROM sales s JOIN recipes r ON r.id = s.recipe_id

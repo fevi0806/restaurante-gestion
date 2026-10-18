@@ -3,7 +3,7 @@
 // Todo es repetible: si algo ya existe, se ignora. Así nunca hay que pegar SQL en la consola.
 import { SCHEMA } from './schema.js';
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 // Columnas añadidas después de la primera versión (para bases de datos ya creadas)
 const COLUMNS = [
@@ -23,7 +23,19 @@ const COLUMNS = [
   ['orders', 'approved_by INTEGER'], ['orders', 'approved_at TEXT'], ['users', 'phone TEXT'], ['users', 'email TEXT'],
   ['receipts', 'rec_temp REAL'], ['receipts', 'rec_check INTEGER'],
   ['receipt_lines', 'lot TEXT'], ['receipt_lines', 'expiry TEXT'], ['receipt_lines', 'expiry_done INTEGER NOT NULL DEFAULT 0'],
+  ['products', 'stock_cache REAL NOT NULL DEFAULT 0'],
 ];
+
+// Stock guardado en el propio artículo y actualizado al momento con cada movimiento (antes se sumaban todos
+// los movimientos en cada consulta y se agotaba el cupo diario de lecturas de la base de datos).
+export const STOCK_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS mov_stock_ins AFTER INSERT ON movements BEGIN UPDATE products SET stock_cache = stock_cache + NEW.qty WHERE id = NEW.product_id; END`,
+  `CREATE TRIGGER IF NOT EXISTS mov_stock_del AFTER DELETE ON movements BEGIN UPDATE products SET stock_cache = stock_cache - OLD.qty WHERE id = OLD.product_id; END`,
+  `CREATE TRIGGER IF NOT EXISTS mov_stock_upd AFTER UPDATE OF qty, product_id ON movements BEGIN UPDATE products SET stock_cache = stock_cache - OLD.qty WHERE id = OLD.product_id; UPDATE products SET stock_cache = stock_cache + NEW.qty WHERE id = NEW.product_id; END`,
+];
+export async function recomputeStock(env) {
+  await env.DB.prepare(`UPDATE products SET stock_cache = COALESCE((SELECT SUM(m.qty) FROM movements m WHERE m.product_id = products.id), 0)`).run();
+}
 
 const benign = (e) => /duplicate column|already exists/i.test(String(e?.message || e));
 
@@ -81,6 +93,9 @@ async function migrate(env) {
   await ensureCheck(env, 'movements', 'ajuste', 'produccion');
   await ensureCheck(env, 'orders', 'borrador', 'pendiente');
   for (const fn of EXTRA) await fn(env, run);
+  // disparadores del stock (después de rehacer tablas, que los borraría) y cálculo inicial
+  for (const sql of STOCK_TRIGGERS) await run(env, sql);
+  if (v < 11) await recomputeStock(env);
   // 4) índices (ya con todas las columnas)
   for (const sql of SCHEMA.filter((s) => /^CREATE INDEX/i.test(s))) await run(env, sql);
   // datos

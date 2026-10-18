@@ -31,6 +31,8 @@ function toast(msg, err = false) {
 }
 
 async function api(path, opts = {}) {
+  // cualquier cambio (no lectura) obliga a refrescar los datos generales la próxima vez
+  if ((opts.method && opts.method !== 'GET') || opts.body) bootDirty = true;
   let res;
   try {
     res = await fetch('/api/' + path, {
@@ -96,8 +98,13 @@ function stockText(p, q) {
   return t;
 }
 
-async function reload() {
+// Los datos generales (artículos, stock, carta…) se reutilizan unos segundos al cambiar de pantalla;
+// después de guardar cualquier cosa se vuelven a pedir siempre. Así se lee mucho menos la base de datos.
+let bootAt = 0, bootDirty = true;
+async function reload(force = false) {
+  if (!force && !bootDirty && Date.now() - bootAt < 45000) return;
   const d = await api('bootstrap');
+  bootAt = Date.now(); bootDirty = false;
   Object.assign(S, d);
   S.formats = d.formats || [];
   // listas siempre en orden alfabético (con acentos y números bien colocados)

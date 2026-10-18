@@ -3,6 +3,8 @@ import { onRequest } from './api.js';
 import { ensureSchema } from './migrate.js';
 import { deliver } from './push.js';
 import { eveningReminders } from './turnos.js';
+import { recomputeStock } from './migrate.js';
+import { localDay } from './api.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -25,6 +27,15 @@ export default {
     }
     ctx.waitUntil((async () => {
       await ensureSchema(env);
+      // una vez al día, de madrugada, se recalcula el stock guardado desde los movimientos (autocorrección)
+      const hour = Number(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid', hour: '2-digit', hour12: false }));
+      if (hour >= 4 && hour < 6) {
+        const last = (await env.DB.prepare(`SELECT value FROM settings WHERE key = 'stock_heal'`).first())?.value;
+        if (last !== localDay()) {
+          await recomputeStock(env);
+          await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('stock_heal', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(localDay()).run();
+        }
+      }
       await eveningReminders(env);
       await deliver(env);
     })().catch((e) => console.error('tarea programada', e)));
