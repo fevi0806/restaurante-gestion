@@ -418,6 +418,7 @@ VIEWS.inicio = async (v) => {
   const acts = [
     ['recepcion.crear', '#/recepcion/nueva?scan=1', '📷', 'Escanear albarán'],
     ['recepcion.crear', '#/recepcion/nueva', '📦', 'Recibir mercancía'],
+    ['pedidos.crear', '#/pedidos/sugeridos', '✨', 'Pedidos sugeridos'],
     ['pedidos.crear', '#/pedidos/nuevo', '📝', 'Hacer pedido'],
     ['mermas.registrar', '#/mermas', '🗑️', 'Registrar merma'],
     ['mermas.registrar', '#/mermas?tipo=consumo_personal', '🍴', 'Comida de personal'],
@@ -463,12 +464,96 @@ async function notifyApprovers(o, approvers) {
       : '<p class="small muted">No hay nadie más con permiso para aprobar pedidos. El superusuario puede darlo en Usuarios y permisos.</p>'}
     <p class="small muted">También le aparecerá en sus avisos al entrar en la app.</p><div class="actions"><button class="primary" value="ok">Hecho</button></div>`);
 }
+// ---------- Pedidos sugeridos ----------
+// La app propone el pedido de cada proveedor; tú lo revisas, cambias lo que quieras y lo aceptas.
+async function pedidosSugeridos(v) {
+  if (!can('pedidos.crear')) throw new Error('No tienes permiso para hacer pedidos');
+  await reload();
+  const approver = can('pedidos.aprobar');
+  const IGN = 'ped-ign:' + today();
+  let ignored = []; try { ignored = JSON.parse(lsGetX(IGN) || '[]'); } catch { ignored = []; }
+  v.innerHTML = '<div class="card">Calculando los pedidos…</div>';
+  let list = await api('orders/suggestions');
+  const done = {};
+  // las de hoy primero, luego las que tienen más que pedir
+  list.sort((a, b) => (b.plan.today ? 1 : 0) - (a.plan.today ? 1 : 0) || b.lines.length - a.lines.length);
+  const lineTotal = (l) => { const p = prodById(l.product_id); return p ? (Number(l.qty) || 0) * unitPrice(p, l.unit) : 0; };
+  const basisTxt = (l, p) => (l.basis === 'consumo' ? `gasta ${num(l.per_day, 2)} ${esc(p.unit)}/día` : l.basis === 'compras' ? `compra ~${num(l.per_day, 2)} ${esc(p.unit)}/día` : 'sin consumo registrado');
+  const card = (s) => {
+    const why = s.plan.known ? `${s.plan.today ? '<span class="pill warn">📅 Toca pedir hoy</span> ' : ''}<span class="small muted">Pedidos: ${esc(s.order_days)} · cubre ${s.days} días (hasta el próximo pedido del ${esc(s.plan.next)})</span>`
+      : `<span class="small muted">${s.order_days ? 'Días de pedido: ' + esc(s.order_days) + ' · ' : ''}Sin días de pedido reconocibles: cubre ${s.days} días</span>`;
+    const head = `<div class="row between"><div><h3 style="margin:0">${esc(s.name)}</h3>${why}</div>
+      <span class="row small">Cubrir <input type="number" min="1" max="30" value="${s.days}" data-days style="width:64px"> días</span></div>
+      ${s.open_orders.length ? `<div class="small txt-warn" style="margin-top:4px">Ya hay ${s.open_orders.map((o) => `<a href="#/pedidos/${o.id}">#${o.id} (${ST_NAME[o.status]})</a>`).join(', ')}. Lo que está enviado ya se descuenta de la sugerencia.</div>` : ''}`;
+    if (done[s.supplier_id]) return `${head}<div class="txt-ok" style="margin-top:8px">✓ ${done[s.supplier_id].text} <a class="btn sm" href="#/pedidos/${done[s.supplier_id].id}${done[s.supplier_id].status === 'enviado' ? '?enviar=1' : ''}">Ver pedido →</a></div>`;
+    if (!s.lines.length) return `${head}<div class="small muted" style="margin-top:8px">Con el stock actual no hace falta pedir nada. <a href="#/pedidos/nuevo">Hacer un pedido a mano</a></div>`;
+    const tot = s.lines.filter((l) => l.on !== false).reduce((t, l) => t + lineTotal(l), 0);
+    return `${head}<div class="table-wrap"><table class="nosort"><thead><tr><th></th><th>Artículo</th><th class="num">Stock</th><th>Por qué</th><th class="num">Pedir</th><th>Formato</th>${can('costes.ver') ? '<th class="num">Importe</th>' : ''}</tr></thead><tbody>
+      ${s.lines.map((l, i) => { const p = prodById(l.product_id); if (!p) return ''; return `<tr data-i="${i}" class="${l.on === false ? 'muted' : ''}"><td><input type="checkbox" data-on ${l.on === false ? '' : 'checked'}></td>
+        <td>${esc(p.name)}</td><td class="num">${stockText(p, l.stock)}${l.incoming ? `<div class="small muted">+${num(l.incoming, 2)} en camino</div>` : ''}</td>
+        <td class="small muted">${basisTxt(l, p)}${l.min_stock ? ` · mínimo ${num(l.min_stock)}` : ''}</td>
+        <td class="num"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-q value="${esc(l.qty)}"></td><td>${unitSelect(p, l.unit, 'data-u')}</td>
+        ${can('costes.ver') ? `<td class="num" data-amt>${eur(lineTotal(l))}</td>` : ''}</tr>`; }).join('')}</tbody></table></div>
+      <div class="row between" style="margin-top:8px"><span>${can('costes.ver') ? `Total estimado <b data-tot>${eur(tot)}</b>` : ''}</span>
+        <span class="row"><button type="button" class="sm" data-act="ign">Hoy no</button><button type="button" data-act="draft">Guardar borrador</button>
+        <button type="button" class="primary" data-act="send">${approver ? '✓ Aceptar y enviar' : 'Enviar a aprobación'}</button></span></div>`;
+  };
+  const shown = () => list.filter((s) => !ignored.includes(s.supplier_id));
+  const render = () => {
+    const sh = shown();
+    v.innerHTML = `<div class="row between"><h1>✨ Pedidos sugeridos</h1><div class="row"><a class="btn" href="#/pedidos">Volver a pedidos</a></div></div>
+      <div class="card small">Calculado con el consumo de las últimas 4 semanas (ventas según escandallo, mermas y comida de personal; si un artículo aún no tiene consumo, con lo que se ha comprado), el stock actual, el mínimo y lo que ya viene en pedidos enviados. Los días a cubrir salen de los <b>días de pedido</b> de cada proveedor (pon, por ejemplo, "lunes y jueves" en su ficha). Cambia lo que quieras antes de aceptar.</div>
+      ${sh.length ? sh.map((s) => `<div class="card" data-s="${s.supplier_id}" ${s.plan.today ? 'style="border-color:var(--accent)"' : ''}>${card(s)}</div>`).join('') : '<div class="card empty">No hay nada que pedir ahora mismo. 👍</div>'}
+      ${ignored.length ? `<p class="small muted">${ignored.length} proveedor(es) ocultos hoy. <a href="#" id="unign">Mostrar</a></p>` : ''}`;
+    if ($('#unign')) $('#unign').onclick = (e) => { e.preventDefault(); ignored = []; lsSetX(IGN, '[]'); render(); };
+  };
+  const sOf = (el) => list.find((x) => x.supplier_id === Number(el.closest('[data-s]').dataset.s));
+  const repaint = (s) => { const el = $(`[data-s="${s.supplier_id}"]`, v); if (el) el.innerHTML = card(s); };
+  const refreshTot = (s, el) => { const t = s.lines.filter((l) => l.on !== false).reduce((a2, l) => a2 + lineTotal(l), 0); if ($('[data-tot]', el)) $('[data-tot]', el).textContent = eur(t); };
+  v.addEventListener('input', (e) => {
+    if (!e.target.closest('[data-s]')) return;
+    const s = sOf(e.target), tr = e.target.closest('tr[data-i]'), el = e.target.closest('[data-s]');
+    if (tr && e.target.matches('[data-q]')) { const l = s.lines[tr.dataset.i]; l.qty = e.target.value; if ($('[data-amt]', tr)) $('[data-amt]', tr).textContent = eur(lineTotal(l)); refreshTot(s, el); }
+  });
+  v.addEventListener('change', (e) => {
+    if (!e.target.closest('[data-s]')) return;
+    const s = sOf(e.target), tr = e.target.closest('tr[data-i]'), el = e.target.closest('[data-s]');
+    if (tr && e.target.matches('[data-on]')) { s.lines[tr.dataset.i].on = e.target.checked; tr.classList.toggle('muted', !e.target.checked); refreshTot(s, el); }
+    if (tr && e.target.matches('[data-u]')) {
+      // al cambiar de formato se convierte la cantidad
+      const l = s.lines[tr.dataset.i], p = prodById(l.product_id), base = (Number(l.qty) || 0) * unitFactor(p, l.unit);
+      l.unit = e.target.value; const f = unitFactor(p, l.unit); l.qty = f >= 1 && l.unit !== p.unit ? Math.ceil(base / f - 0.05) : Math.round((base / f) * 100) / 100; repaint(s);
+    }
+    if (e.target.matches('[data-days]')) act(null, async () => {
+      const d = Number(e.target.value); if (!(d > 0)) return;
+      const [ns] = await api(`orders/suggestions?supplier_id=${s.supplier_id}&days=${d}`);
+      Object.assign(s, ns); repaint(s);
+    });
+  });
+  v.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-act]'); if (!b) return;
+    const s = sOf(b);
+    if (b.dataset.act === 'ign') { ignored.push(s.supplier_id); lsSetX(IGN, JSON.stringify(ignored)); return render(); }
+    act(b, async () => {
+      const lines = s.lines.filter((l) => l.on !== false && Number(l.qty) > 0).map((l) => ({ product_id: l.product_id, qty: Number(l.qty), unit: l.unit }));
+      if (!lines.length) throw new Error('No hay ninguna cantidad marcada para pedir');
+      const status = b.dataset.act === 'draft' ? 'borrador' : approver ? 'enviado' : 'pendiente';
+      const r = await api('orders', { body: { supplier_id: s.supplier_id, status, lines, notes: '' } });
+      if (r.status === 'pendiente') await notifyApprovers({ id: r.id, supplier_name: s.name, n: lines.length, total: lines.reduce((t, l) => t + l.qty * unitPrice(prodById(l.product_id), l.unit), 0) }, r.approvers);
+      done[s.supplier_id] = { id: r.id, status: r.status, text: r.status === 'enviado' ? `Pedido #${r.id} aprobado: envíaselo al proveedor.` : r.status === 'pendiente' ? `Pedido #${r.id} enviado a aprobación.` : `Borrador #${r.id} guardado.` };
+      repaint(s); toast(done[s.supplier_id].text);
+    });
+  });
+  render();
+}
+
 VIEWS.pedidos = async (v, id, q) => {
+  if (id === 'sugeridos') return pedidosSugeridos(v);
   if (id === 'nuevo') return pedidoNuevo(v);
   if (id && q?.get('editar')) { await reload(); const o = await api('orders/' + id); if (!o.can_edit) throw new Error('Este pedido ya no se puede cambiar'); return pedidoNuevo(v, o); }
   if (id) return pedidoDetalle(v, id, q);
   const list = await api('orders');
-  v.innerHTML = `<div class="row between"><h1>Pedidos a proveedores</h1><a class="btn primary" href="#/pedidos/nuevo">+ Nuevo pedido</a></div>
+  v.innerHTML = `<div class="row between"><h1>Pedidos a proveedores</h1><div class="row">${can('pedidos.crear') ? '<a class="btn primary" href="#/pedidos/sugeridos">✨ Pedidos sugeridos</a>' : ''}<a class="btn" href="#/pedidos/nuevo">+ Nuevo pedido</a></div></div>
     <div class="card">${list.length ? `<div class="table-wrap"><table><thead><tr><th>Nº</th><th>Fecha</th><th>Proveedor</th><th>Estado</th><th class="num">Líneas</th><th class="num">Importe est.</th></tr></thead><tbody>
     ${list.map((o) => `<tr class="click" data-h="#/pedidos/${o.id}"><td>#${o.id}</td><td>${fdate(o.order_date)}</td><td>${esc(o.supplier_name)}</td><td><span class="${ST_PILL[o.status]}">${ST_NAME[o.status] || o.status}</span></td><td class="num">${o.n_lines}</td><td class="num">${eur(o.total)}</td></tr>`).join('')}
     </tbody></table></div>` : '<div class="empty">Todavía no hay pedidos.</div>'}</div>`;

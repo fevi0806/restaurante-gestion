@@ -894,6 +894,13 @@ async function route(parts, method, request, env, url, ctx = {}) {
   }
 
   // --- pedidos ---
+  if (a === 'orders' && b === 'suggestions' && method === 'GET') {
+    need(user, 'pedidos.crear');
+    ctx.audit = false;
+    const sid = Number(url.searchParams.get('supplier_id')) || null, d = Number(url.searchParams.get('days')) || null;
+    const list = await suggestAll(env, { supplierId: sid, days: d ? Math.min(Math.max(d, 1), 30) : null });
+    return json(list.map((x) => ({ ...x, lines: x.lines.filter((l) => l.qty > 0) })).filter((x) => sid || x.lines.length || x.plan.today));
+  }
   if (a === 'orders' && b === 'suggest' && method === 'GET') {
     need(user, 'pedidos.crear');
     ctx.audit = false;
@@ -2009,6 +2016,13 @@ async function alerts(env, user) {
     const r = await q1(`SELECT COUNT(*) AS n FROM (SELECT p.id, p.min_stock, COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id), 0) AS s FROM products p WHERE p.active = 1 AND p.min_stock > 0) WHERE s < min_stock`);
     if (r.n) add('warn', '📦', `${r.n} artículo(s) por debajo del stock mínimo`, can(user, 'pedidos.crear') ? '#/pedidos/nuevo' : '#/stock');
   }
+  if (can(user, 'pedidos.crear')) {
+    // los proveedores a los que toca pedir hoy, con su pedido sugerido
+    try {
+      const sug = (await suggestAll(env)).filter((x) => x.plan.today && x.lines.some((l) => l.qty > 0) && !x.open_orders.some((o) => o.order_date === localDay() || o.status !== 'enviado'));
+      if (sug.length) add('warn', '✨', `Hoy toca pedir a ${sug.map((x) => x.name).join(', ')}: tienes el pedido sugerido listo para revisar`, '#/pedidos/sugeridos');
+    } catch (e) { console.error('sugeridos', e); }
+  }
   if (can(user, 'pedidos.aprobar')) {
     const r = await q1(`SELECT COUNT(*) AS n FROM orders WHERE status = 'pendiente'`);
     if (r.n) add('bad', '📝', `${r.n} pedido(s) pendiente(s) de tu aprobación`, '#/pedidos');
@@ -2085,40 +2099,80 @@ async function approvers(env, exceptId) {
 // ---------- pedidos sugeridos ----------
 // Consumo medio diario de las últimas 4 semanas (ventas por escandallo + mermas + personal + producción),
 // ajustado al día de la semana, × días a cubrir + stock mínimo − stock actual. Se redondea al formato de compra.
-async function suggestOrder(env, supplierId, days) {
-  if (!supplierId) throw new HttpError(400, 'Elige el proveedor');
+// ---------- pedidos sugeridos ----------
+// Para cada artículo: consumo diario (últimas 4 semanas, según ventas/escandallos, mermas y personal; si aún no hay datos,
+// según lo comprado) × días a cubrir × peso de esos días + stock mínimo − stock − lo que ya viene en pedidos enviados.
+const WD = [['domingo', 'dom'], ['lunes', 'lun'], ['martes', 'mar'], ['miercoles', 'mie'], ['jueves', 'jue'], ['viernes', 'vie'], ['sabado', 'sab']];
+const WD_LETTER = { D: 0, L: 1, M: 2, X: 3, J: 4, V: 5, S: 6 };
+const WD_NAME = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+// "Pedir lunes y jueves antes de las 12", "L-X-V", "martes" → [1, 4] …
+function orderWeekdays(text) {
+  const t = String(text || '');
+  const n = ' ' + t.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z ]+/g, ' ') + ' ';
+  const out = new Set();
+  WD.forEach(([full, short], i) => { if (n.includes(' ' + full + ' ') || n.includes(' ' + short + ' ')) out.add(i); });
+  if (/a diario|todos los dias|cada dia/.test(n)) [0, 1, 2, 3, 4, 5, 6].forEach((i) => out.add(i));
+  const m = t.match(/\b[LMXJVSD](?:\s*[-,/]\s*[LMXJVSD])+\b/);
+  if (m) m[0].split(/[^LMXJVSD]+/).forEach((c) => c && out.add(WD_LETTER[c]));
+  return [...out].sort();
+}
+function coverPlan(orderDaysText, defDays) {
+  const days = orderWeekdays(orderDaysText);
+  const today = new Date(localDay() + 'T12:00:00Z').getUTCDay();
+  if (!days.length) return { days: defDays, today: false, next: null, known: false };
+  let gap = 1;
+  while (gap < 8 && !days.includes((today + gap) % 7)) gap++;
+  // cubre hasta que llegue lo del siguiente pedido (un día de reparto)
+  return { days: Math.min(gap + 1, 14), today: days.includes(today), next: WD_NAME[(today + gap) % 7], known: true };
+}
+async function suggestAll(env, { supplierId = null, days = null, defDays = 3 } = {}) {
   const since = new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10);
-  const { results } = await env.DB.prepare(`
-    SELECT p.id, p.name, p.unit, p.min_stock, p.price,
+  const { results: prods } = await env.DB.prepare(`
+    SELECT p.id, p.name, p.unit, p.min_stock, p.price, p.supplier_id, p.category,
       COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id), 0) AS stock,
-      COALESCE((SELECT -SUM(qty) FROM movements WHERE product_id = p.id AND mov_date >= ? AND (type IN ('venta', 'merma', 'consumo_personal') OR (type = 'produccion' AND qty < 0))), 0) AS used,
-      (SELECT MIN(mov_date) FROM movements WHERE product_id = p.id) AS first_mov
-    FROM products p WHERE p.active = 1 AND p.supplier_id = ? AND p.prep_recipe_id IS NULL ORDER BY p.category, p.name`).bind(since, supplierId).all();
-  // peso de los próximos días según cómo se reparte la venta por día de la semana
+      COALESCE((SELECT -SUM(qty) FROM movements WHERE product_id = p.id AND mov_date >= ?1 AND (type IN ('venta', 'merma', 'consumo_personal') OR (type = 'produccion' AND qty < 0))), 0) AS used,
+      COALESCE((SELECT SUM(qty) FROM movements WHERE product_id = p.id AND mov_date >= ?1 AND type = 'entrada' AND ref_type = 'albaran'), 0) AS bought,
+      (SELECT MIN(mov_date) FROM movements WHERE product_id = p.id AND COALESCE(ref_type, '') <> 'stock_inicial') AS first_mov
+    FROM products p WHERE p.active = 1 AND p.supplier_id IS NOT NULL AND p.prep_recipe_id IS NULL ${supplierId ? 'AND p.supplier_id = ?2' : ''}
+    ORDER BY p.category, p.name`).bind(...(supplierId ? [since, supplierId] : [since])).all();
+  const { results: inc } = await env.DB.prepare(`SELECT ol.product_id, SUM(ol.qty) AS q FROM order_lines ol JOIN orders o ON o.id = ol.order_id WHERE o.status IN ('pendiente', 'enviado') GROUP BY ol.product_id`).all();
+  const incoming = Object.fromEntries(inc.map((x) => [x.product_id, x.q]));
+  const { results: openOrders } = await env.DB.prepare(`SELECT id, supplier_id, status, order_date FROM orders WHERE status IN ('borrador', 'pendiente', 'enviado') ORDER BY id DESC`).all();
   const { results: wd } = await env.DB.prepare(`SELECT CAST(strftime('%w', sale_date) AS INTEGER) AS w, SUM(units) AS u FROM sales WHERE sale_date >= ? GROUP BY w`).bind(since).all();
   const totalU = wd.reduce((t, x) => t + x.u, 0);
-  let factor = 1;
-  if (totalU > 0) {
-    const share = Object.fromEntries(wd.map((x) => [x.w, x.u / totalU]));
-    let next = 0;
-    for (let i = 1; i <= days; i++) next += share[(new Date(Date.now() + i * 86400000).getUTCDay())] || 0;
-    factor = next / (days / 7); // >1 si se cubren días fuertes (fin de semana)
-  }
+  const share = totalU > 0 ? Object.fromEntries(wd.map((x) => [x.w, x.u / totalU])) : null;
+  const weight = (n) => { if (!share) return 1; let next = 0; for (let i = 1; i <= n; i++) next += share[new Date(Date.now() + i * 86400000).getUTCDay()] || 0; return next / (n / 7) || 1; };
   const { results: fmts } = await env.DB.prepare(`SELECT * FROM product_formats WHERE active = 1 AND is_default = 1`).all();
   const fmap = Object.fromEntries(fmts.map((f) => [f.product_id, f]));
-  const out = results.map((p) => {
-    const span = p.first_mov ? Math.min(28, Math.max(7, (Date.now() - new Date(p.first_mov + 'T12:00:00Z')) / 86400000)) : 28;
-    const perDay = p.used / span;
-    const needBase = Math.max(perDay * days * factor + p.min_stock - p.stock, 0);
-    const f = fmap[p.id];
-    let qty = 0, unit = p.unit;
-    if (needBase > 0.0001) {
-      if (f && f.factor > 0) { qty = Math.ceil(needBase / f.factor - 0.05); unit = 'f:' + f.id; }
-      else qty = p.unit === 'ud' ? Math.ceil(needBase) : Math.ceil(needBase * 10) / 10;
-    }
-    return { product_id: p.id, name: p.name, stock: r2(p.stock), per_day: r2(perDay), min_stock: p.min_stock, need: r2(needBase), qty, unit };
-  });
-  return { days, weekday_factor: r2(factor), lines: out };
+  const { results: sups } = await env.DB.prepare(`SELECT id, name, order_days, phone, email FROM suppliers WHERE active = 1 ${supplierId ? 'AND id = ?' : ''} ORDER BY name`).bind(...(supplierId ? [supplierId] : [])).all();
+  const out = [];
+  for (const sp of sups) {
+    const plan = coverPlan(sp.order_days, defDays);
+    const cover = days || plan.days;
+    const factor = weight(cover);
+    const lines = prods.filter((p) => p.supplier_id === sp.id).map((p) => {
+      const span = p.first_mov ? Math.min(28, Math.max(7, (Date.now() - new Date(p.first_mov + 'T12:00:00Z')) / 86400000)) : 28;
+      const basis = p.used > 0 ? 'consumo' : p.bought > 0 ? 'compras' : null;
+      const perDay = (basis === 'consumo' ? p.used : basis === 'compras' ? p.bought : 0) / span;
+      const inc2 = Number(incoming[p.id]) || 0;
+      const needBase = Math.max(perDay * cover * factor + Number(p.min_stock || 0) - p.stock - inc2, 0);
+      const f = fmap[p.id];
+      let qty = 0, unit = p.unit;
+      if (needBase > 0.0001) {
+        if (f && f.factor > 0) { qty = Math.ceil(needBase / f.factor - 0.05); unit = 'f:' + f.id; }
+        else qty = p.unit === 'ud' ? Math.ceil(needBase) : Math.ceil(needBase * 10) / 10;
+      }
+      return { product_id: p.id, name: p.name, stock: r2(p.stock), incoming: r2(inc2), per_day: r2(perDay), basis, min_stock: p.min_stock, need: r2(needBase), qty, unit };
+    });
+    out.push({ supplier_id: sp.id, name: sp.name, order_days: sp.order_days, phone: sp.phone, email: sp.email, days: cover, plan, weekday_factor: r2(factor),
+      open_orders: openOrders.filter((o) => o.supplier_id === sp.id), lines });
+  }
+  return out;
+}
+async function suggestOrder(env, supplierId, days) {
+  if (!supplierId) throw new HttpError(400, 'Elige el proveedor');
+  const [s] = await suggestAll(env, { supplierId, days });
+  return { days, weekday_factor: s?.weekday_factor ?? 1, lines: s?.lines || [] };
 }
 
 // ---------- APPCC ----------
