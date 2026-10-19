@@ -1,6 +1,7 @@
 // API de la aplicación de gestión del restaurante (Cloudflare Workers + D1)
 import { ensureSchema, SCHEMA_VERSION, recomputeStock } from './migrate.js';
 import { turnos, publicSchedule } from './turnos.js';
+import { eventos, eventAlerts } from './eventos.js';
 import { push, enqueuePush, pushUsersWith } from './push.js';
 
 const ALL = ['direccion', 'cocina', 'sala'];
@@ -54,7 +55,7 @@ ${names.map((x) => '- ' + x).join('\n')}`;
 }
 
 // tablas de módulos posteriores que también entran en la copia
-const BACKUP_EXTRA = ['appcc_equipment', 'appcc_temps', 'appcc_tasks', 'appcc_cleaning', 'staff', 'shift_templates', 'shifts', 'schedule_weeks'];
+const BACKUP_EXTRA = ['appcc_equipment', 'appcc_temps', 'appcc_tasks', 'appcc_cleaning', 'staff', 'shift_templates', 'shifts', 'schedule_weeks', 'events'];
 
 // ---------- permisos ----------
 // El superusuario lo puede todo y decide con casillas qué puede hacer cada persona.
@@ -69,10 +70,11 @@ const PERMS = [
   'productos.editar', 'ventas.gestionar', 'gastos.gestionar',
   'appcc.registrar', 'appcc.gestionar',
   'turnos.ver', 'turnos.gestionar',
+  'eventos.ver', 'eventos.gestionar',
 ];
 const TEMPLATES = {
-  sala: ['caja.registrar', 'mermas.registrar', 'escandallos.ver', 'appcc.registrar', 'turnos.ver'],
-  cocina: ['pedidos.ver', 'pedidos.crear', 'recepcion.ver', 'recepcion.crear', 'mermas.registrar', 'mermas.ver_todas', 'stock.ver', 'inventario.hacer', 'escandallos.ver', 'escandallos.editar', 'produccion.registrar', 'productos.editar', 'costes.ver', 'appcc.registrar', 'appcc.gestionar', 'turnos.ver'],
+  sala: ['caja.registrar', 'mermas.registrar', 'escandallos.ver', 'appcc.registrar', 'turnos.ver', 'eventos.ver'],
+  cocina: ['pedidos.ver', 'pedidos.crear', 'recepcion.ver', 'recepcion.crear', 'mermas.registrar', 'mermas.ver_todas', 'stock.ver', 'inventario.hacer', 'escandallos.ver', 'escandallos.editar', 'produccion.registrar', 'productos.editar', 'costes.ver', 'appcc.registrar', 'appcc.gestionar', 'turnos.ver', 'eventos.ver'],
   direccion: PERMS,
 };
 const permsOf = (u) => {
@@ -519,7 +521,7 @@ export async function onRequest({ request, env, params, ctx: wctx }) {
 // ---------- registro de actividad ----------
 const ENTITY = { products: 'artículo', suppliers: 'proveedor', fixed_costs: 'gasto fijo', users: 'usuario', orders: 'pedido', receipts: 'recepción',
   movements: 'merma / consumo', inventory: 'inventario', recipes: 'plato', sales: 'ventas', 'pos-aliases': 'vínculo Qamarero', 'pos-pending': 'ventas pendientes',
-  settings: 'ajustes', cash: 'caja', allergens: 'alérgenos', appcc: 'APPCC', production: 'producción', backup: 'copia de seguridad', integrations: 'integración', turnos: 'turnos', push: 'avisos' };
+  settings: 'ajustes', cash: 'caja', allergens: 'alérgenos', appcc: 'APPCC', production: 'producción', backup: 'copia de seguridad', integrations: 'integración', turnos: 'turnos', push: 'avisos', events: 'evento' };
 function cleanBody(raw) {
   let d = null;
   try { d = raw ? JSON.parse(raw) : null; } catch { return null; }
@@ -624,6 +626,7 @@ async function route(parts, method, request, env, url, ctx = {}) {
   if (!user) throw new HttpError(401, 'Sesión caducada. Vuelve a entrar.');
   ctx.user = user;
   if (a === 'turnos') return turnos(env, user, ctx, method, b, c, request, url);
+  if (a === 'events') return eventos(env, user, ctx, method, b, request, url);
   if (a === 'push') return push(env, user, ctx, method, b, request, url);
   // las consultas masivas de lectura no se registran
   if (a === 'allergens' || (a === 'sales' && b === 'match')) ctx.audit = false;
@@ -2073,6 +2076,7 @@ async function alerts(env, user) {
     const r = await q1(`SELECT COUNT(*) AS n FROM recipes r WHERE r.active = 1 AND COALESCE(r.kind, 'plato') = 'plato' AND NOT EXISTS (SELECT 1 FROM recipe_lines WHERE recipe_id = r.id)`);
     if (r.n) add('info', '🍽️', `${r.n} plato(s) de la carta sin escandallo`, '#/escandallos');
   }
+  await eventAlerts(env, user, add);
   const order = { bad: 0, warn: 1, info: 2 };
   return out.sort((x, y) => order[x.level] - order[y.level]);
 }

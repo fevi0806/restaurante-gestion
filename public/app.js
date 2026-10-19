@@ -432,6 +432,7 @@ VIEWS.inicio = async (v) => {
     ['caja.registrar', '#/caja', '💶', 'Cerrar caja'],
     ['appcc.registrar', '#/appcc', '🧊', 'Temperaturas y limpieza'],
     ['turnos.gestionar', '#/turnos', '🗓️', 'Cuadrante de turnos'],
+    ['eventos.gestionar', '#/eventos/nuevo', '🎉', 'Apuntar evento'],
     ['inventario.hacer', '#/stock?tab=inventario', '📋', 'Hacer inventario'],
     ['escandallos.ver', '#/escandallos', '🍽️', 'Fichas técnicas'],
     ['panel.ver', '#/panel', '📈', 'Panel de control'],

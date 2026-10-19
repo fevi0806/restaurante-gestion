@@ -3,7 +3,7 @@
 // Todo es repetible: si algo ya existe, se ignora. Así nunca hay que pegar SQL en la consola.
 import { SCHEMA } from './schema.js';
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 // Columnas añadidas después de la primera versión (para bases de datos ya creadas)
 const COLUMNS = [
