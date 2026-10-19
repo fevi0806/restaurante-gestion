@@ -679,7 +679,8 @@ async function route(parts, method, request, env, url, ctx = {}) {
       if (d.confirm !== 'RESTAURAR') throw new HttpError(400, 'Falta la confirmación');
       if (d.wipe) {
         // se vacía todo menos las sesiones, para no echar al que restaura
-        const stmts = tables.slice().reverse().filter((t) => t !== 'users').map((t) => env.DB.prepare(`DELETE FROM ${t}`));
+        // la versión de la base de datos se conserva: si se borrara, cada arranque rehará la actualización completa en plena restauración
+        const stmts = tables.slice().reverse().filter((t) => t !== 'users').map((t) => env.DB.prepare(t === 'settings' ? `DELETE FROM settings WHERE key <> 'schema_version'` : `DELETE FROM ${t}`));
         await runBatch(env, stmts);
         ctx.audit = { action: 'restauración', entity: 'copia de seguridad', summary: `Restauración de copia de seguridad del ${String(d.created_at || '').slice(0, 16)}` };
         return json({ ok: true });
@@ -694,7 +695,7 @@ async function route(parts, method, request, env, url, ctx = {}) {
         return json({ ok: true });
       }
       if (!tables.includes(d.table)) throw new HttpError(400, 'Tabla desconocida: ' + d.table);
-      const rows = Array.isArray(d.rows) ? d.rows : [];
+      const rows = (Array.isArray(d.rows) ? d.rows : []).filter((r) => !(d.table === 'settings' && r.key === 'schema_version'));
       const cols = (await env.DB.prepare(`PRAGMA table_info(${d.table})`).all()).results.map((r) => r.name);
       const stmts = rows.map((r) => { const ks = cols.filter((k) => k in r); return env.DB.prepare(`INSERT OR REPLACE INTO ${d.table} (${ks.join(',')}) VALUES (${ks.map(() => '?').join(',')})`).bind(...ks.map((k) => r[k])); });
       await runBatch(env, stmts);

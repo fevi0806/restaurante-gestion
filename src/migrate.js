@@ -74,7 +74,12 @@ export function addMigration(fn) { EXTRA.push(fn); }
 
 let ready = null;
 export function ensureSchema(env) {
-  if (!ready) ready = migrate(env).catch((e) => { ready = null; throw e; });
+  if (!ready) {
+    // si la base de datos no contesta, no se queda esperando para siempre: la próxima petición lo vuelve a intentar
+    let timer;
+    const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('la base de datos no responde ahora mismo; vuelve a intentarlo en un momento')), 20000); });
+    ready = Promise.race([migrate(env), timeout]).finally(() => clearTimeout(timer)).catch((e) => { ready = null; throw e; });
+  }
   return ready;
 }
 
