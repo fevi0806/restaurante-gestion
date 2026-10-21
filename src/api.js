@@ -1504,24 +1504,36 @@ async function inventoryOpening([op, id], method, request, env, user, ctx) {
     const d = await body(request);
     if (d.confirm !== 'CERRAR') throw new HttpError(400, 'Falta la confirmación');
     const date = isDate(d.date) ? d.date : todayStr();
-    const { results: prods } = await env.DB.prepare(PRODUCTS_SQL).all();
-    const inv = await env.DB.prepare('INSERT INTO inventories (inv_date, notes, user_id, total_diff_value) VALUES (?,?,?,0) RETURNING id').bind(date, 'Regularización: inventario de arranque', user.id).first();
+    // Todo se hace dentro de la base de datos en un único lote (una transacción): con cientos de artículos,
+    // preparar una sentencia por artículo agotaba el tiempo del servidor y el móvil lo veía como "sin conexión",
+    // dejando a veces el cierre a medias. Así, o se aplica entero o no se aplica nada.
+    const NOTE = 'Regularización: inventario de arranque';
+    const COUNTS = `SELECT l.product_id, ROUND(SUM(l.counted), 4) AS counted, GROUP_CONCAT(REPLACE(i.notes, '${OPEN_TAG} ', ''), ' +') AS zones
+      FROM inventory_lines l JOIN inventories i ON i.id = l.inventory_id WHERE i.notes LIKE '${OPEN_TAG}%' AND i.created_at >= ?1 GROUP BY l.product_id`;
+    // cierres anteriores que se cortaron a medias: se deshacen (sus movimientos se borran y el stock vuelve atrás) antes de repetir
+    const { results: stale } = await env.DB.prepare('SELECT id FROM inventories WHERE notes = ? AND created_at >= ?').bind(NOTE, st.since).all();
+    const invId = ((await env.DB.prepare('SELECT MAX(id) AS m FROM inventories').first())?.m || 0) + 1;
     const stmts = [];
-    let counted = 0, zeroed = 0, value = 0;
-    for (const p of prods) {
-      const c = st.counts[p.id];
-      const target = c ? r2(Number(c.counted)) : 0;
-      if (c) counted++; else if (Math.abs(p.stock) > 0.0001) zeroed++;
-      value += target * (Number(p.price) || 0);
-      stmts.push(env.DB.prepare('INSERT INTO inventory_lines (inventory_id, product_id, expected, counted, detail) VALUES (?,?,?,?,?)').bind(inv.id, p.id, r2(p.stock), target, c ? c.zones : 'no contado → 0'));
-      const delta = r2(target - Number(p.stock));
-      if (Math.abs(delta) < 0.0001) continue;
-      stmts.push(env.DB.prepare(`INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-        .bind(p.id, 'entrada', delta, p.price || 0, 'Regularización inventario de arranque', uuid(), 'stock_inicial', inv.id, user.id, date));
-    }
-    stmts.push(env.DB.prepare(`DELETE FROM settings WHERE key = 'opening_since'`));
-    await runBatch(env, stmts);
-    ctx.audit = { action: 'regularización', entity: 'inventario', id: inv.id, summary: `Inventario de arranque cerrado: ${counted} artículos con lo contado, ${zeroed} a cero. Valor del almacén: ${r2(value)} €` };
+    for (const s of stale) stmts.push(
+      env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'stock_inicial' AND ref_id = ?`).bind(s.id),
+      env.DB.prepare('DELETE FROM inventory_lines WHERE inventory_id = ?').bind(s.id),
+      env.DB.prepare('DELETE FROM inventories WHERE id = ?').bind(s.id));
+    stmts.push(
+      env.DB.prepare('INSERT INTO inventories (id, inv_date, notes, user_id, total_diff_value) VALUES (?,?,?,?,0)').bind(invId, date, NOTE, user.id),
+      env.DB.prepare(`INSERT INTO inventory_lines (inventory_id, product_id, expected, counted, detail)
+        SELECT ?2, p.id, ROUND(p.stock_cache, 4), COALESCE(c.counted, 0), COALESCE(c.zones, 'no contado → 0')
+        FROM products p LEFT JOIN (${COUNTS}) c ON c.product_id = p.id WHERE p.active = 1`).bind(st.since, invId),
+      env.DB.prepare(`INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date)
+        SELECT l.product_id, 'entrada', ROUND(l.counted - l.expected, 4), COALESCE(p.price, 0), 'Regularización inventario de arranque',
+               lower(hex(randomblob(16))), 'stock_inicial', ?1, ?2, ?3
+        FROM inventory_lines l JOIN products p ON p.id = l.product_id
+        WHERE l.inventory_id = ?1 AND ABS(ROUND(l.counted - l.expected, 4)) >= 0.0001`).bind(invId, user.id, date),
+      env.DB.prepare(`DELETE FROM settings WHERE key = 'opening_since'`));
+    await env.DB.batch(stmts);
+    const sum = await env.DB.prepare(`SELECT SUM(l.detail <> 'no contado → 0') AS counted, SUM(l.detail = 'no contado → 0' AND ABS(l.expected) > 0.0001) AS zeroed,
+      ROUND(SUM(l.counted * COALESCE(p.price, 0)), 2) AS value FROM inventory_lines l JOIN products p ON p.id = l.product_id WHERE l.inventory_id = ?`).bind(invId).first();
+    const counted = sum?.counted || 0, zeroed = sum?.zeroed || 0, value = sum?.value || 0;
+    ctx.audit = { action: 'regularización', entity: 'inventario', id: invId, summary: `Inventario de arranque cerrado: ${counted} artículos con lo contado, ${zeroed} a cero. Valor del almacén: ${r2(value)} €` };
     return json({ ok: true, counted, zeroed, value: r2(value) });
   }
   throw new HttpError(404, 'Acción desconocida');

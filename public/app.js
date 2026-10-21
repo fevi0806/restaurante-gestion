@@ -42,12 +42,16 @@ async function api(path, opts = {}) {
       credentials: 'same-origin',
     });
   } catch {
-    throw new Error('No hay conexión con el servidor. Comprueba internet y vuelve a intentarlo.');
+    // sin respuesta: o no hay internet o el servidor se ha cortado a mitad (en ese caso el cambio puede haberse hecho o no)
+    if (!navigator.onLine) throw new Error('No hay conexión a internet. Comprueba la wifi o los datos y vuelve a intentarlo.');
+    throw new Error((opts.method && opts.method !== 'GET') || opts.body
+      ? 'El servidor no ha respondido. Recarga la página para ver si se ha guardado antes de repetirlo.'
+      : 'El servidor no ha respondido. Vuelve a intentarlo en un momento.');
   }
   let data = null;
   try { data = await res.json(); } catch { /* sin cuerpo */ }
   if (res.status === 401 && !opts.noRedirect) { S.user = null; renderLogin(); throw new Error('Sesión caducada'); }
-  if (!res.ok) throw new Error((data && data.error) || 'Error ' + res.status);
+  if (!res.ok) throw new Error((data && data.error) || (res.status >= 500 ? `El servidor no ha podido terminar (error ${res.status}). Vuelve a intentarlo en un momento.` : 'Error ' + res.status));
   return data;
 }
 
