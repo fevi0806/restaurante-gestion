@@ -1180,8 +1180,18 @@ VIEWS.stock = async (v, _id, q) => {
         <div class="actions"><button data-close>Volver</button><button class="primary" value="ok">Regularizar</button></div>`);
       if (!ok) return;
       if ($('#cf', $('#modal-form')).value.trim().toUpperCase() !== 'CERRAR') throw new Error('No has escrito CERRAR: no se ha tocado nada');
-      await downloadBackup(await api('backup'));
-      const r = await api('inventory/opening/close', { body: { confirm: 'CERRAR', date: $('#date').value } });
+      try { await downloadBackup(await api('backup')); } catch (err) {
+        if (!(await confirmModal(`No se ha podido descargar la copia de seguridad (${err.message}). ¿Regularizar igualmente?`, 'Regularizar sin copia'))) return;
+      }
+      const body2 = { confirm: 'CERRAR', date: $('#date').value };
+      let r;
+      try { r = await api('inventory/opening/close', { body: body2 }); } catch (err) {
+        // si la respuesta se perdió por el camino, se mira si el cierre llegó a hacerse; si no, se reintenta una vez (es seguro repetirlo)
+        await new Promise((res) => setTimeout(res, 2000));
+        const st2 = await api('inventory/opening').catch(() => null);
+        if (st2 && !st2.active) r = { counted: Object.keys(cnt).length, zeroed: zero.length, value };
+        else r = await api('inventory/opening/close', { body: body2 });
+      }
       lsSetX(DKEY, '{}');
       await reload();
       await modal(`<h2>Inventario regularizado ✓</h2><p>${r.counted} artículos con lo contado y ${r.zeroed} puestos a 0.${can('costes.ver') ? ` Valor del almacén: <b>${eur(r.value)}</b>.` : ''}</p><p class="small muted">A partir de ahora el stock parte de este recuento.</p><div class="actions"><button class="primary" value="ok">Ver el stock</button></div>`);
@@ -3008,10 +3018,14 @@ async function downloadBackup(info, onProgress = () => {}) {
     }
   }
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  // se anota la copia ANTES de lanzar la descarga: en el móvil (sobre todo iPhone o app instalada) la descarga
+  // corta las peticiones que salen justo después y la app lo veía como "sin conexión"
+  await api('backup/done', { body: {} }).catch(() => null);
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `copia_${(S.settings.restaurant_name || 'restaurante').replace(/\W+/g, '_')}_${today()}.json`;
   document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 3000);
-  await api('backup/done', { body: {} }); await reload();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  await new Promise((r) => setTimeout(r, 1500)); // deja que el móvil termine de abrir la descarga
+  await reload().catch(() => null);
 }
 
 VIEWS.copias = async (v) => {
