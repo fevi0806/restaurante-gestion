@@ -1493,6 +1493,37 @@ async function inventoryOpening([op, id], method, request, env, user, ctx) {
     ctx.audit = { action: 'corrección', entity: 'inventario', id: inv.id, summary: `Inventario de arranque: ${n} artículos puestos a 0 vuelven al stock que tenían antes del cierre` };
     return json({ ok: true, restored: n });
   }
+  // Reparación del último cierre: devuelve al stock lo recibido con albarán durante el inventario de arranque
+  // que el cierre puso a 0 (antes no se tenía en cuenta). Con ?dry=1 solo enseña lo que haría. Se puede repetir sin duplicar.
+  if (op === 'fix-receipts' && method === 'POST') {
+    need(user, 'super');
+    const d = await body(request);
+    const NOTE = 'Regularización: inventario de arranque', LABEL = 'Recibido con albarán durante el inventario de arranque';
+    const { results: regs } = await env.DB.prepare('SELECT id, created_at FROM inventories WHERE notes = ? ORDER BY id DESC LIMIT 2').bind(NOTE).all();
+    const R = regs[0];
+    if (!R) throw new HttpError(400, 'No hay ningún inventario de arranque cerrado');
+    const from = regs[1]?.created_at || '2000-01-01';
+    const done = await env.DB.prepare(`SELECT COUNT(*) AS n FROM movements WHERE ref_type = 'stock_inicial' AND ref_id = ? AND label = ?`).bind(R.id, LABEL).first();
+    if (done.n) return json({ ok: true, already: true, items: [] });
+    const { results: items } = await env.DB.prepare(`
+      SELECT m.product_id, p.name, p.unit, COALESCE(p.price, 0) AS price, ROUND(SUM(m.qty), 4) AS q, l.detail, GROUP_CONCAT(DISTINCT m.ref_id) AS receipts
+      FROM movements m JOIN products p ON p.id = m.product_id
+      JOIN inventory_lines l ON l.inventory_id = ?1 AND l.product_id = m.product_id
+      LEFT JOIN (SELECT il.product_id, MAX(i.created_at) AS last_at FROM inventory_lines il JOIN inventories i ON i.id = il.inventory_id
+                 WHERE i.notes LIKE '${OPEN_TAG}%' AND i.created_at > ?2 AND i.created_at < ?3 GROUP BY il.product_id) c ON c.product_id = m.product_id
+      WHERE m.ref_type = 'albaran' AND m.created_at > COALESCE(c.last_at, ?2) AND m.created_at <= ?3
+        AND l.detail NOT LIKE 'recuperado%' AND l.detail NOT LIKE '%recibido%'
+      GROUP BY m.product_id HAVING ABS(SUM(m.qty)) > 0.0001 ORDER BY p.name`).bind(R.id, from, R.created_at).all();
+    if (d.dry || !items.length) return json({ ok: true, dry: !!d.dry, regularization: R.id, items });
+    const date = todayStr(), stmts = [];
+    for (const it of items) stmts.push(
+      env.DB.prepare(`INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?, 'entrada', ?, ?, ?, ?, 'stock_inicial', ?, ?, ?)`)
+        .bind(it.product_id, it.q, it.price, LABEL, uuid(), R.id, user.id, date),
+      env.DB.prepare(`UPDATE inventory_lines SET counted = ROUND(counted + ?, 4), detail = detail || ' + recibido después de contar' WHERE inventory_id = ? AND product_id = ?`).bind(it.q, R.id, it.product_id));
+    await runBatch(env, stmts);
+    ctx.audit = { action: 'corrección', entity: 'inventario', id: R.id, summary: `Recuperado en el stock lo recibido con albarán durante el inventario de arranque: ${items.length} artículos` };
+    return json({ ok: true, regularization: R.id, items });
+  }
   if (!st.active) throw new HttpError(400, 'No hay ningún inventario de arranque en marcha. Lo empieza el responsable desde Stock → Hacer inventario.');
   if (op === 'part' && method === 'POST') {
     const d = await body(request);
@@ -1530,8 +1561,12 @@ async function inventoryOpening([op, id], method, request, env, user, ctx) {
     // preparar una sentencia por artículo agotaba el tiempo del servidor y el móvil lo veía como "sin conexión",
     // dejando a veces el cierre a medias. Así, o se aplica entero o no se aplica nada.
     const NOTE = 'Regularización: inventario de arranque';
-    const COUNTS = `SELECT l.product_id, ROUND(SUM(l.counted), 4) AS counted, GROUP_CONCAT(REPLACE(i.notes, '${OPEN_TAG} ', ''), ' +') AS zones
+    const COUNTS = `SELECT l.product_id, ROUND(SUM(l.counted), 4) AS counted, GROUP_CONCAT(REPLACE(i.notes, '${OPEN_TAG} ', ''), ' +') AS zones, MAX(i.created_at) AS last_at
       FROM inventory_lines l JOIN inventories i ON i.id = l.inventory_id WHERE i.notes LIKE '${OPEN_TAG}%' AND i.created_at >= ?1 GROUP BY l.product_id`;
+    // Lo que se recibe con albarán mientras dura el inventario (después de contar ese artículo, o sin que nadie lo cuente)
+    // no estaba en el recuento: se suma, para que el cierre no lo borre.
+    const LATE = `SELECT m.product_id, ROUND(SUM(m.qty), 4) AS q FROM movements m LEFT JOIN (${COUNTS}) c2 ON c2.product_id = m.product_id
+      WHERE m.ref_type = 'albaran' AND m.created_at > COALESCE(c2.last_at, ?1) GROUP BY m.product_id`;
     // cierres anteriores que se cortaron a medias: se deshacen (sus movimientos se borran y el stock vuelve atrás) antes de repetir
     const { results: stale } = await env.DB.prepare('SELECT id FROM inventories WHERE notes = ? AND created_at >= ?').bind(NOTE, st.since).all();
     const invId = ((await env.DB.prepare('SELECT MAX(id) AS m FROM inventories').first())?.m || 0) + 1;
@@ -1543,8 +1578,10 @@ async function inventoryOpening([op, id], method, request, env, user, ctx) {
     stmts.push(
       env.DB.prepare('INSERT INTO inventories (id, inv_date, notes, user_id, total_diff_value) VALUES (?,?,?,?,0)').bind(invId, date, NOTE, user.id),
       env.DB.prepare(`INSERT INTO inventory_lines (inventory_id, product_id, expected, counted, detail)
-        SELECT ?2, p.id, ROUND(p.stock_cache, 4), COALESCE(c.counted, 0), COALESCE(c.zones, 'no contado → 0')
-        FROM products p LEFT JOIN (${COUNTS}) c ON c.product_id = p.id WHERE p.active = 1`).bind(st.since, invId),
+        SELECT ?2, p.id, ROUND(p.stock_cache, 4), ROUND(COALESCE(c.counted, 0) + COALESCE(lt.q, 0), 4),
+          CASE WHEN c.product_id IS NULL THEN (CASE WHEN ABS(COALESCE(lt.q, 0)) > 0.0001 THEN 'no contado: solo lo recibido durante el inventario' ELSE 'no contado → 0' END)
+               ELSE c.zones || CASE WHEN ABS(COALESCE(lt.q, 0)) > 0.0001 THEN ' + recibido después de contar' ELSE '' END END
+        FROM products p LEFT JOIN (${COUNTS}) c ON c.product_id = p.id LEFT JOIN (${LATE}) lt ON lt.product_id = p.id WHERE p.active = 1`).bind(st.since, invId),
       env.DB.prepare(`INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date)
         SELECT l.product_id, 'entrada', ROUND(l.counted - l.expected, 4), COALESCE(p.price, 0), 'Regularización inventario de arranque',
                lower(hex(randomblob(16))), 'stock_inicial', ?1, ?2, ?3

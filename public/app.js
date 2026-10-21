@@ -1309,6 +1309,7 @@ VIEWS.stock = async (v, _id, q) => {
         ${pendingHere ? `<p class="txt-bad">En este móvil hay ${pendingHere} artículos apuntados sin guardar. Guárdalos antes como una zona o se perderán.</p>` : ''}
         <ul><li><b>${Object.keys(cnt).length}</b> artículos quedan con lo contado (${st.parts.length} zonas).</li>
         <li><b>${S.products.length - Object.keys(cnt).length}</b> no contados quedan a <b>0</b>${zero.length ? ` (${zero.length} tenían stock)` : ''}.</li>
+        <li>Lo que se haya recibido con albarán <b>después de contar</b> (o en zonas sin contar) se suma, no se pierde.</li>
         ${can('costes.ver') ? `<li>Valor del almacén después: <b>${eur(value)}</b></li>` : ''}</ul>
         ${zero.length ? `<details><summary class="small">Ver los que tenían stock y quedan a 0</summary><div class="small">${zero.map((p) => esc(p.name)).join(', ')}</div></details>` : ''}
         <p class="small muted">Antes se descarga una copia de seguridad. La regularización cuenta como stock inicial, no como descuadre.</p>
