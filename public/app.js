@@ -325,6 +325,25 @@ function cellKey(td) {
 const cmpKeys = (a, b) => (a.n != null && b.n != null ? a.n - b.n : a.n != null ? -1 : b.n != null ? 1 : collator.compare(a.s, b.s));
 const lsGetX = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
 const lsSetX = (k, v) => { try { localStorage.setItem(k, v); } catch { /* sin almacenamiento */ } };
+// Filtro rápido por categoría: una fila de botones. Recuerda en este móvil la última elegida (key).
+// info[c] = texto pequeño junto al nombre (n.º de artículos, contados…)
+const catChipsHtml = (cats, info = {}) => `<div class="chips" data-chips role="group" aria-label="Filtrar por categoría"><button type="button" class="chip on" data-fc="">Todas</button>${cats.map((c) => `<button type="button" class="chip" data-fc="${esc(c)}">${esc(c)}${info[c] != null ? ` <span class="chip-n">${esc(String(info[c]))}</span>` : ''}</button>`).join('')}</div>`;
+function bindCatChips(root, key, onChange) {
+  const box = $('[data-chips]', root); if (!box) return () => '';
+  let cur = '';
+  const set = (c, save = true) => {
+    cur = $$('[data-fc]', box).some((b) => b.dataset.fc === c) ? c : '';
+    $$('[data-fc]', box).forEach((b) => { b.classList.toggle('on', b.dataset.fc === cur); b.setAttribute('aria-pressed', b.dataset.fc === cur); });
+    if (save) lsSetX('fcat:' + key, cur);
+    onChange(cur);
+  };
+  box.addEventListener('click', (e) => { const b = e.target.closest('[data-fc]'); if (b) set(b.dataset.fc); });
+  set(lsGetX('fcat:' + key) || '', false);
+  $('[data-fc].on', box)?.scrollIntoView({ block: 'nearest', inline: 'center' });
+  const get = () => cur;
+  get.set = set;
+  return get;
+}
 function enhanceTables(root) {
   $$('table', root).forEach((table) => {
     if (table.dataset.enh || table.classList.contains('nosort') || table.classList.contains('sched')) return;
@@ -1091,8 +1110,8 @@ VIEWS.stock = async (v, _id, q) => {
       <p class="small muted">${open ? 'Apunta lo que hay en tu zona en cajas, botellas o sueltos: la app hace la suma. Deja en blanco lo que no esté en tu zona.' : 'Cuenta lo que hay físicamente y apúntalo. Deja en blanco lo que no cuentes. La app compara con el stock teórico y registra la diferencia como descuadre.'} Lo que escribes se guarda en este móvil hasta que pulses Guardar.</p>
       <div class="row">${open ? '<div class="field"><label>Zona que cuentas</label><input id="zone" list="dl-zones" placeholder="Cámara, congelador, almacén, barra…"><datalist id="dl-zones">' + ['Cámara', 'Congelador', 'Almacén seco', 'Bebidas', 'Barra', 'Cocina', 'Bodega'].map((z) => `<option value="${z}">`).join('') + '</datalist></div>' : ''}
         <div class="field"><label>Fecha del recuento</label><input type="date" id="date" value="${today()}"></div>
-        <div class="field"><label>Categoría</label><select id="fcat"><option value="">Todas</option>${cats.map((c) => `<option>${esc(c)}</option>`).join('')}</select></div>
         <div class="field" style="flex:2 1 200px"><label>Buscar</label><input id="search" placeholder="Filtrar artículos…"></div></div>
+      ${catChipsHtml(cats, Object.fromEntries(cats.map((c) => { const ps = S.products.filter((p) => (p.category || 'Sin categoría') === c); return [c, open ? `${ps.filter((p) => counted[p.id]).length}/${ps.length}` : ps.length]; })))}
       <div class="row between">${open ? '<label class="check"><input type="checkbox" id="pend"> <span>Ver solo los que nadie ha contado todavía</span></label>' : '<span></span>'}
         ${canAdd ? '<button type="button" id="newart">+ Artículo que no está en la lista</button>' : ''}</div>
       ${cats.map((c) => catBlock(c, S.products.filter((p) => (p.category || 'Sin categoría') === c))).join('') || '<div class="empty" data-noprod>No hay artículos.</div>'}
@@ -1100,11 +1119,12 @@ VIEWS.stock = async (v, _id, q) => {
       <div class="sticky-foot row between"><span class="small muted" id="cnt">0 contados</span><button class="primary" id="save">${open ? 'Guardar mi zona' : 'Guardar inventario'}</button></div></div>
       ${tableCard('Inventarios anteriores', invs.filter((i) => !String(i.notes || '').startsWith('[arranque]')), ['Fecha', 'Quién', 'Descuadre'], (i) => [`${fdate(i.inv_date)}${i.notes ? `<div class="small muted">${esc(i.notes)}</div>` : ''}`, esc(i.user_name || ''), `<span class="${i.total_diff_value < 0 ? 'txt-bad' : ''}">${eur(i.total_diff_value)}</span>`], 'Aún no se ha hecho ningún inventario')}`;
     const filt = () => {
-      const s = norm($('#search').value), c = $('#fcat').value, pend = $('#pend')?.checked;
+      const s = norm($('#search').value), c = fcat ? fcat() : '', pend = $('#pend')?.checked;
       $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', (s && !tr.dataset.n.includes(s)) || (pend && tr.classList.contains('done'))));
       $$('[data-cat]', v).forEach((d) => d.classList.toggle('hidden', (c && d.dataset.cat !== c) || !$$('tr[data-n]', d).some((tr) => !tr.classList.contains('hidden'))));
     };
-    $('#search').oninput = filt; $('#fcat').onchange = filt; if ($('#pend')) $('#pend').onchange = filt;
+    let fcat = null; fcat = bindCatChips(v, 'inventario', () => filt()); filt();
+    $('#search').oninput = filt; if ($('#pend')) $('#pend').onchange = filt;
     if ($('#zone')) { $('#zone').value = lsGetX(DKEY + ':zona') || ''; $('#zone').oninput = () => lsSetX(DKEY + ':zona', $('#zone').value); }
     if ($('#impinv')) $('#impinv').onclick = () => inventarioImport($('#date').value);
     // crear o corregir un artículo sin salir del inventario: solo se redibuja su fila
@@ -1117,7 +1137,7 @@ VIEWS.stock = async (v, _id, q) => {
         const rows = $$('tr[data-row]', block), after = rows.find((r) => collator.compare(prodById(r.dataset.row)?.name || '', p.name) > 0);
         if (after) after.insertAdjacentHTML('beforebegin', invRow(p)); else $('tbody', block).insertAdjacentHTML('beforeend', invRow(p));
       }
-      if (!$$('#fcat option', v).some((o) => o.value === c)) $('#fcat').insertAdjacentHTML('beforeend', `<option>${esc(c)}</option>`);
+      if (!$$('[data-fc]', v).some((o) => o.dataset.fc === c)) $('[data-chips]', v).insertAdjacentHTML('beforeend', `<button type="button" class="chip" data-fc="${esc(c)}">${esc(c)}</button>`);
       const tr = $(`tr[data-row="${p.id}"]`, v); showRow(tr); refresh();
       if (focus) { tr.classList.remove('hidden'); tr.closest('[data-cat]').classList.remove('hidden'); tr.scrollIntoView({ block: 'center' }); $('input[data-f]', tr)?.focus(); }
     };
@@ -1219,12 +1239,21 @@ VIEWS.stock = async (v, _id, q) => {
   const totalVal = S.products.reduce((s, p) => s + Math.max(p.stock, 0) * (p.price || 0), 0);
   const ed = can('productos.editar');
   v.innerHTML = `<h1>Stock e inventario</h1>${tabs}<div class="card">
-    <div class="row between"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar artículo…"></div>${ed ? '<button type="button" class="danger" id="baja">Dar de baja seleccionados</button>' : ''}<b>Valor total: ${eur(totalVal)}</b></div>
+    <div class="row between"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar artículo…"></div>${ed ? '<button type="button" class="danger" id="baja">Dar de baja seleccionados</button>' : ''}<b id="valtot">Valor total: ${eur(totalVal)}</b></div>
+    ${catChipsHtml(cats, Object.fromEntries(cats.map((c) => [c, S.products.filter((p) => (p.category || 'Sin categoría') === c).length])))}
     <div class="table-wrap" style="margin-top:10px"><table><thead><tr>${ed ? '<th><input type="checkbox" id="all" aria-label="Marcar todos"></th>' : ''}<th>Artículo</th><th>Categoría</th><th class="num">Stock teórico</th><th class="num">Mínimo</th><th class="num">Precio</th><th class="num">Valor</th></tr></thead><tbody>
-    ${S.products.map((p) => `<tr data-n="${esc(norm(p.name + ' ' + (p.category || '')))}" data-id="${p.id}" class="${p.min_stock > 0 && p.stock < p.min_stock ? 'flag' : ''}">${ed ? `<td><input type="checkbox" data-sel ${p.prep_recipe_id ? 'disabled title="Las elaboraciones se gestionan en Carta"' : ''}></td>` : ''}<td>${esc(p.name)}<div class="small muted">${esc(p.supplier_name || '')}</div></td><td>${esc(p.category || '')}</td><td class="num ${p.stock < 0 ? 'txt-bad' : ''}">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)}</td><td class="num">${eur(p.price)}</td><td class="num">${eur(Math.max(p.stock, 0) * p.price)}</td></tr>`).join('') || `<tr><td colspan="${ed ? 7 : 6}" class="empty">No hay artículos</td></tr>`}
+    ${S.products.map((p) => `<tr data-n="${esc(norm(p.name + ' ' + (p.category || '')))}" data-c="${esc(p.category || 'Sin categoría')}" data-id="${p.id}" class="${p.min_stock > 0 && p.stock < p.min_stock ? 'flag' : ''}">${ed ? `<td><input type="checkbox" data-sel ${p.prep_recipe_id ? 'disabled title="Las elaboraciones se gestionan en Carta"' : ''}></td>` : ''}<td>${esc(p.name)}<div class="small muted">${esc(p.supplier_name || '')}</div></td><td>${esc(p.category || '')}</td><td class="num ${p.stock < 0 ? 'txt-bad' : ''}">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)}</td><td class="num">${eur(p.price)}</td><td class="num">${eur(Math.max(p.stock, 0) * p.price)}</td></tr>`).join('') || `<tr><td colspan="${ed ? 7 : 6}" class="empty">No hay artículos</td></tr>`}
     </tbody></table></div>
     <p class="small muted">Stock teórico = entradas − ventas según escandallo − mermas − consumo de personal ± ajustes de inventario. Un stock negativo suele indicar un albarán sin registrar o un escandallo con cantidades bajas.</p></div>`;
-  $('#search').oninput = () => { const s = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', s && !tr.dataset.n.includes(s))); };
+  let fcat = null;
+  const filtStock = () => {
+    const s = norm($('#search').value), c = fcat ? fcat() : '';
+    $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', !!((s && !tr.dataset.n.includes(s)) || (c && tr.dataset.c !== c))));
+    const ps = c ? S.products.filter((p) => (p.category || 'Sin categoría') === c) : S.products;
+    $('#valtot').textContent = `${c ? 'Valor ' + c : 'Valor total'}: ${eur(ps.reduce((a, p) => a + Math.max(p.stock, 0) * (p.price || 0), 0))}`;
+  };
+  fcat = bindCatChips(v, 'stock', filtStock); filtStock();
+  $('#search').oninput = filtStock;
   if (ed) {
     const visible = () => $$('tr[data-id]', v).filter((tr) => !tr.classList.contains('hidden') && !tr.classList.contains('fhide'));
     $('#all').onchange = () => visible().forEach((tr) => { const c = $('[data-sel]', tr); if (!c.disabled) c.checked = $('#all').checked; });
@@ -2265,11 +2294,14 @@ VIEWS.productos = async (v, id) => {
   if (id) return productoEdit(v, id);
   v.innerHTML = `<div class="row between"><h1>Existencias</h1><div class="row"><button id="imp">Importar Excel</button><a class="btn" href="#/productos/alergenos">🧠 Revisar alérgenos${S.products.filter((p) => !p.allergens_checked).length ? ` <span class="badge-count">${S.products.filter((p) => !p.allergens_checked).length}</span>` : ''}</a>${can('productos.editar') ? `<a class="btn" href="#/productos/repetidos">🔁 Repetidos${(() => { const n = dupGroups(S.products.filter((p) => !p.prep_recipe_id), (p) => [dupKey(p.name)]).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a>` : ''}<a class="btn" href="#/productos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/productos/nuevo">+ Nuevo artículo</a></div></div>
     <p class="small muted" style="margin-top:-6px">Existencias es todo lo que se compra a proveedores y se guarda en almacén: ingredientes, bebidas, limpieza… Lo que se vende está en <a href="#/escandallos">Carta</a>.</p>
-    <div class="card"><div class="field"><input id="search" placeholder="Buscar…"></div><div class="table-wrap"><table><thead><tr><th>Artículo</th><th>Categoría</th><th>Proveedor</th><th>Control</th><th>Formatos</th><th class="num">Precio</th><th class="num">Mínimo</th><th>Alérgenos</th></tr></thead><tbody>
-    ${S.products.map((p) => `<tr class="click" data-h="${p.prep_recipe_id ? '#/escandallos/' + p.prep_recipe_id : '#/productos/' + p.id}" data-n="${esc(norm(p.name + ' ' + (p.category || '') + ' ' + (p.supplier_name || '')))}"><td>${esc(p.name)}${p.prep_recipe_id ? ' <span class="pill">elaboración</span>' : ''}</td><td>${esc(p.category || '')}</td><td>${esc(p.supplier_name || '')}</td><td>${esc(p.unit)}</td><td class="small">${fmtsOf(p).map((f) => esc(f.name)).join(', ') || '<span class="muted">—</span>'}</td><td class="num">${eur(p.price)} / ${esc(p.unit)}</td><td class="num">${num(p.min_stock)}</td><td>${p.allergens_checked ? algIcons(splitList(p.allergens)) || '<span class="small muted">ninguno</span>' : '<span class="pill warn">sin revisar</span>'}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">Sin artículos. Impórtalos desde un Excel con tus tarifas de proveedor o créalos uno a uno.</td></tr>'}
+    <div class="card"><div class="field"><input id="search" placeholder="Buscar…"></div>${(() => { const cs = [...new Set(S.products.map((p) => p.category || 'Sin categoría'))].sort(collator.compare); return catChipsHtml(cs, Object.fromEntries(cs.map((c) => [c, S.products.filter((p) => (p.category || 'Sin categoría') === c).length]))); })()}<div class="table-wrap"><table><thead><tr><th>Artículo</th><th>Categoría</th><th>Proveedor</th><th>Control</th><th>Formatos</th><th class="num">Precio</th><th class="num">Mínimo</th><th>Alérgenos</th></tr></thead><tbody>
+    ${S.products.map((p) => `<tr class="click" data-c="${esc(p.category || 'Sin categoría')}" data-h="${p.prep_recipe_id ? '#/escandallos/' + p.prep_recipe_id : '#/productos/' + p.id}" data-n="${esc(norm(p.name + ' ' + (p.category || '') + ' ' + (p.supplier_name || '')))}"><td>${esc(p.name)}${p.prep_recipe_id ? ' <span class="pill">elaboración</span>' : ''}</td><td>${esc(p.category || '')}</td><td>${esc(p.supplier_name || '')}</td><td>${esc(p.unit)}</td><td class="small">${fmtsOf(p).map((f) => esc(f.name)).join(', ') || '<span class="muted">—</span>'}</td><td class="num">${eur(p.price)} / ${esc(p.unit)}</td><td class="num">${num(p.min_stock)}</td><td>${p.allergens_checked ? algIcons(splitList(p.allergens)) || '<span class="small muted">ninguno</span>' : '<span class="pill warn">sin revisar</span>'}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">Sin artículos. Impórtalos desde un Excel con tus tarifas de proveedor o créalos uno a uno.</td></tr>'}
     </tbody></table></div></div>`;
   bindRowLinks(v);
-  $('#search').oninput = () => { const s2 = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', s2 && !tr.dataset.n.includes(s2))); };
+  let fcatE = null;
+  const filtE = () => { const s2 = norm($('#search').value), c = fcatE ? fcatE() : ''; $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', !!((s2 && !tr.dataset.n.includes(s2)) || (c && tr.dataset.c !== c)))); };
+  fcatE = bindCatChips(v, 'existencias', filtE); filtE();
+  $('#search').oninput = filtE;
   $('#imp').onclick = () => importWizard({
     title: 'Importar existencias', sheetHint: ['articul', 'existencia', 'producto', 'catalogo'],
     help: 'Sube un Excel o CSV con tus artículos (por ejemplo, la tarifa de un proveedor). Los que ya existan con el mismo nombre se actualizan. Si la tarifa trae formato (Caja 24, Saco 25 kg…) indícalo y se crea el formato.',

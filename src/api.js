@@ -1471,6 +1471,28 @@ async function inventoryOpening([op, id], method, request, env, user, ctx) {
     ctx.audit = { action: 'inicio', entity: 'inventario', summary: 'Empieza el inventario de arranque' };
     return json(await openingState(env));
   }
+  // Rescatar artículos que el cierre puso a 0 por no estar contados: vuelven al stock que tenían justo antes del cierre
+  // (se borra su movimiento de regularización; lo que haya pasado después —ventas, albaranes, otros inventarios— se respeta)
+  if (op === 'restore' && method === 'POST') {
+    need(user, 'super');
+    const d = await body(request);
+    const inv = await env.DB.prepare('SELECT id FROM inventories WHERE id = ? AND notes = ?').bind(Number(d.inventory_id), 'Regularización: inventario de arranque').first();
+    if (!inv) throw new HttpError(404, 'No encuentro esa regularización del inventario de arranque');
+    const ids = [...new Set((d.product_ids || []).map(Number).filter(Boolean))];
+    if (!ids.length) throw new HttpError(400, 'No has indicado artículos');
+    const stmts = [];
+    for (let i = 0; i < ids.length; i += 90) {
+      const part = ids.slice(i, i + 90), q = part.map(() => '?').join(',');
+      stmts.push(
+        env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'stock_inicial' AND ref_id = ? AND product_id IN (${q})
+          AND product_id IN (SELECT product_id FROM inventory_lines WHERE inventory_id = ? AND detail = 'no contado → 0')`).bind(inv.id, ...part, inv.id),
+        env.DB.prepare(`UPDATE inventory_lines SET counted = expected, detail = 'recuperado: stock de antes del cierre' WHERE inventory_id = ? AND detail = 'no contado → 0' AND product_id IN (${q})`).bind(inv.id, ...part));
+    }
+    const res = await env.DB.batch(stmts);
+    const n = res.filter((_, i) => i % 2 === 1).reduce((a, r) => a + (r.meta?.changes || 0), 0);
+    ctx.audit = { action: 'corrección', entity: 'inventario', id: inv.id, summary: `Inventario de arranque: ${n} artículos puestos a 0 vuelven al stock que tenían antes del cierre` };
+    return json({ ok: true, restored: n });
+  }
   if (!st.active) throw new HttpError(400, 'No hay ningún inventario de arranque en marcha. Lo empieza el responsable desde Stock → Hacer inventario.');
   if (op === 'part' && method === 'POST') {
     const d = await body(request);

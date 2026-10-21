@@ -327,3 +327,10 @@ button.ghost { background: none; border: none; box-shadow: none; padding: 2px 4p
 .evchip.st-reservado { background: var(--warn-bg); color: var(--warn); }
 .evchip.st-cancelado { text-decoration: line-through; opacity: .6; }
 @media (max-width: 640px) { .evday { min-height: 58px; } .evchip { font-size: .75rem; padding: 1px 3px; text-align: center; } .evchip .evt { display: none; } .evd .small { display: none; } .evtime { min-width: 60px; } }
+
+/* filtro rápido por categoría (botones que se tocan bien en el móvil) */
+.chips { display: flex; gap: 6px; overflow-x: auto; width: 0; min-width: 100%; max-width: 100%; padding: 2px 0 8px; margin: 4px 0 6px; scrollbar-width: thin; -webkit-overflow-scrolling: touch; }
+.chip { flex: 0 0 auto; padding: 7px 12px; border-radius: 99px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text); font-weight: 600; font-size: .88rem; cursor: pointer; white-space: nowrap; }
+.chip.on { background: var(--brand); color: var(--brand-ink); border-color: var(--brand); }
+.chip .chip-n { font-weight: 500; opacity: .75; margin-left: 2px; }
+@media (min-width: 900px) { .chips { flex-wrap: wrap; overflow: visible; } }
