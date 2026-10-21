@@ -10,6 +10,7 @@ const num = (n, d = 2) => (Number(n) || 0).toLocaleString('es-ES', { maximumFrac
 const pct = (n) => (n === null || n === undefined || isNaN(n) ? '—' : num(n, 1) + ' %');
 const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
 const today = () => iso(new Date());
+const cap1st = (t) => String(t).charAt(0).toUpperCase() + String(t).slice(1);
 const fdate = (s) => (s ? new Date(String(s).slice(0, 10) + 'T12:00:00').toLocaleDateString('es-ES', { day: '2-digit', month: 'short', year: '2-digit' }) : '');
 const parseNum = (v) => {
   if (typeof v === 'number') return v;
@@ -228,29 +229,36 @@ function renderLogin() {
 }
 
 // ---------------- estructura y navegación ----------------
-const NAV = [
-  { r: 'inicio', t: 'Inicio', i: '🏠', need: [] },
-  { r: 'panel', t: 'Panel de control', i: '📈', need: ['panel.ver'] },
-  { r: 'informes', t: 'Informes', i: '🗂️', need: ['informes.ver'] },
-  { r: 'caja', t: 'Caja del día', i: '💶', need: ['caja.registrar', 'caja.ver'] },
-  { r: 'appcc', t: 'APPCC', i: '🧊', need: ['appcc.registrar', 'appcc.gestionar'] },
-  { sep: true },
-  { r: 'pedidos', t: 'Pedidos', i: '📝', need: ['pedidos.ver', 'pedidos.crear'] },
-  { r: 'recepcion', t: 'Recepción', i: '📦', need: ['recepcion.ver', 'recepcion.crear'] },
-  { r: 'mermas', t: 'Mermas y personal', i: '🗑️', need: ['mermas.registrar', 'mermas.ver_todas'] },
-  { r: 'stock', t: 'Stock e inventario', i: '📊', need: ['stock.ver', 'inventario.hacer'] },
-  { r: 'escandallos', t: 'Carta y escandallos', i: '🍽️', need: ['escandallos.ver', 'escandallos.editar'] },
-  { sep: true },
-  { r: 'ventas', t: 'Ventas Qamarero', i: '🧾', need: ['ventas.gestionar'] },
-  { r: 'gastos', t: 'Gastos fijos', i: '🏷️', need: ['gastos.gestionar'] },
-  { r: 'productos', t: 'Existencias', i: '🥕', need: ['productos.editar'] },
-  { r: 'proveedores', t: 'Proveedores', i: '🚚', need: ['productos.editar'] },
-  { sep: true },
-  { r: 'usuarios', t: 'Usuarios y permisos', i: '👥', need: ['super'] },
-  { r: 'actividad', t: 'Registro de actividad', i: '🕵️', need: ['super'] },
-  { r: 'copias', t: 'Copias de seguridad', i: '💾', need: ['super'] },
-  { r: 'ajustes', t: 'Ajustes', i: '⚙️', need: ['super'] },
+// Zonas del restaurante: cada una con su color, que se ve en el menú, en Inicio y en la cabecera de cada pantalla
+const GROUPS = [
+  { g: 'dia', t: 'Día a día' },
+  { g: 'compras', t: 'Compras y almacén' },
+  { g: 'cocina', t: 'Cocina y carta' },
+  { g: 'equipo', t: 'Equipo' },
+  { g: 'numeros', t: 'Números' },
+  { g: 'admin', t: 'Administración' },
 ];
+const NAV = [
+  { r: 'inicio', t: 'Inicio', i: '🏠', need: [], d: 'Lo que tienes pendiente hoy y accesos directos a todo.' },
+  { r: 'caja', g: 'dia', t: 'Caja del día', i: '💶', need: ['caja.registrar', 'caja.ver'], d: 'Cuenta la caja al cerrar y compárala con Qamarero.' },
+  { r: 'appcc', g: 'dia', t: 'APPCC', i: '🧊', need: ['appcc.registrar', 'appcc.gestionar'], d: 'Temperaturas de cámaras, limpieza y tareas de higiene.' },
+  { r: 'mermas', g: 'dia', t: 'Mermas y personal', i: '🗑️', need: ['mermas.registrar', 'mermas.ver_todas'], d: 'Apunta lo que se tira y lo que come el personal.' },
+  { r: 'pedidos', g: 'compras', t: 'Pedidos', i: '📝', need: ['pedidos.ver', 'pedidos.crear'], d: 'Pide a los proveedores. La app te sugiere qué pedir.' },
+  { r: 'recepcion', g: 'compras', t: 'Recepción', i: '📦', need: ['recepcion.ver', 'recepcion.crear'], d: 'Apunta lo que llega: escanea el albarán o la factura.' },
+  { r: 'stock', g: 'compras', t: 'Stock e inventario', i: '📊', need: ['stock.ver', 'inventario.hacer'], d: 'Cuánto hay de cada cosa y el recuento de inventario.' },
+  { r: 'productos', g: 'compras', t: 'Existencias', i: '🥕', need: ['productos.editar'], d: 'La lista de artículos: unidades, precios, formatos y mínimos.' },
+  { r: 'proveedores', g: 'compras', t: 'Proveedores', i: '🚚', need: ['productos.editar'], d: 'Datos de contacto y días de pedido de cada proveedor.' },
+  { r: 'escandallos', g: 'cocina', t: 'Carta y escandallos', i: '🍽️', need: ['escandallos.ver', 'escandallos.editar'], d: 'Platos, fichas técnicas, coste por ración y alérgenos.' },
+  { r: 'panel', g: 'numeros', t: 'Panel de control', i: '📈', need: ['panel.ver'], d: 'Ventas, food cost, mermas y resultado del periodo.' },
+  { r: 'informes', g: 'numeros', t: 'Informes', i: '🗂️', need: ['informes.ver'], d: 'Informes listos para imprimir o enviar.' },
+  { r: 'ventas', g: 'numeros', t: 'Ventas Qamarero', i: '🧾', need: ['ventas.gestionar'], d: 'Importa las ventas del TPV para descontar el stock.' },
+  { r: 'gastos', g: 'numeros', t: 'Gastos fijos', i: '🏷️', need: ['gastos.gestionar'], d: 'Alquiler, luz, sueldos y demás gastos de cada mes.' },
+  { r: 'usuarios', g: 'admin', t: 'Usuarios y permisos', i: '👥', need: ['super'], d: 'Quién entra en la app y qué puede ver y hacer.' },
+  { r: 'actividad', g: 'admin', t: 'Registro de actividad', i: '🕵️', need: ['super'], d: 'Quién ha hecho cada cambio y cuándo.' },
+  { r: 'copias', g: 'admin', t: 'Copias de seguridad', i: '💾', need: ['super'], d: 'Descarga o restaura una copia de todos los datos.' },
+  { r: 'ajustes', g: 'admin', t: 'Ajustes', i: '⚙️', need: ['super'], d: 'Datos del restaurante, IVA, objetivos y conexiones.' },
+];
+const groupOf = (n) => GROUPS.find((x) => x.g === n?.g);
 function setAlertBadge(al) {
   const a = $('#side a[data-r="inicio"]'); if (!a) return;
   a.querySelector('.badge-count')?.remove();
@@ -258,22 +266,34 @@ function setAlertBadge(al) {
   if (n) a.insertAdjacentHTML('beforeend', `<span class="badge-count" title="Avisos">${n}</span>`);
 }
 const allowed = (n) => (!n.when || n.when()) && (!n.need || !n.need.length || n.need.some((p) => (p === 'super' ? S.user?.is_super : can(p))));
-// separadores solo entre grupos con algo visible
-const visibleNav = () => NAV.filter((n, i) => (n.sep ? NAV.slice(i + 1).some((x) => !x.sep && allowed(x)) && NAV.slice(0, i).some((x) => !x.sep && allowed(x)) && !NAV[i + 1]?.sep : allowed(n)));
+// menú agrupado por zonas; solo las zonas con algo que este usuario pueda ver
+const visibleGroups = () => GROUPS.map((g) => ({ ...g, items: NAV.filter((n) => n.g === g.g && allowed(n)) })).filter((g) => g.items.length);
+// barra de abajo en el móvil: Inicio, lo más usado que pueda hacer este usuario y el menú
+const BOTTOM = ['recepcion', 'mermas', 'stock', 'caja', 'pedidos', 'mihorario', 'turnos', 'escandallos', 'panel'];
 
 function renderShell() {
+  const home = NAV[0];
+  const bottom = BOTTOM.map((r) => NAV.find((n) => n.r === r)).filter((n) => n && allowed(n)).slice(0, 3);
   $('#app').innerHTML = `<div class="shell" id="shell">
-    <nav class="side" id="side">
-      <div class="brand">${esc(S.settings.restaurant_name)}<small>Control de consumo</small></div>
-      ${visibleNav().map((n) => (n.sep ? '<div class="sep"></div>' : `<a href="#/${n.r}" data-r="${n.r}"><span>${n.i}</span>${esc(n.t)}</a>`)).join('')}
-      <div class="sep"></div>
-      <div class="who">${esc(S.user.name)}${S.user.is_super ? ' · Superusuario' : ''}<br><button class="sm" id="logout">Salir</button></div>
+    <nav class="side" id="side" aria-label="Menú">
+      <div class="brand"><span class="logo" aria-hidden="true">🧺</span><div>${esc(S.settings.restaurant_name)}<small>Gestión del restaurante</small></div></div>
+      <a href="#/inicio" data-r="inicio" class="home"><span class="ic">${home.i}</span><span class="tx">Inicio</span></a>
+      ${visibleGroups().map((g) => `<div class="grp g-${g.g}"><div class="gt">${esc(g.t)}</div>
+        ${g.items.map((n) => `<a href="#/${n.r}" data-r="${n.r}"><span class="ic">${n.i}</span><span class="tx">${esc(n.t)}</span></a>`).join('')}</div>`).join('')}
+      <div class="who"><span class="av" aria-hidden="true">${esc((S.user.name || '?').trim()[0].toUpperCase())}</span><div><b>${esc(S.user.name)}</b>${S.user.is_super ? '<small>Dirección</small>' : ''}</div><button class="sm" id="logout">Salir</button></div>
     </nav>
-    <div>
-      <div class="topbar"><button id="menu" aria-label="Menú">☰</button><span class="t" id="ttl"></span></div>
+    <div class="content">
+      <div class="topbar"><button id="menu" aria-label="Abrir el menú">☰</button><span class="t" id="ttl"></span></div>
+      <div class="crumb" id="crumb"></div>
       <main class="main" id="view"></main>
-    </div></div>`;
-  $('#menu').onclick = () => $('#shell').classList.toggle('nav-open');
+    </div>
+    <nav class="bottombar" aria-label="Accesos rápidos">
+      <a href="#/inicio" data-r="inicio"><span>🏠</span>Inicio</a>
+      ${bottom.map((n) => `<a href="#/${n.r}" data-r="${n.r}" class="g-${n.g}"><span>${n.i}</span>${esc(n.t.split(' ')[0])}</a>`).join('')}
+      <a href="#" id="menu2"><span>☰</span>Menú</a>
+    </nav></div>`;
+  const toggle = (e) => { e.preventDefault(); $('#shell').classList.toggle('nav-open'); };
+  $('#menu').onclick = toggle; $('#menu2').onclick = toggle;
   $('#side').onclick = (e) => { if (e.target.closest('a')) $('#shell').classList.remove('nav-open'); };
   $('#shell').addEventListener('click', (e) => { if (e.target.id === 'shell') $('#shell').classList.remove('nav-open'); });
   api('alerts').then(setAlertBadge).catch(() => {});
@@ -294,8 +314,12 @@ async function route() {
   const q = new URLSearchParams(qs || '');
   const nav = NAV.find((n) => n.r === r);
   if (!nav || !allowed(nav)) { location.hash = '#/inicio'; return; }
-  $$('#side a').forEach((a) => a.classList.toggle('active', a.dataset.r === r));
+  $$('#side a, .bottombar a').forEach((a) => a.classList.toggle('active', a.dataset.r === r));
   $('#ttl').textContent = nav.t;
+  // dónde estás y para qué sirve esta pantalla, con el color de su zona
+  const grp = groupOf(nav);
+  $('#shell').dataset.g = nav.g || 'inicio';
+  $('#crumb').innerHTML = r === 'inicio' ? '' : `<span class="cg">${grp ? esc(grp.t) : ''}</span><span class="cn">${nav.i} ${esc(nav.t)}</span>${nav.d ? `<span class="cd">${esc(nav.d)}</span>` : ''}`;
   const old = $('#view'), view = old.cloneNode(false);
   old.replaceWith(view);
   view.innerHTML = '<div class="boot">Cargando…</div>';
@@ -445,37 +469,53 @@ function consumptionBar(d) {
 
 VIEWS.inicio = async (v) => {
   await reload();
+  // accesos directos por zonas, con una línea que dice para qué sirve cada uno
   const acts = [
-    ['recepcion.crear', '#/recepcion/nueva?scan=1', '📷', 'Escanear albarán'],
-    ['recepcion.crear', '#/recepcion/nueva', '📦', 'Recibir mercancía'],
-    ['pedidos.crear', '#/pedidos/sugeridos', '✨', 'Pedidos sugeridos'],
-    ['pedidos.crear', '#/pedidos/nuevo', '📝', 'Hacer pedido'],
-    ['mermas.registrar', '#/mermas', '🗑️', 'Registrar merma'],
-    ['mermas.registrar', '#/mermas?tipo=consumo_personal', '🍴', 'Comida de personal'],
-    ['caja.registrar', '#/caja', '💶', 'Cerrar caja'],
-    ['appcc.registrar', '#/appcc', '🧊', 'Temperaturas y limpieza'],
-    ['turnos.gestionar', '#/turnos', '🗓️', 'Cuadrante de turnos'],
-    ['eventos.gestionar', '#/eventos/nuevo', '🎉', 'Apuntar evento'],
-    ['inventario.hacer', '#/stock?tab=inventario', '📋', 'Hacer inventario'],
-    ['escandallos.ver', '#/escandallos', '🍽️', 'Fichas técnicas'],
-    ['panel.ver', '#/panel', '📈', 'Panel de control'],
-    ['informes.ver', '#/informes', '🗂️', 'Informes'],
-  ].filter(([p]) => can(p));
+    ['dia', 'caja.registrar', '#/caja', '💶', 'Cerrar caja', 'Cuenta el cajón al final del turno'],
+    ['dia', 'appcc.registrar', '#/appcc', '🧊', 'Temperaturas y limpieza', 'Las anotaciones de higiene del día'],
+    ['dia', 'mermas.registrar', '#/mermas', '🗑️', 'Registrar merma', 'Algo se ha roto, caducado o tirado'],
+    ['dia', 'mermas.registrar', '#/mermas?tipo=consumo_personal', '🍴', 'Comida de personal', 'Lo que come o bebe el equipo'],
+    ['dia', 'eventos.gestionar', '#/eventos/nuevo', '🎉', 'Apuntar evento', 'Una reserva de grupo nueva'],
+    ['dia', '!eventos.gestionar|eventos.ver', '#/eventos', '🎉', 'Próximos eventos', 'Grupos y celebraciones que vienen'],
+    ['compras', 'recepcion.crear', '#/recepcion/nueva?scan=1', '📷', 'Escanear albarán', 'Haz una foto y se rellena solo'],
+    ['compras', 'recepcion.crear', '#/recepcion/nueva', '📦', 'Recibir mercancía', 'Apuntar a mano lo que ha llegado'],
+    ['compras', 'pedidos.crear', '#/pedidos/sugeridos', '✨', 'Pedidos sugeridos', 'Lo que hace falta pedir, ya calculado'],
+    ['compras', 'pedidos.crear', '#/pedidos/nuevo', '📝', 'Hacer pedido', 'Un pedido a un proveedor'],
+    ['compras', 'inventario.hacer', '#/stock?tab=inventario', '📋', 'Hacer inventario', 'Contar lo que hay en cámaras y almacén'],
+    ['compras', 'stock.ver', '#/stock', '📊', 'Ver stock', 'Cuánto queda de cada artículo'],
+    ['cocina', 'escandallos.ver', '#/escandallos', '🍽️', 'Fichas técnicas', 'Recetas, costes y alérgenos'],
+    ['equipo', '@me_staff', '#/mihorario', '⏰', 'Mi horario', 'Cuándo te toca trabajar'],
+    ['equipo', 'turnos.gestionar', '#/turnos', '🗓️', 'Cuadrante de turnos', 'Organiza la semana del equipo'],
+    ['numeros', 'panel.ver', '#/panel', '📈', 'Panel de control', 'Cómo va el mes en números'],
+    ['numeros', 'informes.ver', '#/informes', '🗂️', 'Informes', 'Para imprimir o enviar'],
+  ].filter(([, p]) => (p === '@me_staff' ? !!S.me_staff : p.startsWith('!') ? !can(p.slice(1).split('|')[0]) && can(p.split('|')[1]) : can(p)));
+  const tiles = GROUPS.map((g) => ({ ...g, items: acts.filter((x) => x[0] === g.g) })).filter((g) => g.items.length);
   const low = canAny('stock.ver', 'pedidos.crear') ? S.products.filter((p) => p.min_stock > 0 && p.stock < p.min_stock) : [];
   let kp = '';
   if (can('panel.ver')) {
     const now = new Date();
     const d = await api(`dashboard?from=${iso(new Date(now.getFullYear(), now.getMonth(), 1))}&to=${today()}`).catch(() => null);
-    if (d) kp = `<h3 style="margin-top:20px">Este mes</h3><div class="grid k">${kpi('Ventas sin IVA', eur(d.revenue), '')}${kpi('Food cost real', pct(d.food_cost_real), `Objetivo ${num(d.settings.food_cost_target)} %`, d.food_cost_real > d.settings.food_cost_target + 3 ? 'bad' : '')}${kpi('Mermas + personal', eur(d.waste + d.staff), '')}${kpi('Resultado estimado', eur(d.result), '', d.result < 0 ? 'bad' : 'good')}</div>
+    if (d) kp = `<h2 class="todo">Este mes</h2><div class="grid k">${kpi('Ventas sin IVA', eur(d.revenue), '')}${kpi('Food cost real', pct(d.food_cost_real), `Objetivo ${num(d.settings.food_cost_target)} %`, d.food_cost_real > d.settings.food_cost_target + 3 ? 'bad' : '')}${kpi('Mermas + personal', eur(d.waste + d.staff), '')}${kpi('Resultado estimado', eur(d.result), '', d.result < 0 ? 'bad' : 'good')}</div>
       ${d.pending_pos ? `<div class="card" style="margin-top:12px;border-color:var(--accent)"><b>${d.pending_pos} nombre(s) de Qamarero sin vincular.</b> <a href="#/ventas?tab=pendientes">Vincular →</a></div>` : ''}`;
   }
   const al = await api('alerts').catch(() => []);
   setAlertBadge(al);
-  const alertsCard = al.length ? `<div class="card alerts"><h3>Avisos</h3>${al.map((x) => `<a class="alert ${x.level}" href="${x.link}"><span>${x.icon}</span><span>${esc(x.text)}</span><span class="muted">›</span></a>`).join('')}</div>` : '<div class="card small muted">✓ Sin avisos. Todo en orden.</div>';
-  v.innerHTML = `<h1>Hola, ${esc(S.user.name.split(' ')[0])}</h1>${S.me_staff ? '<div id="today-shift"></div>' : ''}<div id="pushc"></div>${alertsCard}
-    ${acts.length ? `<div class="quick">${acts.map(([, h, i, t]) => `<a href="${h}"><span>${i}</span>${esc(t)}</a>`).join('')}</div>` : '<div class="card">Todavía no tienes permisos asignados. Pídeselos al responsable.</div>'}
+  const urgent = al.filter((x) => x.level !== 'info');
+  const alertsCard = al.length ? `<section class="alerts"><h2>${urgent.length ? `Pendiente (${urgent.length})` : 'Para hoy'}</h2>
+      ${al.map((x, i) => `<a class="alert ${x.level} ${i >= 4 ? 'more hidden' : ''}" href="${x.link}"><span class="ai">${x.icon}</span><span>${esc(x.text)}</span><span class="go">›</span></a>`).join('')}
+      ${al.length > 4 ? `<button class="ghost seeall" id="seeall">Ver los ${al.length} avisos</button>` : ''}</section>`
+    : '<section class="alerts ok"><span class="ai">✓</span> Todo en orden: no hay nada pendiente.</section>';
+  const hour = new Date().getHours();
+  const hello = hour < 6 ? 'Buenas noches' : hour < 14 ? 'Buenos días' : hour < 21 ? 'Buenas tardes' : 'Buenas noches';
+  const day = cap1st(new Date().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' }));
+  v.innerHTML = `<header class="hello"><h1>${hello}, ${esc(S.user.name.split(' ')[0])}</h1><p>${day}</p></header>
+    ${S.me_staff ? '<div id="today-shift"></div>' : ''}<div id="pushc"></div>${alertsCard}
+    ${tiles.length ? `<h2 class="todo">¿Qué vas a hacer?</h2>${tiles.map((g) => `<section class="stall g-${g.g}"><h3>${esc(g.t)}</h3><div class="tiles">
+        ${g.items.map(([, , h, i, t, hint]) => `<a class="tile" href="${h}"><span class="ti">${i}</span><span class="tt">${esc(t)}</span><span class="th">${esc(hint)}</span></a>`).join('')}</div></section>`).join('')}`
+      : '<div class="card">Todavía no tienes permisos asignados. Pídeselos al responsable.</div>'}
     ${kp}
     ${low.length ? `<div style="margin-top:16px">${tableCard('Bajo stock mínimo', low, ['Artículo', 'Stock', 'Mínimo'], (r) => [esc(r.name), `<span class="txt-bad">${stockText(r, r.stock)}</span>`, `${num(r.min_stock)} ${esc(r.unit)}`], '')}</div>` : ''}`;
+  const sa = $('#seeall', v); if (sa) sa.onclick = () => { $$('.alert.more', v).forEach((x) => x.classList.remove('hidden')); sa.remove(); };
   if (S.me_staff) todayShiftCard($('#today-shift'));
   if (S.me_staff || can('pedidos.aprobar') || can('pedidos.crear') || can('turnos.gestionar'))
     pushCard($('#pushc'), S.me_staff ? 'Tu horario cuando se publique o cambie, recordatorio la tarde antes' + (can('pedidos.aprobar') ? ' y los pedidos por aprobar.' : ' y la respuesta a tus pedidos.') : can('pedidos.aprobar') ? 'Te suena el móvil cuando haya un pedido por aprobar.' : 'Te avisamos cuando aprueben o rechacen tus pedidos.');

@@ -18,7 +18,7 @@ const evHours = (e) => (e.start_time ? e.start_time + (e.end_time ? '–' + e.en
 const evPeople = (e) => `${e.people} pers.${e.kids ? ` (${e.kids} niños)` : ''}`;
 const evActive = (e) => e.status !== 'cancelado';
 
-NAV.splice(NAV.findIndex((n) => n.r === 'turnos') + 1, 0, { r: 'eventos', t: 'Eventos', i: '🎉', need: ['eventos.ver', 'eventos.gestionar'] });
+NAV.push({ r: 'eventos', g: 'dia', t: 'Eventos y grupos', i: '🎉', need: ['eventos.ver', 'eventos.gestionar'], d: 'Reservas de grupos: comuniones, comidas de empresa, cumpleaños…' });
 PERM_GROUPS.splice(PERM_GROUPS.findIndex((g) => g[0] === 'Turnos') + 1, 0,
   ['Eventos', [['eventos.ver', 'Ver la agenda de eventos y grupos (sin precios ni señales)'], ['eventos.gestionar', 'Apuntar, cambiar y cancelar eventos; ver precios y señales']]]);
 

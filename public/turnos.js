@@ -429,6 +429,6 @@ async function renderPublic(token) {
 }
 
 // ---------------- enganches con la app ----------------
-NAV.splice(NAV.findIndex((n) => n.r === 'appcc') + 1, 0,
-  { r: 'turnos', t: 'Turnos', i: '🗓️', need: ['turnos.ver', 'turnos.gestionar'] },
-  { r: 'mihorario', t: 'Mi horario', i: '⏰', need: [], when: () => !!S.me_staff });
+NAV.push(
+  { r: 'turnos', g: 'equipo', t: 'Turnos', i: '🗓️', need: ['turnos.ver', 'turnos.gestionar'], d: 'El cuadrante de la semana de todo el equipo.' },
+  { r: 'mihorario', g: 'equipo', t: 'Mi horario', i: '⏰', need: [], when: () => !!S.me_staff, d: 'Tus turnos de esta semana y las siguientes.' });
