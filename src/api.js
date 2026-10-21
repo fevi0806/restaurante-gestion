@@ -1507,11 +1507,11 @@ async function inventoryOpening([op, id], method, request, env, user, ctx) {
     if (done.n) return json({ ok: true, already: true, items: [] });
     const { results: items } = await env.DB.prepare(`
       SELECT m.product_id, p.name, p.unit, COALESCE(p.price, 0) AS price, ROUND(SUM(m.qty), 4) AS q, l.detail, GROUP_CONCAT(DISTINCT m.ref_id) AS receipts
-      FROM movements m JOIN products p ON p.id = m.product_id
+      FROM movements m JOIN products p ON p.id = m.product_id JOIN receipts r ON r.id = m.ref_id
       JOIN inventory_lines l ON l.inventory_id = ?1 AND l.product_id = m.product_id
       LEFT JOIN (SELECT il.product_id, MAX(i.created_at) AS last_at FROM inventory_lines il JOIN inventories i ON i.id = il.inventory_id
                  WHERE i.notes LIKE '${OPEN_TAG}%' AND i.created_at > ?2 AND i.created_at < ?3 GROUP BY il.product_id) c ON c.product_id = m.product_id
-      WHERE m.ref_type = 'albaran' AND m.created_at > COALESCE(c.last_at, ?2) AND m.created_at <= ?3
+      WHERE m.ref_type = 'albaran' AND COALESCE(r.notes, '') NOT LIKE 'Importada de Excel%' AND m.created_at > COALESCE(c.last_at, ?2) AND m.created_at <= ?3
         AND l.detail NOT LIKE 'recuperado%' AND l.detail NOT LIKE '%recibido%'
       GROUP BY m.product_id HAVING ABS(SUM(m.qty)) > 0.0001 ORDER BY p.name`).bind(R.id, from, R.created_at).all();
     if (d.dry || !items.length) return json({ ok: true, dry: !!d.dry, regularization: R.id, items });
@@ -1565,8 +1565,9 @@ async function inventoryOpening([op, id], method, request, env, user, ctx) {
       FROM inventory_lines l JOIN inventories i ON i.id = l.inventory_id WHERE i.notes LIKE '${OPEN_TAG}%' AND i.created_at >= ?1 GROUP BY l.product_id`;
     // Lo que se recibe con albarán mientras dura el inventario (después de contar ese artículo, o sin que nadie lo cuente)
     // no estaba en el recuento: se suma, para que el cierre no lo borre.
-    const LATE = `SELECT m.product_id, ROUND(SUM(m.qty), 4) AS q FROM movements m LEFT JOIN (${COUNTS}) c2 ON c2.product_id = m.product_id
-      WHERE m.ref_type = 'albaran' AND m.created_at > COALESCE(c2.last_at, ?1) GROUP BY m.product_id`;
+    // (las facturas antiguas importadas de Excel no cuentan: son historial y no cambian el stock)
+    const LATE = `SELECT m.product_id, ROUND(SUM(m.qty), 4) AS q FROM movements m JOIN receipts r ON r.id = m.ref_id LEFT JOIN (${COUNTS}) c2 ON c2.product_id = m.product_id
+      WHERE m.ref_type = 'albaran' AND COALESCE(r.notes, '') NOT LIKE 'Importada de Excel%' AND m.created_at > COALESCE(c2.last_at, ?1) GROUP BY m.product_id`;
     // cierres anteriores que se cortaron a medias: se deshacen (sus movimientos se borran y el stock vuelve atrás) antes de repetir
     const { results: stale } = await env.DB.prepare('SELECT id FROM inventories WHERE notes = ? AND created_at >= ?').bind(NOTE, st.since).all();
     const invId = ((await env.DB.prepare('SELECT MAX(id) AS m FROM inventories').first())?.m || 0) + 1;
