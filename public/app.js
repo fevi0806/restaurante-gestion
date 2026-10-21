@@ -514,7 +514,7 @@ VIEWS.inicio = async (v) => {
         ${g.items.map(([, , h, i, t, hint]) => `<a class="tile" href="${h}"><span class="ti">${i}</span><span class="tt">${esc(t)}</span><span class="th">${esc(hint)}</span></a>`).join('')}</div></section>`).join('')}`
       : '<div class="card">Todavía no tienes permisos asignados. Pídeselos al responsable.</div>'}
     ${kp}
-    ${low.length ? `<div style="margin-top:16px">${tableCard('Bajo stock mínimo', low, ['Artículo', 'Stock', 'Mínimo'], (r) => [esc(r.name), `<span class="txt-bad">${stockText(r, r.stock)}</span>`, `${num(r.min_stock)} ${esc(r.unit)}`], '')}</div>` : ''}`;
+    ${low.length ? `<div style="margin-top:16px">${tableCard('Bajo stock mínimo', low, ['Artículo', 'Proveedor', 'Hay', 'Mínimo'], (r) => [esc(r.name), esc(r.supplier_name || 'sin proveedor'), `<span class="txt-bad">${stockText(r, r.stock)}</span>`, `${num(r.min_stock)} ${esc(r.unit)}`], '')}${can('pedidos.crear') ? '<div class="row" style="justify-content:flex-end;margin-top:-6px"><a class="btn primary" href="#/pedidos/minimos">Pedir lo que falta</a></div>' : ''}</div>` : ''}`;
   const sa = $('#seeall', v); if (sa) sa.onclick = () => { $$('.alert.more', v).forEach((x) => x.classList.remove('hidden')); sa.remove(); };
   if (S.me_staff) todayShiftCard($('#today-shift'));
   if (S.me_staff || can('pedidos.aprobar') || can('pedidos.crear') || can('turnos.gestionar'))
@@ -620,11 +620,13 @@ async function pedidosSugeridos(v) {
 
 VIEWS.pedidos = async (v, id, q) => {
   if (id === 'sugeridos') return pedidosSugeridos(v);
-  if (id === 'nuevo') return pedidoNuevo(v);
+  if (id === 'minimos') return pedidosMinimos(v);
+  if (id === 'nuevo') return pedidoNuevo(v, null, q);
   if (id && q?.get('editar')) { await reload(); const o = await api('orders/' + id); if (!o.can_edit) throw new Error('Este pedido ya no se puede cambiar'); return pedidoNuevo(v, o); }
   if (id) return pedidoDetalle(v, id, q);
+  await reload();
   const list = await api('orders');
-  v.innerHTML = `<div class="row between"><h1>Pedidos a proveedores</h1><div class="row">${can('pedidos.crear') ? '<a class="btn primary" href="#/pedidos/sugeridos">✨ Pedidos sugeridos</a>' : ''}<a class="btn" href="#/pedidos/nuevo">+ Nuevo pedido</a></div></div>
+  v.innerHTML = `<div class="row between"><h1>Pedidos a proveedores</h1><div class="row">${(() => { const n = belowMin().length; return n && can('pedidos.crear') ? `<a class="btn" href="#/pedidos/minimos">⚠️ Bajo mínimo <span class="badge-count">${n}</span></a>` : ''; })()}${can('pedidos.crear') ? '<a class="btn primary" href="#/pedidos/sugeridos">✨ Pedidos sugeridos</a>' : ''}<a class="btn" href="#/pedidos/nuevo">+ Nuevo pedido</a></div></div>
     <div class="card">${list.length ? `<div class="table-wrap"><table><thead><tr><th>Nº</th><th>Fecha</th><th>Proveedor</th><th>Estado</th><th class="num">Líneas</th><th class="num">Importe est.</th></tr></thead><tbody>
     ${list.map((o) => `<tr class="click" data-h="#/pedidos/${o.id}"><td>#${o.id}</td><td>${fdate(o.order_date)}</td><td>${esc(o.supplier_name)}</td><td><span class="${ST_PILL[o.status]}">${ST_NAME[o.status] || o.status}</span></td><td class="num">${o.n_lines}</td><td class="num">${eur(o.total)}</td></tr>`).join('')}
     </tbody></table></div>` : '<div class="empty">Todavía no hay pedidos.</div>'}</div>`;
@@ -632,7 +634,74 @@ VIEWS.pedidos = async (v, id, q) => {
 };
 const bindRowLinks = (el) => $$('tr[data-h]', el).forEach((tr) => (tr.onclick = () => go(tr.dataset.h)));
 
-async function pedidoNuevo(v, existing) {
+// ---------- Bajo mínimo: qué falta y a quién pedírselo ----------
+const belowMin = () => S.products.filter((p) => p.min_stock > 0 && p.stock < p.min_stock && !p.prep_recipe_id);
+// cantidad para volver al mínimo, en el formato de compra (cajas enteras, o la unidad redondeada)
+function qtyToMin(p, u) {
+  const need = Math.max(p.min_stock - Math.max(p.stock, 0), 0), f = unitFactor(p, u);
+  return f > 1 || u.startsWith('f:') ? Math.max(Math.ceil(need / f - 1e-9), 1) : Math.ceil((need / f) * 100) / 100;
+}
+async function pedidosMinimos(v) {
+  if (!can('pedidos.crear')) throw new Error('No tienes permiso para hacer pedidos');
+  await reload();
+  const approver = can('pedidos.aprobar');
+  const items = belowMin();
+  const open = await api('orders').catch(() => []);
+  const groups = {};
+  items.forEach((p) => { const k = p.supplier_id || 0; (groups[k] = groups[k] || []).push(p); });
+  const sups = Object.keys(groups).map(Number).sort((a, b) => (a === 0) - (b === 0) || collator.compare(S.suppliers.find((x) => x.id === a)?.name || '', S.suppliers.find((x) => x.id === b)?.name || ''));
+  const state = {}; // product_id -> { on, qty, unit }
+  items.forEach((p) => { const u = defaultBuyUnit(p); state[p.id] = { on: true, qty: qtyToMin(p, u), unit: u }; });
+  const done = {};
+  const card = (sid) => {
+    const ps = groups[sid], sup = S.suppliers.find((x) => x.id === sid);
+    if (!sid) return `<h2 style="margin:0">Sin proveedor asignado</h2><p class="small muted">Estos artículos están por debajo del mínimo pero no tienen proveedor. Asígnaselo en Existencias para poder pedirlos.</p>
+      <div class="table-wrap"><table class="nosort"><thead><tr><th>Artículo</th><th class="num">Hay</th><th class="num">Mínimo</th><th></th></tr></thead><tbody>
+      ${ps.map((p) => `<tr><td>${esc(p.name)}<div class="small muted">${esc(p.category || '')}</div></td><td class="num txt-bad">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)} ${esc(p.unit)}</td><td class="num"><a class="btn sm" href="#/productos?q=${encodeURIComponent(p.name)}">Asignar proveedor</a></td></tr>`).join('')}</tbody></table></div>`;
+    const oo = open.filter((o) => o.supplier_id === sid && ['borrador', 'pendiente', 'enviado'].includes(o.status));
+    const head = `<div class="row between"><div><h2 style="margin:0">${esc(sup?.name || 'Proveedor')}</h2><div class="small muted">${[sup?.order_days && 'Pedidos: ' + sup.order_days, sup?.phone].filter(Boolean).map(esc).join(' · ')}</div></div><span class="pill bad">${ps.length} bajo mínimo</span></div>
+      ${oo.length ? `<div class="small txt-warn" style="margin-top:6px">Ya hay ${oo.map((o) => `<a href="#/pedidos/${o.id}">pedido #${o.id} (${ST_NAME[o.status]})</a>`).join(', ')} a este proveedor: revisa que no lo pidas dos veces.</div>` : ''}`;
+    if (done[sid]) return `${head}<div class="txt-ok" style="margin-top:10px">✓ ${done[sid].text} <a class="btn sm" href="#/pedidos/${done[sid].id}${done[sid].status === 'enviado' ? '?enviar=1' : ''}">Ver pedido</a></div>`;
+    const tot = ps.reduce((t, p) => t + (state[p.id].on ? (Number(state[p.id].qty) || 0) * unitPrice(p, state[p.id].unit) : 0), 0);
+    return `${head}<div class="table-wrap"><table class="nosort"><thead><tr><th></th><th>Artículo</th><th class="num">Hay</th><th class="num">Mínimo</th><th class="num">Pedir</th><th>Formato</th></tr></thead><tbody>
+      ${ps.map((p) => { const st = state[p.id]; return `<tr data-p="${p.id}" class="${st.on ? '' : 'muted'}"><td><input type="checkbox" data-on ${st.on ? 'checked' : ''} aria-label="Incluir"></td>
+        <td>${esc(p.name)}<div class="small muted">${esc(p.category || '')}</div></td><td class="num txt-bad">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)} ${esc(p.unit)}</td>
+        <td class="num"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-q value="${esc(st.qty)}"></td><td>${unitSelect(p, st.unit, 'data-u')}</td></tr>`; }).join('')}</tbody></table></div>
+      <div class="row between" style="margin-top:10px"><span>${can('costes.ver') ? `Estimado <b>${eur(tot)}</b>` : ''}</span>
+        <span class="row"><a class="btn" href="#/pedidos/nuevo?sup=${sid}&min=1">Abrir en pedido completo</a><button type="button" data-act="draft">Guardar borrador</button><button type="button" class="primary" data-act="send">${approver ? 'Crear y enviar' : 'Enviar a aprobación'}</button></span></div>`;
+  };
+  const render = () => {
+    v.innerHTML = `<div class="row between"><h1>⚠️ Bajo mínimo</h1><div class="row"><a class="btn" href="#/pedidos/sugeridos">✨ Pedidos sugeridos</a><a class="btn" href="#/pedidos">Volver a pedidos</a></div></div>
+      ${items.length ? `<p class="muted">${items.length === 1 ? 'Hay 1 artículo' : `Hay ${items.length} artículos`} por debajo del stock mínimo, agrupados por proveedor. La cantidad propuesta es la que falta para volver al mínimo; cámbiala si quieres pedir más.</p>
+        ${sups.map((sid) => `<div class="card" data-s="${sid}">${card(sid)}</div>`).join('')}`
+      : '<div class="card empty">Ningún artículo está por debajo de su mínimo. 👍<div class="small" style="margin-top:6px">Los mínimos se ponen en Existencias, en la ficha de cada artículo.</div></div>'}`;
+  };
+  const repaint = (sid) => { const el = $(`[data-s="${sid}"]`, v); if (el) el.innerHTML = card(sid); };
+  v.addEventListener('change', (e) => {
+    const tr = e.target.closest('tr[data-p]'); if (!tr) return;
+    const p = prodById(tr.dataset.p), st = state[p.id];
+    if (e.target.matches('[data-on]')) st.on = e.target.checked;
+    if (e.target.matches('[data-q]')) st.qty = e.target.value;
+    if (e.target.matches('[data-u]')) { st.unit = e.target.value; st.qty = qtyToMin(p, st.unit); }
+    repaint(p.supplier_id || 0);
+  });
+  v.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-act]'); if (!b) return;
+    const sid = Number(b.closest('[data-s]').dataset.s), sup = S.suppliers.find((x) => x.id === sid);
+    act(b, async () => {
+      const lines = groups[sid].filter((p) => state[p.id].on && Number(state[p.id].qty) > 0).map((p) => ({ product_id: p.id, qty: Number(state[p.id].qty), unit: state[p.id].unit }));
+      if (!lines.length) throw new Error('No hay ninguna cantidad marcada para pedir');
+      const status = b.dataset.act === 'draft' ? 'borrador' : approver ? 'enviado' : 'pendiente';
+      const r = await api('orders', { body: { supplier_id: sid, status, lines, notes: '' } });
+      if (r.status === 'pendiente') await notifyApprovers({ id: r.id, supplier_name: sup?.name || '', n: lines.length, total: lines.reduce((t, l) => t + l.qty * unitPrice(prodById(l.product_id), l.unit), 0) }, r.approvers);
+      done[sid] = { id: r.id, status: r.status, text: r.status === 'enviado' ? `Pedido #${r.id} creado: envíaselo al proveedor.` : r.status === 'pendiente' ? `Pedido #${r.id} enviado a aprobación.` : `Borrador #${r.id} guardado.` };
+      repaint(sid); toast(done[sid].text);
+    });
+  });
+  render();
+}
+
+async function pedidoNuevo(v, existing, q) {
   if (!S.suppliers.length) { v.innerHTML = `<div class="card">Primero da de alta proveedores y artículos. <a href="#/proveedores">Ir a proveedores →</a></div>`; return; }
   const lines = {}; // product_id -> { qty, unit }
   if (existing) existing.lines.forEach((l) => (lines[l.product_id] = { qty: l.input_qty ?? l.qty, unit: l.input_unit || l.unit }));
@@ -665,6 +734,13 @@ async function pedidoNuevo(v, existing) {
   };
   const total = () => { const t = Object.entries(lines).reduce((s, [pidv, l]) => { const p = prodById(pidv); return s + (Number(l.qty) || 0) * (p ? unitPrice(p, l.unit) : 0); }, 0); $('#tot').textContent = t ? 'Estimado: ' + eur(t) : ''; };
   $('#sup').onchange = () => { $('#sugbar').style.display = $('#sup').value ? '' : 'none'; draw(); };
+  // viene de "Bajo mínimo": proveedor ya elegido y cantidades para llegar al mínimo
+  const qsup = Number(q?.get('sup'));
+  if (!existing && qsup && S.suppliers.some((x) => x.id === qsup)) {
+    $('#sup').value = String(qsup); $('#sugbar').style.display = '';
+    if (q.get('min')) belowMin().filter((p) => p.supplier_id === qsup).forEach((p) => { const u = defaultBuyUnit(p); lines[p.id] = { qty: qtyToMin(p, u), unit: u }; });
+    draw();
+  }
   $('#sugg').onclick = (e) => act(e.target, async () => {
     const r = await api(`orders/suggest?supplier_id=${$('#sup').value}&days=${$('#sdays').value}`);
     let n = 0;
@@ -1160,7 +1236,7 @@ VIEWS.stock = async (v, _id, q) => {
       ${tableCard('Inventarios anteriores', invs.filter((i) => !String(i.notes || '').startsWith('[arranque]')), ['Fecha', 'Quién', 'Descuadre'], (i) => [`${fdate(i.inv_date)}${i.notes ? `<div class="small muted">${esc(i.notes)}</div>` : ''}`, esc(i.user_name || ''), `<span class="${i.total_diff_value < 0 ? 'txt-bad' : ''}">${eur(i.total_diff_value)}</span>`], 'Aún no se ha hecho ningún inventario')}`;
     const filt = () => {
       const s = norm($('#search').value), c = fcat ? fcat() : '', pend = $('#pend')?.checked;
-      $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', (s && !tr.dataset.n.includes(s)) || (pend && tr.classList.contains('done'))));
+      $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', !!((s && !tr.dataset.n.includes(s)) || (pend && tr.classList.contains('done')))));
       $$('[data-cat]', v).forEach((d) => d.classList.toggle('hidden', (c && d.dataset.cat !== c) || !$$('tr[data-n]', d).some((tr) => !tr.classList.contains('hidden'))));
     };
     let fcat = null; fcat = bindCatChips(v, 'inventario', () => filt()); filt();
@@ -1544,7 +1620,7 @@ VIEWS.escandallos = async (v, id, q) => {
       <td>${algIcons(al) || (r.n_lines ? '<span class="muted small">ninguno</span>' : '<span class="muted small">—</span>')}${r.alg_unchecked ? ` <span class="pill warn" title="${r.alg_unchecked} ingrediente(s) sin revisar">revisar</span>` : ''}</td></tr>`; }).join('') || `<tr><td colspan="9" class="empty">No hay platos. ${can('escandallos.editar') ? 'Importa tu carta de Qamarero o crea el primero.' : ''}</td></tr>`}
     </tbody></table></div>${showCost ? `<p class="small muted">Coste MP = materia prima por ración, incluido el % de varios. % coste sobre PVP sin IVA (${num(S.settings.iva_pct)} %). Beneficio neto = PVP sin IVA − materia prima − gastos fijos imputados. PVP recomendado = el precio con IVA para que la materia prima sea el ${num(target)} % (en rojo si el actual se queda por debajo).</p>` : ''}</div>`;
   bindRowLinks(v);
-  const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value; $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', (q2 && !tr.dataset.n.includes(q2)) || (c && tr.dataset.c !== c))); };
+  const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value; $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', !!((q2 && !tr.dataset.n.includes(q2)) || (c && tr.dataset.c !== c)))); };
   $('#search').oninput = filt; $('#fcat').onchange = filt;
   if ($('#exp')) $('#exp').onclick = (e) => act(e.target, exportCartaQamarero);
   if ($('#impesc')) $('#impesc').onclick = () => escandallosImport();
@@ -1660,7 +1736,7 @@ async function cartaLista(v) {
   v.addEventListener('input', (e) => { const t = e.target.closest('tr[data-i]'); if (t && e.target.dataset.k) { const k = e.target.dataset.k; rows[t.dataset.i][k] = ['pvp', 'portions'].includes(k) ? Number(e.target.value) : e.target.value; calc(t.dataset.i); } status(); });
   v.addEventListener('change', status);
   $('#all').onchange = () => { $$('tr[data-i]', v).forEach((t) => { if (!t.classList.contains('hidden')) $('[data-sel]', t).checked = $('#all').checked; }); status(); };
-  const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value; $$('tr[data-i]', v).forEach((t) => t.classList.toggle('hidden', (q2 && !t.dataset.n.includes(q2)) || (c && t.dataset.c !== c))); };
+  const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value; $$('tr[data-i]', v).forEach((t) => t.classList.toggle('hidden', !!((q2 && !t.dataset.n.includes(q2)) || (c && t.dataset.c !== c)))); };
   $('#search').oninput = filt; $('#fcat').onchange = filt;
   const need = () => { const s2 = sel(); if (!s2.length) throw new Error('Marca primero los platos (casilla de la izquierda)'); return s2; };
   $('#apct').onclick = () => act(null, async () => {
@@ -2326,7 +2402,7 @@ async function repetidos(v, kind) {
   })));
 }
 
-VIEWS.productos = async (v, id) => {
+VIEWS.productos = async (v, id, q) => {
   await reload();
   if (id === 'lista') return existenciasLista(v);
   if (id === 'alergenos') return revisarAlergenos(v);
@@ -2340,7 +2416,10 @@ VIEWS.productos = async (v, id) => {
   bindRowLinks(v);
   let fcatE = null;
   const filtE = () => { const s2 = norm($('#search').value), c = fcatE ? fcatE() : ''; $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', !!((s2 && !tr.dataset.n.includes(s2)) || (c && tr.dataset.c !== c)))); };
-  fcatE = bindCatChips(v, 'existencias', filtE); filtE();
+  fcatE = bindCatChips(v, 'existencias', filtE);
+  // desde otra pantalla se puede llegar buscando un artículo concreto (?q=nombre)
+  if (q?.get('q')) { $('#search').value = q.get('q'); fcatE.set(''); }
+  filtE();
   $('#search').oninput = filtE;
   $('#imp').onclick = () => importWizard({
     title: 'Importar existencias', sheetHint: ['articul', 'existencia', 'producto', 'catalogo'],
@@ -2410,7 +2489,7 @@ async function existenciasLista(v) {
   const onEdit = (e) => { const t = e.target.closest('tr[data-i]'); if (t && e.target.dataset.k) { const k = e.target.dataset.k; rows[t.dataset.i][k] = ['price', 'min_stock'].includes(k) ? Number(e.target.value) : e.target.value; mark(t.dataset.i); } status(); };
   v.addEventListener('input', onEdit); v.addEventListener('change', onEdit);
   $('#all').onchange = () => { $$('tr[data-i]', v).forEach((t) => { if (!t.classList.contains('hidden')) $('[data-sel]', t).checked = $('#all').checked; }); status(); };
-  const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value, sp = $('#fsup').value; $$('tr[data-i]', v).forEach((t) => t.classList.toggle('hidden', (q2 && !t.dataset.n.includes(q2)) || (c && t.dataset.c !== c) || (sp && t.dataset.s !== sp))); };
+  const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value, sp = $('#fsup').value; $$('tr[data-i]', v).forEach((t) => t.classList.toggle('hidden', !!((q2 && !t.dataset.n.includes(q2)) || (c && t.dataset.c !== c) || (sp && t.dataset.s !== sp)))); };
   $('#search').oninput = filt; $('#fcat').onchange = filt; $('#fsup').onchange = filt;
   const need = () => { const s2 = sel(); if (!s2.length) throw new Error('Marca primero los artículos (casilla de la izquierda)'); return s2; };
   $('#apct').onclick = () => act(null, async () => { const p2 = Number($('#pct').value); if (!p2) throw new Error('Indica el % (por ejemplo 5 o −3)'); need().forEach((i) => setVal(i, 'price', Math.round(rows[i].price * (1 + p2 / 100) * 10000) / 10000)); status(); });
@@ -2510,7 +2589,7 @@ VIEWS.proveedores = async (v, id) => {
     <div class="card"><div class="row"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar por nombre o CIF…"></div>${ed ? '<button type="button" id="merge">🔁 Fusionar seleccionados</button>' : ''}</div><div class="table-wrap"><table><thead><tr>${ed ? '<th><input type="checkbox" id="all" aria-label="Marcar todos"></th>' : ''}<th>Proveedor</th><th>CIF</th><th>Contacto</th><th>Teléfono</th><th>Días de pedido</th><th class="num">Artículos</th></tr></thead><tbody>
     ${S.suppliers.map((s) => `<tr class="click" data-id="${s.id}" data-n="${esc(norm(s.name + ' ' + (s.cif || '')))}">${ed ? '<td class="selcell"><input type="checkbox" data-sel></td>' : ''}<td>${esc(s.name)}</td><td>${s.cif ? esc(s.cif) : '<span class="muted small">falta</span>'}</td><td>${esc(s.contact || '')}</td><td>${esc(s.phone || '')}</td><td>${esc(s.order_days || '')}</td><td class="num">${S.products.filter((p) => p.supplier_id === s.id).length}</td></tr>`).join('') || `<tr><td colspan="${ed ? 7 : 6}" class="empty">Sin proveedores. Impórtalos desde Excel o créalos uno a uno.</td></tr>`}
     </tbody></table></div></div>`;
-  $('#search').oninput = () => { const q2 = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', q2 && !tr.dataset.n.includes(q2))); };
+  $('#search').oninput = () => { const q2 = norm($('#search').value); $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', !!(q2 && !tr.dataset.n.includes(q2)))); };
   if (ed) {
     const visible = () => $$('tr[data-id]', v).filter((tr) => !tr.classList.contains('hidden') && !tr.classList.contains('fhide'));
     $$('.selcell', v).forEach((td) => (td.onclick = (e) => e.stopPropagation()));

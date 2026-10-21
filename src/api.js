@@ -2060,7 +2060,7 @@ async function alerts(env, user) {
   }
   if (can(user, 'stock.ver') || can(user, 'pedidos.crear')) {
     const r = await q1(`SELECT COUNT(*) AS n FROM products WHERE active = 1 AND min_stock > 0 AND stock_cache < min_stock`);
-    if (r.n) add('warn', '📦', `${r.n} artículo(s) por debajo del stock mínimo`, can(user, 'pedidos.crear') ? '#/pedidos/nuevo' : '#/stock');
+    if (r.n) add('warn', '📦', `${r.n} artículo(s) por debajo del stock mínimo: mira cuáles y de qué proveedor`, can(user, 'pedidos.crear') ? '#/pedidos/minimos' : '#/stock');
   }
   if (can(user, 'pedidos.crear')) {
     // los proveedores a los que toca pedir hoy, con su pedido sugerido
