@@ -1,3 +1,4 @@
+/* Gestión del restaurante — estilos (nuevo aspecto, 21/10/2026) */
 /* letras propias (sin depender de Google): Figtree para el texto y Lexend, muy fácil de leer, para títulos y menú */
 @font-face { font-family: 'Figtree'; src: url('/fonts/figtree.woff') format('woff'); font-weight: 300 900; font-display: swap; }
 @font-face { font-family: 'Lexend'; src: url('/fonts/lexend.woff') format('woff'); font-weight: 100 900; font-display: swap; }
