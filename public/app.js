@@ -1607,6 +1607,7 @@ async function escandallosIA(v, q) {
 VIEWS.escandallos = async (v, id, q) => {
   if (id === 'ia') return escandallosIA(v, q);
   if (id === 'lista') return cartaLista(v);
+  if (id === 'masivo') return escandallarLista(v);
   if (id) return escandalloEdit(v, id, q);
   const tab = q?.get('tab') || 'platos';
   if (tab === 'elaboraciones') return elaboracionesList(v);
@@ -1618,7 +1619,7 @@ VIEWS.escandallos = async (v, id, q) => {
   const cats = [...new Set(S.recipes.map((r) => r.category || 'Sin categoría'))];
   v.innerHTML = `<div class="row between"><h1>Carta y escandallos</h1><div class="row">
       ${can('escandallos.editar') ? '<button id="imp">Importar carta</button><button id="impesc">Importar escandallos</button>' : ''}${canAny('escandallos.editar', 'ventas.gestionar') ? '<button id="exp">⬇ Exportar para Qamarero</button>' : ''}
-      ${can('escandallos.editar') ? `<a class="btn" href="#/escandallos/ia">✨ Escandallos con IA${(() => { const n = S.allRecipes.filter((r) => !r.n_lines).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a><a class="btn" href="#/escandallos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/escandallos/nuevo">+ Nuevo plato</a>` : ''}</div></div>
+      ${can('escandallos.editar') ? `<a class="btn" href="#/escandallos/ia">✨ Escandallos con IA${(() => { const n = S.allRecipes.filter((r) => !r.n_lines).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a><a class="btn" href="#/escandallos/masivo">📋 Escandallar en lista</a><a class="btn" href="#/escandallos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/escandallos/nuevo">+ Nuevo plato</a>` : ''}</div></div>
     ${CARTA_TABS('platos')}
     ${showCost ? `<div class="card small">${fx?.pct != null ? `Gastos fijos imputados: <b>${pct(fx.pct)}</b> del precio sin IVA de cada plato (${eur(fx.monthly)}/mes ÷ ${eur(fx.revenue)}/mes de facturación, según ${esc(fx.source)}).` : `Para repartir los gastos fijos entre los platos, indica la <b>facturación mensual prevista</b> en <a href="#/ajustes">Ajustes</a> o importa ventas${fx?.note ? ` (${esc(fx.note)})` : ''}.`} Objetivo de coste de materia prima: ${num(target)} %.</div>` : ''}
     <div class="card"><div class="row"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar plato…"></div>
@@ -1769,6 +1770,181 @@ async function cartaLista(v) {
 }
 
 // ---------- Ficha técnica (escandallo) ----------
+// ---------- Escandallar en lista: muchos platos en una pantalla ----------
+const lineYield = (l) => Math.max((1 - Math.min(Number(l.waste_pct) || 0, 95) / 100) * (1 - Math.min(Number(l.cook_loss_pct) || 0, 95) / 100), 0.05);
+// Cada plato se despliega para poner sus ingredientes sin salir de la lista. Además, un ingrediente se puede añadir
+// a varios platos marcados de una vez (pan y picos, aceite de freír, guarnición…) o copiar el escandallo de otro plato.
+async function escandallarLista(v) {
+  if (!can('escandallos.editar')) throw new Error('No tienes permiso para editar escandallos');
+  await reload();
+  const showCost = can('costes.ver');
+  const target = Number(S.settings.food_cost_target) || 30;
+  const cats = [...new Set(S.recipes.map((r) => r.category || 'Sin categoría'))].sort(collator.compare);
+  const open = {}; // recipe_id -> líneas en edición
+  const sel = new Set();
+  let onlyEmpty = lsGetX('esc-masivo:vacios') !== '0';
+  const lineCost = (l) => { const p = prodById(l.product_id); return p ? (Number(l.qty) || 0) * unitPrice(p, l.unit) / lineYield(l) : 0; };
+  const fcOf = (cost, r) => (r.pvp > 0 ? (cost / (r.pvp / ivaDiv())) * 100 : null);
+  const ingOpts = () => `<datalist id="dl-ing">${S.products.map((p) => `<option value="${esc(prodLabel(p))}">`).join('')}</datalist>`;
+  const rowHead = (r) => {
+    const fc = r.n_lines ? fcOf(r.cost, r) : null;
+    return `<td><input type="checkbox" data-sel aria-label="Marcar" ${sel.has(r.id) ? 'checked' : ''}></td>
+      <td><button type="button" class="ghost" data-open style="font-weight:600;text-align:left">${open[r.id] ? '▾' : '▸'} ${esc(r.name)}</button>${r.portions > 1 ? ` <span class="small muted">(${num(r.portions, 0)} raciones)</span>` : ''}<div class="small muted">${esc(r.category || '')}</div></td>
+      <td class="num">${r.n_lines ? `${r.n_lines} ingr.` : '<span class="pill warn">sin escandallo</span>'}</td>
+      ${showCost ? `<td class="num">${r.n_lines ? eur(r.cost) : '—'}</td><td class="num">${eur(r.pvp)}</td><td class="num ${fc != null && fc > target + 3 ? 'txt-bad' : fc != null && fc <= target ? 'txt-ok' : ''}">${fc != null ? pct(fc) : '—'}</td>` : ''}`;
+  };
+  const editor = (r) => {
+    const ls = open[r.id];
+    const tot = ls.reduce((t, l) => t + lineCost(l), 0) / (Number(r.portions) || 1);
+    const fc = fcOf(tot * (1 + (Number(r.misc_pct) || 0) / 100), r);
+    return `<td colspan="${showCost ? 6 : 3}" style="background:var(--surface-2);padding:10px 12px">
+      <div class="table-wrap"><table class="nosort grid-edit"><thead><tr><th>Ingrediente</th><th class="num">Cantidad</th><th>Unidad</th><th class="num">Merma limpieza %</th><th class="num">Pérdida cocción %</th>${showCost ? '<th class="num">Coste</th>' : ''}<th></th></tr></thead><tbody>
+      ${ls.map((l, i) => { const p = prodById(l.product_id); return `<tr data-li="${i}">
+        <td style="min-width:260px;width:40%"><input data-f="prod" list="dl-ing" style="min-width:240px" value="${esc(p ? prodLabel(p) : l._txt || '')}" placeholder="Escribe para buscar…"></td>
+        <td class="num"><input class="qty" data-f="qty" type="number" step="any" inputmode="decimal" min="0" value="${esc(l.qty ?? '')}"></td>
+        <td>${p ? unitSelect(p, l.unit, 'data-f="unit"') : '<span class="small muted">—</span>'}</td>
+        <td class="num"><input class="qty" data-f="waste_pct" type="number" step="any" min="0" max="95" value="${esc(l.waste_pct || '')}" placeholder="0"></td>
+        <td class="num"><input class="qty" data-f="cook_loss_pct" type="number" step="any" min="0" max="95" value="${esc(l.cook_loss_pct || '')}" placeholder="0"></td>
+        ${showCost ? `<td class="num small" data-lc>${p ? eur(lineCost(l)) : ''}</td>` : ''}
+        <td><button type="button" class="sm ghost" data-rm aria-label="Quitar">✕</button></td></tr>`; }).join('')}
+      </tbody></table></div>
+      <div class="row between" style="margin-top:8px"><span class="row"><button type="button" class="sm" data-addl>+ Ingrediente</button>
+        <span class="small muted">${r.portions > 1 ? `Cantidades para las ${num(r.portions, 0)} raciones de la receta. ` : 'Cantidades para una ración. '}Pulsa Intro en la cantidad para añadir otra línea.</span></span>
+        <span class="row">${showCost ? `<span data-tot>Coste ración <b>${eur(tot * (1 + (Number(r.misc_pct) || 0) / 100))}</b>${fc != null ? ` · FC <b class="${fc > target + 3 ? 'txt-bad' : fc <= target ? 'txt-ok' : ''}">${pct(fc)}</b>` : ''}</span>` : ''}
+        <a class="btn sm" href="#/escandallos/${r.id}">Ficha completa</a><button type="button" class="sm" data-cancel>Cancelar</button><button type="button" class="primary sm" data-save>Guardar</button></span></div></td>`;
+  };
+  const visible = () => {
+    const s = norm($('#q', v)?.value || ''), c = fcat ? fcat() : '';
+    return S.recipes.filter((r) => (!onlyEmpty || !r.n_lines || open[r.id]) && (!c || (r.category || 'Sin categoría') === c) && (!s || norm(r.name).includes(s)));
+  };
+  const drawRows = () => {
+    const list = visible();
+    $('#rows', v).innerHTML = list.map((r) => `<tr data-r="${r.id}">${rowHead(r)}</tr>${open[r.id] ? `<tr data-ed="${r.id}">${editor(r)}</tr>` : ''}`).join('')
+      || `<tr><td colspan="${showCost ? 6 : 3}" class="empty">${onlyEmpty ? 'Todos los platos de esta vista tienen escandallo. 👍 Quita «Solo sin escandallo» para ver todos.' : 'No hay platos con ese filtro.'}</td></tr>`;
+    $('#nsel', v).textContent = sel.size ? `${sel.size} marcado(s)` : 'Marca platos con la casilla';
+    // platos de los que se puede copiar (los que ya tienen escandallo, también los recién hechos)
+    const cs = $('#csrc', v), keep = cs.value;
+    cs.innerHTML = `<option value="">Copiar de otro plato…</option>${S.allRecipes.filter((r) => r.n_lines).map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}`;
+    cs.value = keep;
+    const left = S.recipes.filter((r) => !r.n_lines).length;
+    $('#left', v).textContent = left ? `${left} de ${S.recipes.length} platos sin escandallo` : `Todos los platos (${S.recipes.length}) tienen escandallo 🎉`;
+  };
+  const redrawEditor = (id) => { const tr = $(`tr[data-ed="${id}"]`, v); const r = recById(id); if (tr && r) tr.innerHTML = editor(r); };
+  v.innerHTML = `<div class="row between"><h1>Escandallar en lista</h1><a class="btn" href="#/escandallos">Volver a la carta</a></div>
+    <div class="card small"><b id="left"></b><br>Toca un plato para ponerle los ingredientes ahí mismo. Para lo que llevan muchos platos (pan y picos, aceite de freír, una guarnición…) márcalos y usa <b>Añadir a los marcados</b>. Si dos platos llevan casi lo mismo (ración y media, o dos tostas), usa <b>Copiar de otro plato</b> y luego ajusta.</div>
+    <div class="card">
+      <div class="row"><div class="field" style="flex:2 1 220px;margin:0"><input id="q" placeholder="Buscar plato…"></div>
+        <label class="check" style="margin:0"><input type="checkbox" id="empty" ${onlyEmpty ? 'checked' : ''}> <span>Solo sin escandallo</span></label></div>
+      ${catChipsHtml(cats)}
+      <div class="bulkbar row" style="flex-wrap:wrap">
+        <b id="nsel"></b>
+        <span class="row" style="flex:1 1 520px;gap:6px">
+          <input id="bp" list="dl-ing" placeholder="Ingrediente para los marcados…" style="flex:2 1 200px">
+          <input id="bq" class="qty" type="number" step="any" min="0" placeholder="Cant." style="width:90px">
+          <span id="bu"></span>
+          <label class="small" style="margin:0;font-weight:500;display:flex;gap:4px;align-items:center"><input type="checkbox" id="bpp" checked style="width:18px;min-height:18px"> por ración</label>
+          <button type="button" class="primary" id="badd">Añadir a los marcados</button></span>
+        <span class="row" style="gap:6px"><select id="csrc" style="max-width:240px"></select>
+          <input id="cf" class="qty" type="number" step="any" min="0" value="1" title="Proporción: 0,5 para media ración" style="width:70px"><button type="button" id="ccopy">Copiar a los marcados</button></span>
+      </div>
+      <div class="table-wrap"><table class="nosort"><thead><tr><th><input type="checkbox" id="all" aria-label="Marcar todos"></th><th>Plato</th><th class="num">Escandallo</th>${showCost ? '<th class="num">Coste</th><th class="num">PVP</th><th class="num">FC</th>' : ''}</tr></thead><tbody id="rows"></tbody></table></div>
+      ${ingOpts()}
+    </div>`;
+  let fcat = null;
+  fcat = bindCatChips(v, 'esc-masivo', () => drawRows());
+  $('#q', v).oninput = drawRows;
+  $('#empty', v).onchange = (e) => { onlyEmpty = e.target.checked; lsSetX('esc-masivo:vacios', onlyEmpty ? '1' : '0'); drawRows(); };
+  $('#all', v).onchange = (e) => { visible().forEach((r) => (e.target.checked ? sel.add(r.id) : sel.delete(r.id))); drawRows(); };
+  // unidad del ingrediente elegido para los marcados
+  $('#bp', v).oninput = () => { const p = prodFromLabel($('#bp', v).value); $('#bu', v).innerHTML = p ? unitSelect(p, defaultRecipeUnit(p), 'id="bus"') : ''; };
+  const openRecipe = async (id) => {
+    const r = await api('recipes/' + id);
+    open[id] = r.lines.map((l) => ({ product_id: l.product_id, qty: l.input_qty ?? l.qty, unit: l.input_unit || l.unit, waste_pct: l.waste_pct || 0, cook_loss_pct: l.cook_loss_pct || 0 }));
+    if (!open[id].length) open[id].push({ product_id: null, qty: '', unit: '', waste_pct: 0, cook_loss_pct: 0 });
+    drawRows();
+    $(`tr[data-ed="${id}"] input[data-f="prod"]`, v)?.focus();
+  };
+  const afterSave = async (ids) => { await reload(true); drawRows(); ids.forEach((id) => redrawEditor(id)); };
+  v.addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-r]'), ed = e.target.closest('tr[data-ed]');
+    if (tr && e.target.closest('[data-open]')) { const id = Number(tr.dataset.r); if (open[id]) { delete open[id]; drawRows(); } else act(null, () => openRecipe(id)); return; }
+    if (!ed) return;
+    const id = Number(ed.dataset.ed), ls = open[id];
+    if (e.target.closest('[data-addl]')) { ls.push({ product_id: null, qty: '', unit: '', waste_pct: 0, cook_loss_pct: 0 }); redrawEditor(id); $$(`tr[data-ed="${id}"] input[data-f="prod"]`, v).pop()?.focus(); }
+    if (e.target.closest('[data-rm]')) { ls.splice(Number(e.target.closest('[data-li]').dataset.li), 1); redrawEditor(id); }
+    if (e.target.closest('[data-cancel]')) { delete open[id]; drawRows(); }
+    const sb = e.target.closest('[data-save]');
+    if (sb) act(sb, async () => {
+      const bad = ls.filter((l) => !l.product_id && l._txt);
+      if (bad.length) throw new Error(`No encuentro el ingrediente "${bad[0]._txt}". Elígelo de la lista (o créalo en Existencias).`);
+      const lines = ls.filter((l) => l.product_id && Number(l.qty) > 0).map(({ _txt, ...l }) => l);
+      await api(`recipes/${id}/lines`, { method: 'PUT', body: { lines } });
+      delete open[id];
+      toast(`Escandallo de "${recById(id)?.name}" guardado`);
+      await afterSave([]);
+    });
+  });
+  v.addEventListener('change', (e) => {
+    const tr = e.target.closest('tr[data-r]');
+    if (tr && e.target.matches('[data-sel]')) { const id = Number(tr.dataset.r); e.target.checked ? sel.add(id) : sel.delete(id); $('#nsel', v).textContent = sel.size ? `${sel.size} marcado(s)` : 'Marca platos con la casilla'; return; }
+    const li = e.target.closest('tr[data-li]'), ed = e.target.closest('tr[data-ed]');
+    if (!li || !ed) return;
+    const id = Number(ed.dataset.ed), l = open[id][Number(li.dataset.li)], f = e.target.dataset.f;
+    if (f === 'prod') {
+      const p = prodFromLabel(e.target.value);
+      if (p) { l.product_id = p.id; l.unit = defaultRecipeUnit(p); delete l._txt; } else { l.product_id = null; l._txt = e.target.value.trim(); }
+      setTimeout(() => { redrawEditor(id); $(`tr[data-ed="${id}"] tr[data-li="${li.dataset.li}"] input[data-f="qty"]`, v)?.focus(); });
+    } else if (f === 'unit') { l.unit = e.target.value; setTimeout(() => redrawEditor(id)); }
+    else {
+      // cantidades y mermas: solo se actualizan los costes, sin redibujar (para no perder el sitio al pasar con Tab)
+      l[f] = e.target.value === '' ? '' : Number(e.target.value);
+      const box = $(`tr[data-ed="${id}"]`, v), r = recById(id);
+      const lc = $('[data-lc]', li); if (lc && prodById(l.product_id)) lc.textContent = eur(lineCost(l));
+      const tmp = document.createElement('tr'); tmp.innerHTML = editor(r);
+      const nt = $('[data-tot]', tmp), ot = $('[data-tot]', box); if (nt && ot) ot.innerHTML = nt.innerHTML;
+    }
+  });
+  // Intro en la cantidad: línea nueva
+  v.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !e.target.matches('input[data-f="qty"]')) return;
+    e.preventDefault();
+    const ed = e.target.closest('tr[data-ed]'), id = Number(ed.dataset.ed), li = Number(e.target.closest('tr[data-li]').dataset.li);
+    open[id][li].qty = e.target.value === '' ? '' : Number(e.target.value);
+    if (li === open[id].length - 1) open[id].push({ product_id: null, qty: '', unit: '', waste_pct: 0, cook_loss_pct: 0 });
+    redrawEditor(id); $(`tr[data-ed="${id}"] tr[data-li="${li + 1}"] input[data-f="prod"]`, v)?.focus();
+  });
+  $('#badd', v).onclick = (e) => act(e.target, async () => {
+    if (!sel.size) throw new Error('Marca primero los platos');
+    const p = prodFromLabel($('#bp', v).value);
+    if (!p) throw new Error('Elige el ingrediente de la lista');
+    const qty = parseNum($('#bq', v).value);
+    if (!(qty > 0)) throw new Error('Escribe la cantidad');
+    const unit = $('#bus', v)?.value || p.unit;
+    if (!(await confirmModal(`¿Añadir ${num(qty, 3)} ${unitShort(p, unit)} de "${p.name}" ${$('#bpp', v).checked ? 'por ración ' : ''}a ${sel.size} plato(s)? Si alguno ya lo lleva, se sustituye la cantidad.`, 'Añadir'))) return;
+    await api('recipes/add-line', { body: { recipe_ids: [...sel], product_id: p.id, qty, unit, per_portion: $('#bpp', v).checked } });
+    toast(`Añadido a ${sel.size} plato(s)`);
+    [...sel].forEach((id) => delete open[id]);
+    await afterSave([]);
+  });
+  $('#ccopy', v).onclick = (e) => act(e.target, async () => {
+    if (!sel.size) throw new Error('Marca primero los platos');
+    const src = Number($('#csrc', v).value); if (!src) throw new Error('Elige el plato del que copiar');
+    const f = parseNum($('#cf', v).value) || 1;
+    const s0 = await api('recipes/' + src), srcPortions = Number(s0.portions) || 1;
+    const targets = [...sel].filter((id) => id !== src);
+    const withLines = targets.filter((id) => recById(id)?.n_lines);
+    if (!(await confirmModal(`¿Copiar el escandallo de "${s0.name}"${f !== 1 ? ` × ${num(f, 2)}` : ''} a ${targets.length} plato(s)?${withLines.length ? ` ${withLines.length} ya tienen escandallo y se sustituirá.` : ''}`, 'Copiar'))) return;
+    for (const id of targets) {
+      const r = recById(id), k = f * (Number(r?.portions) || 1) / srcPortions;
+      await api(`recipes/${id}/lines`, { method: 'PUT', body: { lines: s0.lines.map((l) => ({ product_id: l.product_id, qty: Math.round((l.input_qty ?? l.qty) * k * 10000) / 10000, unit: l.input_unit || l.unit, waste_pct: l.waste_pct, cook_loss_pct: l.cook_loss_pct })) } });
+      delete open[id];
+    }
+    toast(`Copiado a ${targets.length} plato(s)`);
+    await afterSave([]);
+  });
+  drawRows();
+}
+
 async function escandalloEdit(v, id, q) {
   const isNew = id === 'nuevo';
   const r = isNew ? { name: '', category: '', pvp: 0, portions: 1, notes: '', lines: [], misc_pct: null, kind: q?.get('tipo') === 'elaboracion' ? 'elaboracion' : 'plato', yield_unit: 'kg' } : await api('recipes/' + id);

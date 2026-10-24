@@ -839,6 +839,9 @@ async function route(parts, method, request, env, url, ctx = {}) {
     return json({ rows, ai: !!env.AI, ai_used: aiUsed });
   }
   if (a === 'recipes' && b === 'bulk-edit' && method === 'PUT') return recipesBulkEdit(request, env, user);
+  // escandallar en lista: cambiar solo los ingredientes de un plato, o añadir uno a varios platos a la vez
+  if (a === 'recipes' && b && c === 'lines' && method === 'PUT') return recipeLinesSet(request, env, user, Number(b), ctx);
+  if (a === 'recipes' && b === 'add-line' && method === 'POST') return recipesAddLine(request, env, user, ctx);
   if (a === 'recipes' && b === 'export') return recipesExport(env, user);
   if (a === 'suppliers' && b === 'bulk' && method === 'POST') return suppliersBulk(request, env, user);
   if (a === 'products' && b === 'merge' && method === 'POST') return productsMerge(request, env, user, ctx);
@@ -2063,6 +2066,50 @@ async function productsBulkEdit(request, env, user) {
   try { await runBatch(env, stmts); } catch (e) { if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Hay dos artículos con el mismo nombre'); throw e; }
   await refreshPrepCosts(env);
   return json({ ok: true, count: items.length });
+}
+
+async function writeRecipeLines(env, recipeId, lines, replace) {
+  const own = (await env.DB.prepare('SELECT product_id FROM recipes WHERE id = ?').bind(recipeId).first())?.product_id;
+  const valid = lines.filter((l) => l.product_id && Number(l.qty) > 0 && Number(l.product_id) !== own);
+  const { pmap, fmap } = await unitCtx(env, valid.map((l) => l.product_id));
+  const stmts = replace ? [env.DB.prepare('DELETE FROM recipe_lines WHERE recipe_id = ?').bind(recipeId)] : [];
+  const pct = (x) => Math.min(Math.max(Number(x) || 0, 0), 95);
+  for (const l of valid) {
+    const p = pmap[l.product_id];
+    if (!p) continue;
+    const u = unitInfo(p, l.unit, fmap);
+    if (!replace) stmts.push(env.DB.prepare('DELETE FROM recipe_lines WHERE recipe_id = ? AND product_id = ?').bind(recipeId, p.id));
+    stmts.push(env.DB.prepare('INSERT INTO recipe_lines (recipe_id, product_id, qty, waste_pct, cook_loss_pct, input_qty, input_unit) VALUES (?,?,?,?,?,?,?)')
+      .bind(recipeId, p.id, Number(l.qty) * u.factor, pct(l.waste_pct), pct(l.cook_loss_pct), Number(l.qty), l.unit || p.unit));
+  }
+  stmts.push(env.DB.prepare('UPDATE recipes SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').bind(recipeId));
+  await runBatch(env, stmts);
+  return valid.length;
+}
+async function recipeLinesSet(request, env, user, id, ctx) {
+  need(user, 'escandallos.editar');
+  const r = await env.DB.prepare('SELECT id, name FROM recipes WHERE id = ? AND active = 1').bind(id).first();
+  if (!r) throw new HttpError(404, 'Plato no encontrado');
+  const d = await body(request);
+  if (!Array.isArray(d.lines)) throw new HttpError(400, 'Faltan los ingredientes');
+  const n = await writeRecipeLines(env, id, d.lines, true);
+  await refreshPrepCosts(env);
+  ctx.audit = { action: 'modificación', entity: 'escandallo', id, summary: `Escandallo de "${r.name}": ${n} ingrediente(s)` };
+  const cost = await env.DB.prepare(RECIPES_SQL.replace('WHERE r.active = 1', 'WHERE r.active = 1 AND r.id = ?')).bind(id).first().catch(() => null);
+  return json({ ok: true, lines: n, recipe: cost });
+}
+async function recipesAddLine(request, env, user, ctx) {
+  need(user, 'escandallos.editar');
+  const d = await body(request);
+  const ids = [...new Set((d.recipe_ids || []).map(Number).filter(Boolean))];
+  if (!ids.length) throw new HttpError(400, 'Marca al menos un plato');
+  if (!Number(d.product_id) || !(Number(d.qty) > 0)) throw new HttpError(400, 'Elige el ingrediente y la cantidad');
+  // cantidad por plato; si el plato es para varias raciones se multiplica (la cantidad escrita es por ración)
+  const { results: recs } = await allIn(env, 'SELECT id, name, portions FROM recipes WHERE id IN (??) AND active = 1', ids);
+  for (const r of recs) await writeRecipeLines(env, r.id, [{ product_id: Number(d.product_id), qty: Number(d.qty) * (d.per_portion ? Number(r.portions) || 1 : 1), unit: d.unit, waste_pct: d.waste_pct, cook_loss_pct: d.cook_loss_pct }], false);
+  await refreshPrepCosts(env);
+  ctx.audit = { action: 'modificación', entity: 'escandallo', summary: `Ingrediente #${d.product_id} añadido a ${recs.length} plato(s): ${recs.map((r) => r.name).join(', ').slice(0, 200)}` };
+  return json({ ok: true, recipes: recs.length });
 }
 
 async function recipesBulkEdit(request, env, user) {
