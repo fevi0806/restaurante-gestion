@@ -4,7 +4,7 @@ import { ensureSchema } from './migrate.js';
 import { deliver } from './push.js';
 import { eveningReminders } from './turnos.js';
 import { recomputeStock } from './migrate.js';
-import { localDay } from './api.js';
+import { localDay, recalcStaleSales } from './api.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -36,6 +36,8 @@ export default {
           await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('stock_heal', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(localDay()).run();
         }
       }
+      // ventas volcadas con escandallos antiguos: se recalculan solas
+      await recalcStaleSales(env, 10).catch((e) => console.error('recalcular ventas', e));
       await eveningReminders(env);
       await deliver(env);
     })().catch((e) => console.error('tarea programada', e)));

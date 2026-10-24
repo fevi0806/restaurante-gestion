@@ -21,6 +21,7 @@ const parseNum = (v) => {
   return Number(s);
 };
 const norm = (s) => String(s || '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ');
+const tapaFactor = () => Number(S.settings?.tapa_factor) > 0 ? Number(S.settings.tapa_factor) : 0.33;
 const halfFactor = (name) => (/(^|\s)(1\/2|½|media|medio)(\s|$)/i.test(String(name)) ? 0.5 : /(^|\s)(1\/4|cuarto)(\s|$)/i.test(String(name)) ? 0.25 : 1);
 
 function toast(msg, err = false) {
@@ -69,6 +70,9 @@ const can = (p) => !!S.user && (S.user.is_super || (S.user.perms || []).includes
 const canAny = (...ps) => ps.some(can);
 const ROLE_NAMES = { direccion: 'Dirección', cocina: 'Cocina', sala: 'Sala' };
 const prodLabel = (p) => `${p.name} (${p.unit})${p.prep_recipe_id ? ' · elaboración' : ''}`;
+// Proveedores que traen un artículo: el habitual y los demás que lo han traído (o se han apuntado a mano)
+const supIdsOf = (p) => [p.supplier_id, ...String(p.other_suppliers || '').split(',').map(Number)].filter((x, i, a) => x && a.indexOf(x) === i);
+const supName = (id) => S.suppliers.find((x) => x.id === Number(id))?.name || 'proveedor';
 const prodById = (id) => S.products.find((p) => p.id === Number(id));
 const recById = (id) => S.recipes.find((r) => r.id === Number(id));
 const prodFromLabel = (v) => S.products.find((p) => prodLabel(p) === v || norm(p.name) === norm(v));
@@ -647,11 +651,16 @@ async function pedidosMinimos(v) {
   const approver = can('pedidos.aprobar');
   const items = belowMin();
   const open = await api('orders').catch(() => []);
-  const groups = {};
-  items.forEach((p) => { const k = p.supplier_id || 0; (groups[k] = groups[k] || []).push(p); });
-  const sups = Object.keys(groups).map(Number).sort((a, b) => (a === 0) - (b === 0) || collator.compare(S.suppliers.find((x) => x.id === a)?.name || '', S.suppliers.find((x) => x.id === b)?.name || ''));
-  const state = {}; // product_id -> { on, qty, unit }
-  items.forEach((p) => { const u = defaultBuyUnit(p); state[p.id] = { on: true, qty: qtyToMin(p, u), unit: u }; });
+  const state = {}; // product_id -> { on, qty, unit, sup }
+  items.forEach((p) => { const u = defaultBuyUnit(p); state[p.id] = { on: true, qty: qtyToMin(p, u), unit: u, sup: p.supplier_id || supIdsOf(p)[0] || 0 }; });
+  // agrupados por el proveedor al que se va a pedir (el habitual, salvo que elijas otro de los que también lo traen)
+  let groups = {}, sups = [];
+  const regroup = () => {
+    groups = {};
+    items.forEach((p) => { const k = state[p.id].sup || 0; (groups[k] = groups[k] || []).push(p); });
+    sups = Object.keys(groups).map(Number).sort((a, b) => (a === 0) - (b === 0) || collator.compare(supName(a), supName(b)));
+  };
+  regroup();
   const done = {};
   const card = (sid) => {
     const ps = groups[sid], sup = S.suppliers.find((x) => x.id === sid);
@@ -665,7 +674,7 @@ async function pedidosMinimos(v) {
     const tot = ps.reduce((t, p) => t + (state[p.id].on ? (Number(state[p.id].qty) || 0) * unitPrice(p, state[p.id].unit) : 0), 0);
     return `${head}<div class="table-wrap"><table class="nosort"><thead><tr><th></th><th>Artículo</th><th class="num">Hay</th><th class="num">Mínimo</th><th class="num">Pedir</th><th>Formato</th></tr></thead><tbody>
       ${ps.map((p) => { const st = state[p.id]; return `<tr data-p="${p.id}" class="${st.on ? '' : 'muted'}"><td><input type="checkbox" data-on ${st.on ? 'checked' : ''} aria-label="Incluir"></td>
-        <td>${esc(p.name)}<div class="small muted">${esc(p.category || '')}</div></td><td class="num txt-bad">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)} ${esc(p.unit)}</td>
+        <td>${esc(p.name)}<div class="small muted">${esc(p.category || '')}</div>${supIdsOf(p).length > 1 ? `<label class="small" style="font-weight:500;margin-top:4px">Pedir a <select data-sup style="width:auto;min-height:32px;padding:3px 6px">${supIdsOf(p).map((id) => `<option value="${id}" ${id === st.sup ? 'selected' : ''}>${esc(supName(id))}${id === p.supplier_id ? ' (habitual)' : ''}</option>`).join('')}</select></label>` : ''}</td><td class="num txt-bad">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)} ${esc(p.unit)}</td>
         <td class="num"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-q value="${esc(st.qty)}"></td><td>${unitSelect(p, st.unit, 'data-u')}</td></tr>`; }).join('')}</tbody></table></div>
       <div class="row between" style="margin-top:10px"><span>${can('costes.ver') ? `Estimado <b>${eur(tot)}</b>` : ''}</span>
         <span class="row"><a class="btn" href="#/pedidos/nuevo?sup=${sid}&min=1">Abrir en pedido completo</a><button type="button" data-act="draft">Guardar borrador</button><button type="button" class="primary" data-act="send">${approver ? 'Crear y enviar' : 'Enviar a aprobación'}</button></span></div>`;
@@ -683,7 +692,8 @@ async function pedidosMinimos(v) {
     if (e.target.matches('[data-on]')) st.on = e.target.checked;
     if (e.target.matches('[data-q]')) st.qty = e.target.value;
     if (e.target.matches('[data-u]')) { st.unit = e.target.value; st.qty = qtyToMin(p, st.unit); }
-    repaint(p.supplier_id || 0);
+    if (e.target.matches('[data-sup]')) { st.sup = Number(e.target.value); regroup(); return render(); }
+    repaint(st.sup || 0);
   });
   v.addEventListener('click', (e) => {
     const b = e.target.closest('button[data-act]'); if (!b) return;
@@ -720,11 +730,11 @@ async function pedidoNuevo(v, existing, q) {
     const sid = Number($('#sup').value);
     const s = S.suppliers.find((x) => x.id === sid);
     $('#sinfo').textContent = s ? [s.order_days && `Días de pedido: ${s.order_days}`, s.phone, s.email].filter(Boolean).join(' · ') : '';
-    const prods = S.products.filter((p) => p.supplier_id === sid || lines[p.id]);
+    const prods = S.products.filter((p) => supIdsOf(p).includes(sid) || lines[p.id]).sort((a, b) => (a.supplier_id === sid ? 0 : 1) - (b.supplier_id === sid ? 0 : 1) || byName(a, b));
     $('#plist').innerHTML = !sid ? '' : prods.length ? `<div class="table-wrap"><table><thead><tr><th>Artículo</th><th class="num">Stock</th><th class="num">Mínimo</th><th class="num">Pedir</th><th>Formato</th></tr></thead><tbody>
       ${prods.map((p) => { const l = lines[p.id] || { qty: '', unit: defaultBuyUnit(p) }; const low = p.min_stock > 0 && p.stock < p.min_stock;
         const sug = low ? Math.ceil(((p.min_stock - p.stock) / unitFactor(p, l.unit)) * 10) / 10 : '';
-        return `<tr class="${low ? 'flag' : ''}"><td>${esc(p.name)}<div class="small muted">${esc(p.category || '')}${p.price ? ' · ' + eur(unitPrice(p, l.unit)) + ' / ' + esc(unitShort(p, l.unit)) : ''}</div></td><td class="num">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)}</td>
+        return `<tr class="${low ? 'flag' : ''}"><td>${esc(p.name)}<div class="small muted">${p.supplier_id && p.supplier_id !== sid ? `<span class="pill">habitual: ${esc(supName(p.supplier_id))}</span> ` : ''}${esc(p.category || '')}${p.price ? ' · ' + eur(unitPrice(p, l.unit)) + ' / ' + esc(unitShort(p, l.unit)) : ''}</div></td><td class="num">${stockText(p, p.stock)}</td><td class="num">${num(p.min_stock)}</td>
         <td class="num"><input class="qty" type="number" step="any" inputmode="decimal" min="0" data-p="${p.id}" value="${l.qty}" placeholder="${sug ? num(sug, 1) : ''}"></td>
         <td>${unitSelect(p, l.unit, `data-u="${p.id}"`)}</td></tr>`; }).join('')}
       </tbody></table></div><div class="small muted">Resaltado: por debajo del mínimo (la sugerencia aparece en gris).</div>` : '<div class="empty small">Este proveedor no tiene artículos asignados. Añádelos abajo o en Existencias.</div>';
@@ -2141,8 +2151,11 @@ Content-Type: application/json
   // --- importar archivo ---
   v.innerHTML = head + `<div class="card">
     <p class="small muted">Exporta de Qamarero el informe de <b>ventas por producto</b> del periodo (Excel o CSV) y súbelo. Los nombres ya vinculados se asignan solos; los nuevos te los pregunto una vez.</p>
-    <div class="row"><div class="field"><label>Desde</label><input type="date" id="from" value="${today()}"></div><div class="field"><label>Hasta</label><input type="date" id="to" value="${today()}"></div></div>
+    <div class="row"><div class="field"><label>Desde</label><input type="date" id="from" value="${q.get('dia') || today()}"></div><div class="field"><label>Hasta</label><input type="date" id="to" value="${q.get('dia') || today()}"></div></div>
+    <p class="small muted">Lo mejor es importar <b>cada día</b> (desde = hasta = ese día): así se cuadra con la caja de ese día y el almacén se descuenta al día.</p>
     <div class="field"><label>Archivo</label><input type="file" id="file" accept=".xlsx,.xls,.csv,.txt"></div>
+    <div class="field"><label>Complementos (opcional)</label><input type="file" id="cfile" accept=".xlsx,.xls,.csv,.txt">
+      <div class="small muted">El informe <b>productos con complementos más vendidos</b> del mismo periodo. Con él separo las tapas y medias raciones de las raciones enteras, para descontar del almacén lo que de verdad sale (tapa = ${num(tapaFactor() * 100, 0)} % del escandallo, media = 50 %).</div></div>
     <div id="cols"></div><div id="res"></div></div>`;
   let sheet = null;
   $('#file').onchange = async () => {
@@ -2165,15 +2178,43 @@ Content-Type: application/json
       agg[k].units += units;
       if (ci('revenue') >= 0) agg[k].revenue += parseNum(row[ci('revenue')]) || 0;
     }
+    // complementos: las tapas y medias raciones se separan de la ración entera
+    const cf = $('#cfile').files[0];
+    let compNote = '';
+    if (cf) {
+      const cs = await readSheet(cf);
+      const col = (words) => guessCol(cs.headers, words);
+      const cP = col(['producto', 'articulo', 'nombre']), cC = col(['complemento', 'opcion', 'modificador']), cU = col(['cantidad', 'unidades', 'uds']), cT = col(['total', 'importe']);
+      if (cP < 0 || cC < 0 || cU < 0) throw new Error('El archivo de complementos no tiene las columnas Producto, Complemento y Cantidad');
+      const PREFIX = /^(?:1\/2|½|media|medio)\s+(?:raci[oó]n|rac\.?)\s+(?:de\s+)?|^tapa\s+(?:de\s+)?/i;
+      let nSplit = 0;
+      for (const row of cs.data) {
+        const prod = String(row[cP] ?? '').trim(), comp = String(row[cC] ?? '').trim(), u = parseNum(row[cU]);
+        if (!prod || !(u > 0)) continue;
+        const label = /tapa/i.test(comp) ? 'Tapa' : /(1\/2|½|media|medio)/i.test(comp) ? '1/2 Ración' : null;
+        if (!label) continue; // otros complementos (punto de la carne, refresco del combinado…) no cambian la ración
+        if (agg[norm(prod)] && PREFIX.test(prod)) continue; // las ventas ya traen la media ración por separado
+        const base = prod.replace(PREFIX, '').trim();
+        const rev = cT >= 0 ? parseNum(row[cT]) || 0 : null;
+        const key = norm(base), tgt = agg[key] || Object.values(agg).find((x) => norm(x.name) === key);
+        if (tgt) { tgt.units = Math.max(tgt.units - u, 0); if (tgt.revenue != null && rev != null) tgt.revenue = Math.max(tgt.revenue - rev, 0); }
+        const nm = `${label} de ${base}`, k2 = norm(nm);
+        agg[k2] ||= { name: nm, units: 0, revenue: rev != null ? 0 : null };
+        agg[k2].units += u; if (rev != null && agg[k2].revenue != null) agg[k2].revenue += rev;
+        nSplit += u;
+      }
+      for (const [k, x] of Object.entries(agg)) if (!(x.units > 0)) delete agg[k];
+      compNote = nSplit ? `<p class="small muted">${num(nSplit, 0)} tapas y medias raciones separadas de las raciones enteras con el archivo de complementos.</p>` : '';
+    }
     const rows = Object.values(agg);
     if (!rows.length) throw new Error('No encuentro filas con producto y unidades');
     const { matched, pending } = await api('sales/match', { body: { rows } });
-    $('#res').innerHTML = `<h3 style="margin-top:18px">Reconocidos (${matched.length})</h3>
+    $('#res').innerHTML = `${compNote}<h3 style="margin-top:18px">Reconocidos (${matched.length})</h3>
       ${matched.length ? `<div class="table-wrap"><table><thead><tr><th>Qamarero</th><th>Plato</th><th class="num">Uds</th><th class="num">Importe</th></tr></thead><tbody>${matched.map((m) => `<tr><td>${esc(m.pos_name)}</td><td>${esc(recById(m.recipe_id)?.name)}${m.factor !== 1 ? ` × ${num(m.factor, 3)}` : ''}${m.auto ? ' <span class="pill warn" title="Vinculado por parecido: revisa que sea correcto">auto</span>' : ''}</td><td class="num">${num(m.units)}</td><td class="num">${m.revenue != null ? eur(m.revenue) : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty small">Ninguno todavía.</div>'}
       <h3 style="margin-top:18px">Nuevos: asígnalos (${pending.length})</h3>
       ${pending.length ? `<p class="small muted">Elige el plato de cada nombre. Las medias raciones vienen con factor 0,5 propuesto. Lo que dejes sin asignar queda en Pendientes para más tarde. Marca "No es comida" en bebidas sin control, suplementos, etc.</p>
       <div class="table-wrap"><table><thead><tr><th>Qamarero</th><th class="num">Uds</th><th>Plato</th><th class="num">Factor</th><th class="num">PVP variante</th><th>No es comida</th></tr></thead><tbody>
-      ${pending.map((p, i) => `<tr data-p="${i}"><td>${esc(p.pos_name)}</td><td class="num">${num(p.units)}</td><td><select data-k="recipe">${recOpts(null)}</select></td><td class="num"><input class="qty" type="number" step="any" data-k="factor" value="${halfFactor(p.pos_name)}"></td><td class="num"><input class="qty" type="number" step="any" data-k="pvp" placeholder="opcional"></td><td><input type="checkbox" data-k="ign" style="width:auto;min-height:0"></td></tr>`).join('')}
+      ${pending.map((p, i) => `<tr data-p="${i}"><td>${esc(p.pos_name)}</td><td class="num">${num(p.units)}</td><td><select data-k="recipe">${recOpts(null)}</select></td><td class="num"><input class="qty" type="number" step="any" data-k="factor" value="${/^tapa\b/i.test(p.pos_name) ? tapaFactor() : halfFactor(p.pos_name)}"></td><td class="num"><input class="qty" type="number" step="any" data-k="pvp" placeholder="opcional"></td><td><input type="checkbox" data-k="ign" style="width:auto;min-height:0"></td></tr>`).join('')}
       </tbody></table></div>` : '<div class="empty small">Todo reconocido. 👍</div>'}
       <div class="sticky-foot row between"><span class="small muted">Periodo ${fdate($('#from').value)} → ${fdate($('#to').value)}</span><button class="primary" id="doimp">Volcar ventas</button></div>`;
     $('#doimp').onclick = (e) => act(e.target, async () => {
@@ -2188,11 +2229,17 @@ Content-Type: application/json
       if (!$('#from').value || !$('#to').value || $('#from').value > $('#to').value) throw new Error('Revisa las fechas del periodo');
       if (!rowsOut.length && !left.length) throw new Error('No hay nada que volcar');
       const body = { date_from: $('#from').value, date_to: $('#to').value, filename: $('#file').files[0]?.name, save_aliases: true, rows: rowsOut, pending: left };
-      const r0 = await api('sales/import', { body });
+      let r0;
+      try { r0 = await api('sales/import', { body }); } catch (err) {
+        if (!/Ya hay ventas importadas/.test(err.message)) throw err;
+        if (!(await confirmModal(err.message, 'Sustituir'))) return;
+        r0 = await api('sales/import', { body: { ...body, replace: true } });
+      }
       const r = r0.id ? r0 : null;
       await modal(`<h2>Ventas volcadas</h2>${r ? `<p><b>${eur(r.revenue)}</b> sin IVA en ${r.dishes} ${r.dishes === 1 ? 'plato' : 'platos'}.</p>` : ''}
         ${left.length ? `<p>${left.length} ${left.length === 1 ? 'nombre queda' : 'nombres quedan'} en <b>Pendientes</b>.</p>` : ''}
-        ${r?.without_recipe?.length ? `<p class="txt-warn">Sin escandallo (no descuentan stock): ${r.without_recipe.map(esc).join(', ')}</p>` : ''}
+        ${r && r.stock_share === 0 ? '<p class="small muted">Es de antes del inventario de arranque: cuenta para las ventas y el food cost, pero no descuenta almacén (lo contado ya lo reflejaba).</p>' : r && r.stock_share < 1 ? `<p class="small muted">El periodo empieza antes del inventario de arranque: solo descuenta del almacén la parte posterior (${num(r.stock_share * 100, 0)} %).</p>` : ''}
+        ${r?.without_recipe?.length ? `<p class="txt-warn">Sin escandallo todavía: ${r.without_recipe.map(esc).join(', ')}. No descuentan stock hasta que tengan escandallo; entonces se recalcula solo.</p>` : ''}
         <div class="actions"><button class="primary" value="ok">Cerrar</button></div>`);
       go('#/ventas?tab=historial');
     });
@@ -2299,7 +2346,7 @@ async function doMerge(kind, items, keep, newname) {
   await api(`${kind}/merge`, { body: { target_id: keep, source_ids: items.map((x) => x.id).filter((id) => id !== keep) } });
   if (newname && newname !== kept.name) await api(`${kind}/${keep}`, { method: 'PUT', body: { name: newname } }).catch(() => null); // si el nombre ya existe, se queda el que tenía
 }
-async function mergeDialog(kind, items) {
+async function mergeDialog(kind, items, opts = {}) {
   const isP = kind === 'products';
   if (items.length < 2) throw new Error('Marca al menos dos para fusionarlos');
   if (isP && items.some((p) => p.prep_recipe_id)) throw new Error('Las elaboraciones no se fusionan aquí: quítalas de la selección');
@@ -2311,7 +2358,7 @@ async function mergeDialog(kind, items) {
     <p class="small muted">Elige cuál se queda. ${isP ? 'Los albaranes, pedidos, stock, inventarios, mermas y escandallos de los demás pasan a él' : 'Sus artículos, pedidos y albaranes pasan a él'}; los demás desaparecen. Lo que le falte (categoría, proveedor, CIF, teléfono…) se completa con los datos de los otros.</p>
     ${isP && units.size > 1 ? '<p class="txt-warn">Hay artículos con distinta unidad de control: solo se pueden juntar los que se controlan igual (kg, l o ud).</p>' : ''}
     ${items.map((x) => `<label class="check" style="align-items:flex-start"><input type="radio" name="keep" value="${x.id}" ${x === best ? 'checked' : ''}> <span><b>${esc(x.name)}</b><br><span class="small muted">${info(x)}</span></span></label>`).join('')}
-    <div class="field" style="margin-top:10px"><label>Nombre con el que se queda</label><input name="newname" value="${esc(finalName(kind, best))}" required></div>
+    <div class="field" style="margin-top:10px"><label>Nombre con el que se queda</label><input name="newname" value="${esc(finalName(kind, best))}" required>${opts.generic ? '<div class="small muted">Mejor un nombre genérico, sin marca ni proveedor: «Aceite de oliva suave», «Tomate triturado». Cada proveedor seguirá reconociéndose por su propio nombre al escanear sus albaranes.</div>' : ''}</div>
     <p class="small txt-bad">No se puede deshacer (salvo restaurando una copia de seguridad).</p>
     <div class="actions"><button data-close>Cancelar</button><button class="primary" value="ok">Fusionar</button></div>`, {
     onOpen: (f) => $$('[name=keep]', f).forEach((rb) => (rb.onchange = () => { const x = items.find((y) => y.id === Number(rb.value)); $('[name=newname]', f).value = isP ? cleanDesc(x.name) || x.name : x.name; })),
@@ -2336,14 +2383,52 @@ async function bajaProducts(items) {
   toast(items.length === 1 ? 'Artículo dado de baja' : `${items.length} artículos dados de baja`);
   return true;
 }
-async function repetidos(v, kind) {
+// Lo mismo de distintos proveedores ("Aceite de oliva suave (garrafa 5 l)" de uno y "ACEITE GOURMET OLIVA SUAVE 5L" de otro):
+// se comparan las palabras que importan, sin marcas de la casa, envases ni medidas; misma unidad y misma categoría.
+const XSTOP = new Set('de del la el los las en con sin y a al x ud uds unid unidades kg gr grs g l lt cl ml caja cj pack bot botella botellas quality economy gourmet garrafa bolsa bol lata bote cubo saco tarrina pet vidrio bdja bandeja granel pu eu ek extra fresco fresca p u e k c s n t m'.split(' '));
+const xTokens = (n) => new Set(norm(cleanDesc(n)).replace(/[^a-z0-9ñ ]/g, ' ').split(' ').filter((w) => w.length > 1 && !XSTOP.has(w) && !/\d/.test(w)).map((w) => (w.length > 4 && w.endsWith('s') ? w.slice(0, -1) : w)));
+function crossGroups(list) {
+  const T = list.map((p) => ({ p, t: xTokens(p.name) }));
+  const parent = T.map((_, i) => i), find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  for (let i = 0; i < T.length; i++) for (let j = i + 1; j < T.length; j++) {
+    const a = T[i], b = T[j];
+    if (a.p.unit !== b.p.unit || (a.p.supplier_id && a.p.supplier_id === b.p.supplier_id)) continue;
+    if (a.p.category && b.p.category && a.p.category !== b.p.category) continue;
+    if (!a.t.size || !b.t.size) continue;
+    let inter = 0; for (const w of a.t) if (b.t.has(w)) inter++;
+    const small = Math.min(a.t.size, b.t.size), big = Math.max(a.t.size, b.t.size);
+    if (inter >= Math.min(2, small) && inter / small >= 0.99 && inter / big > 0.5) parent[find(i)] = find(j);
+  }
+  const g = {}; T.forEach((x, i) => (g[find(i)] = g[find(i)] || []).push(x.p));
+  return Object.values(g).filter((x) => x.length > 1 && x.length <= 6 && new Set(x.map((p) => p.supplier_id || 0)).size > 1);
+}
+async function repetidos(v, kind, mode) {
   if (!can('productos.editar')) throw new Error('No tienes permiso para editar existencias y proveedores');
   await reload();
   const isP = kind === 'products';
   const list = isP ? S.products.filter((p) => !p.prep_recipe_id) : S.suppliers;
-  const groups = isP ? dupGroups(list, (p) => [dupKey(p.name)]) : dupGroups(list, (x) => [cifK(x.cif).length >= 8 ? 'c:' + cifK(x.cif) : '', 'n:' + supKey(x.name), 'k:' + dupKey(x.name)]);
+  const cross = isP && mode === 'cross';
+  const groups = cross ? crossGroups(list) : isP ? dupGroups(list, (p) => [dupKey(p.name)]) : dupGroups(list, (x) => [cifK(x.cif).length >= 8 ? 'c:' + cifK(x.cif) : '', 'n:' + supKey(x.name), 'k:' + dupKey(x.name)]);
   const back = isP ? '#/productos' : '#/proveedores';
+  if (cross) {
+    v.innerHTML = `<div class="row between"><h1>Mismo género, varios proveedores</h1><a class="btn" href="#/productos">Volver</a></div>
+      <div class="tabs"><a href="#/productos/repetidos">Repetidos</a><a href="#/productos/mismo" class="on">Varios proveedores</a></div>
+      <div class="card small"><p style="margin-top:0"><b>Por qué juntarlos:</b> si el aceite te lo traen dos proveedores y en la app son dos artículos, el escandallo solo puede descontar de uno y el stock nunca cuadra. Lo correcto es <b>un artículo por género</b> (lo que se usa en cocina) y que cualquier proveedor lo traiga.</p>
+      <p style="margin-bottom:0">Al fusionar, todo pasa al que se queda: stock, albaranes, escandallos y precios. El proveedor del otro queda como <b>otro proveedor</b> del artículo (se ve en su ficha, en «Quién lo trae»), y al hacer pedidos puedes pedírselo a cualquiera. Ponle un nombre genérico, sin marca, por ejemplo «Aceite de oliva suave». Revisa cada grupo: son parecidos por el nombre y puede colarse alguno que no sea lo mismo.</p></div>
+      ${groups.length ? groups.map((g, gi) => `<div class="card mergegrp" data-g="${gi}">${g.map((x) => `<div class="row between" style="flex-wrap:nowrap"><label><input type="checkbox" data-id="${x.id}" checked> <span><b>${esc(x.name)}</b> <span class="small muted">${esc(x.unit)} · ${esc(x.supplier_name || 'sin proveedor')} · stock ${stockText(x, x.stock)}${can('costes.ver') && x.price ? ' · ' + eur(x.price) + '/' + esc(x.unit) : ''}</span></span></label>
+        <button type="button" class="sm ghost" data-edit="${x.id}" aria-label="Corregir">✏️</button></div>`).join('')}
+        <div class="row" style="margin-top:6px"><button type="button" class="primary sm" data-merge="${gi}">🔁 Es lo mismo: juntar en uno</button></div></div>`).join('')
+        : '<div class="card empty">No he encontrado artículos parecidos de proveedores distintos. Si conoces alguno, márcalos en <a href="#/productos/lista">Existencias → Editar en lista</a> y pulsa Fusionar.</div>'}`;
+    $$('[data-edit]', v).forEach((b) => (b.onclick = () => act(b, async () => { const r = await productQuick(prodById(b.dataset.edit)); if (r) repetidos(v, kind, mode); })));
+    $$('[data-merge]', v).forEach((b) => (b.onclick = () => act(b, async () => {
+      const g = groups[b.dataset.merge], box = b.closest('.mergegrp');
+      const sel = g.filter((x) => $(`[data-id="${x.id}"]`, box).checked);
+      if (await mergeDialog(kind, sel, { generic: true })) repetidos(v, kind, mode);
+    })));
+    return;
+  }
   v.innerHTML = `<div class="row between"><h1>${isP ? 'Artículos' : 'Proveedores'} repetidos</h1><a class="btn" href="${back}">Volver</a></div>
+    ${isP ? '<div class="tabs"><a href="#/productos/repetidos" class="on">Repetidos</a><a href="#/productos/mismo">Varios proveedores</a></div>' : ''}
     <div class="card small">Estos ${isP ? 'artículos tienen el mismo nombre si se quitan lotes, fechas, cantidades y mayúsculas' : 'proveedores tienen el mismo CIF o casi el mismo nombre'}. Revisa cada grupo, desmarca lo que no sea lo mismo y pulsa <b>Fusionar</b>: todo su historial pasa al que se queda.
       <br>¿Falta alguno? ${isP ? 'En <a href="#/productos/lista">Existencias → Editar en lista</a>' : 'En la lista de proveedores'} márcalos con la casilla y pulsa <b>Fusionar</b>.</div>
     ${groups.length ? `<div class="card row between" style="border-color:var(--accent)"><div><b>${groups.length} grupos de repetidos (${groups.reduce((n, g) => n + g.length, 0)} ${isP ? 'artículos' : 'proveedores'})</b>
@@ -2408,6 +2493,7 @@ VIEWS.productos = async (v, id, q) => {
   if (id === 'lista') return existenciasLista(v);
   if (id === 'alergenos') return revisarAlergenos(v);
   if (id === 'repetidos') return repetidos(v, 'products');
+  if (id === 'mismo') return repetidos(v, 'products', 'cross');
   if (id) return productoEdit(v, id);
   v.innerHTML = `<div class="row between"><h1>Existencias</h1><div class="row"><button id="imp">Importar Excel</button><a class="btn" href="#/productos/alergenos">🧠 Revisar alérgenos${S.products.filter((p) => !p.allergens_checked).length ? ` <span class="badge-count">${S.products.filter((p) => !p.allergens_checked).length}</span>` : ''}</a>${can('productos.editar') ? `<a class="btn" href="#/productos/repetidos">🔁 Repetidos${(() => { const n = dupGroups(S.products.filter((p) => !p.prep_recipe_id), (p) => [dupKey(p.name)]).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a>` : ''}<a class="btn" href="#/productos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/productos/nuevo">+ Nuevo artículo</a></div></div>
     <p class="small muted" style="margin-top:-6px">Existencias es todo lo que se compra a proveedores y se guarda en almacén: ingredientes, bebidas, limpieza… Lo que se vende está en <a href="#/escandallos">Carta</a>.</p>
@@ -2507,6 +2593,26 @@ async function existenciasLista(v) {
   status();
 }
 
+// Tarjeta "Quién lo trae": el mismo artículo puede llegar de varios proveedores; el stock y el escandallo son uno solo
+async function drawSups(v, p) {
+  const box = $('#psups', v); if (!box) return;
+  const list = await api(`products/${p.id}/suppliers`).catch(() => []);
+  const others = list.filter((x) => x.supplier_id !== p.supplier_id);
+  const ed = can('productos.editar');
+  box.innerHTML = `<h3 style="margin-top:8px">Quién lo trae</h3>
+    <p class="small muted">Si varios proveedores te traen lo mismo, es <b>un solo artículo</b>: el stock y el escandallo no cambian según quién lo traiga. Cada albarán se apunta a este artículo y aquí ves de quién llega y a qué precio.</p>
+    <div class="table-wrap"><table class="nosort"><thead><tr><th>Proveedor</th><th class="num">Último precio</th><th>Última entrega</th><th class="num">Entregas</th><th></th></tr></thead><tbody>
+    ${p.supplier_id ? (() => { const h = list.find((x) => x.supplier_id === p.supplier_id); return `<tr><td><b>${esc(supName(p.supplier_id))}</b> <span class="pill ok">habitual</span></td><td class="num">${h?.last_price != null ? eur(h.last_price) + '/' + esc(p.unit) : '—'}</td><td>${h?.last_date ? fdate(h.last_date) : '—'}</td><td class="num">${h?.receipts || 0}</td><td></td></tr>`; })() : ''}
+    ${others.map((x) => `<tr><td>${esc(x.name)}</td><td class="num">${x.last_price != null ? eur(x.last_price) + '/' + esc(p.unit) : '—'}</td><td>${x.last_date ? fdate(x.last_date) : '—'}</td><td class="num">${x.receipts}</td>
+      <td class="num">${ed ? `<button type="button" class="sm" data-hab="${x.supplier_id}">Hacer habitual</button>${!x.receipts ? ` <button type="button" class="sm ghost" data-unsup="${x.supplier_id}" aria-label="Quitar">✕</button>` : ''}` : ''}</td></tr>`).join('')}
+    ${!p.supplier_id && !others.length ? '<tr><td colspan="5" class="small muted">Todavía no ha llegado de ningún proveedor.</td></tr>' : ''}
+    </tbody></table></div>
+    ${ed ? `<div class="row" style="margin:6px 0 12px"><select id="addsup" style="max-width:280px"><option value="">+ También lo trae…</option>${S.suppliers.filter((x) => !supIdsOf(p).includes(x.id)).map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></div>` : ''}`;
+  if ($('#addsup', box)) $('#addsup', box).onchange = (e) => act(null, async () => { if (!e.target.value) return; await api(`products/${p.id}/suppliers`, { body: { supplier_id: Number(e.target.value) } }); await reload(true); drawSups(v, prodById(p.id)); toast('Proveedor añadido'); });
+  $$('[data-hab]', box).forEach((b) => (b.onclick = () => act(b, async () => { await api('products/' + p.id, { method: 'PUT', body: { supplier_id: Number(b.dataset.hab) } }); await reload(true); toast('Proveedor habitual cambiado'); route(); })));
+  $$('[data-unsup]', box).forEach((b) => (b.onclick = () => act(b, async () => { await api(`products/${p.id}/suppliers?supplier_id=${b.dataset.unsup}`, { method: 'DELETE' }); await reload(true); drawSups(v, prodById(p.id)); })));
+}
+
 async function productoEdit(v, id) {
   const isNew = id === 'nuevo';
   const p = isNew ? { name: '', category: '', unit: 'kg', price: 0, supplier_id: '', min_stock: 0 } : prodById(id);
@@ -2519,6 +2625,7 @@ async function productoEdit(v, id) {
       ${fieldHtml({ name: 'supplier_id', label: 'Proveedor habitual', type: 'select', options: [['', '—'], ...S.suppliers.map((x) => [x.id, x.name])] }, p.supplier_id ?? '')}</div>
     <div class="row">${fieldHtml({ name: 'price', label: 'Precio por unidad de control sin IVA (€)', type: 'number', help: 'Se actualiza solo con cada albarán' }, p.price)}
       ${fieldHtml({ name: 'min_stock', label: 'Stock mínimo (en unidad de control)', type: 'number', help: 'Por debajo se avisa para pedir' }, p.min_stock)}</div>
+    ${!isNew ? '<div id="psups"></div>' : ''}
     <h3 style="margin-top:8px">Alérgenos que contiene</h3>
     <p class="small muted">Los platos que lo lleven los heredan automáticamente. Compruébalo con la etiqueta o la ficha técnica del proveedor. ${!isNew ? '<button type="button" class="sm" id="sugg">🧠 Sugerir</button>' : ''} ${!isNew && !p.allergens_checked ? '<span class="pill warn">sin revisar</span>' : ''}</p>
     <div id="algp">${algPicker('palg', splitList(p.allergens))}</div>
@@ -2526,6 +2633,7 @@ async function productoEdit(v, id) {
     <p class="small muted">Cómo te llega o cómo lo cuentas: caja de 24 botellas, saco de 25 kg, garrafa de 5 l, barril de 30 l… Escribe cuántas unidades de control trae cada formato. El marcado como habitual sale por defecto en pedidos y recepción.</p>
     <div id="fmts"></div><button type="button" id="addf" class="sm">+ Añadir formato</button>
     <div class="sticky-foot row between" style="margin-top:14px"><div>${!isNew ? '<button type="button" class="danger" id="del">Eliminar artículo</button>' : ''}</div><div class="row"><a class="btn" href="#/productos">Cancelar</a><button class="primary">Guardar</button></div></div></form>`;
+  if (!isNew) drawSups(v, p);
   const unitNow = () => $('[name=unit]', v).value;
   const drawF = () => {
     const u = unitNow();
@@ -2884,7 +2992,7 @@ VIEWS.caja = async (v, _id, q) => {
       ${cur.updated_at ? `<div class="small muted">Registrada por ${esc(cur.user_name || '')} · ${esc(cur.updated_at)}</div>` : ''}</div>
       <div class="row">${F.map(([k, l]) => `<div class="field"><label>${l} (€)</label><input type="number" step="0.01" inputmode="decimal" name="${k}" value="${cur[k] ?? ''}">${k === 'cash' ? '<button type="button" class="sm" id="count" style="margin-top:6px">🪙 Contar billetes y monedas</button>' : ''}</div>`).join('')}</div>
       <div class="row">
-        <div class="field"><label>Cierre Z de Qamarero (€ con IVA)</label><input type="number" step="0.01" inputmode="decimal" name="pos_total" value="${cur.pos_total ?? ''}">${cur.qamarero_import ? `<div class="small muted">Ventas importadas de ese día: ${eur(cur.qamarero_import)}</div>` : ''}</div>
+        <div class="field"><label>Cierre Z de Qamarero (€ con IVA)</label><input type="number" step="0.01" inputmode="decimal" name="pos_total" value="${cur.pos_total ?? (cur.qamarero_import ? Math.round(cur.qamarero_import * 100) / 100 : '')}">${cur.qamarero_import ? `<div class="small muted">Ventas importadas de ese día: ${eur(cur.qamarero_import)} con IVA${cur.pos_total == null ? ' (se usa como cierre si no escribes otro)' : ''}</div>` : ''}${can('ventas.gestionar') ? `<a class="btn sm" style="margin-top:6px" href="#/ventas?dia=${day}">📥 ${cur.qamarero_import ? 'Volver a importar' : 'Importar'} ventas de Qamarero de este día</a>` : ''}</div>
         <div class="field"><label>Pagos hechos con dinero de caja (€)</label><input type="number" step="0.01" inputmode="decimal" name="cash_out" value="${cur.cash_out ?? ''}"><div class="small muted">Proveedores, compras de última hora… No se restan del total.</div></div>
         <div class="field"><label>Comensales</label><input type="number" step="1" inputmode="numeric" name="covers" value="${cur.covers ?? ''}"></div>
       </div>
@@ -3228,6 +3336,7 @@ VIEWS.ajustes = async (v) => {
     ${fieldHtml({ name: 'food_cost_target', label: 'Objetivo de coste de materia prima (%)', type: 'number', help: 'Lo habitual en restauración está entre el 25 y el 35 %' }, S.settings.food_cost_target)}
     <h3 style="margin-top:14px">Escandallos</h3>
     ${fieldHtml({ name: 'misc_pct', label: '% de varios por defecto', type: 'number', help: 'Sal, especias, aceite de fritura y pequeños ingredientes que no se pesan. Se suma al coste de cada plato (cada ficha puede cambiarlo)' }, S.settings.misc_pct)}
+    ${fieldHtml({ name: 'tapa_factor', label: 'Una tapa equivale a… (de una ración)', type: 'number', help: 'Para descontar del almacén lo que se vende como tapa en Qamarero. 0,33 = un tercio de la ración; la media ración siempre es 0,5' }, S.settings.tapa_factor ?? 0.33)}
     ${fieldHtml({ name: 'expected_revenue', label: 'Facturación mensual prevista, sin IVA (€)', type: 'number', help: 'Para repartir los gastos fijos entre los platos. Si lo dejas vacío, se usa la media real de ventas (Qamarero) o de caja de los últimos 90 días' }, S.settings.expected_revenue ?? '')}
     <div class="small muted" style="margin-bottom:12px">${S.fixed?.pct != null ? `Ahora mismo: gastos fijos ${eur(S.fixed.monthly)}/mes ÷ ${eur(S.fixed.revenue)}/mes (${esc(S.fixed.source)}) = <b>${pct(S.fixed.pct)}</b> que se imputa a cada plato.` : `Todavía no se pueden imputar los gastos fijos: ${esc(S.fixed?.note || 'falta la facturación')}.`}</div>
     <button class="primary">Guardar</button></form>

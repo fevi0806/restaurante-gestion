@@ -44,7 +44,9 @@ async function unsyncPush() {
 }
 // tarjeta para activar los avisos en este móvil
 async function pushCard(el, why) {
+  if (!el) return;
   const st = await pushState();
+  if (!el.isConnected) return; // ya se ha cambiado de pantalla
   if (st === 'on' || st === 'unsupported') { el.innerHTML = st === 'on' ? '<div class="small muted" style="margin:8px 0">🔔 Avisos activados en este dispositivo.</div>' : ''; return; }
   el.innerHTML = `<div class="card push-card"><div><b>🔔 Recibe los avisos en el móvil</b><div class="small muted">${esc(why)}</div>
     ${st === 'ios-install' ? '<div class="small" style="margin-top:6px">En iPhone: toca <b>Compartir</b> → <b>Añadir a pantalla de inicio</b>, abre la app desde ese icono y vuelve aquí.</div>' : ''}

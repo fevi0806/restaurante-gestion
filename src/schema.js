@@ -55,5 +55,6 @@ export const SCHEMA = [
 "CREATE TABLE IF NOT EXISTS notices ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, title TEXT NOT NULL, body TEXT, url TEXT, tag TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, sent_at TEXT )",
 "CREATE INDEX IF NOT EXISTS idx_notices ON notices(user_id, id)",
 "CREATE TABLE IF NOT EXISTS events ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_date TEXT NOT NULL, start_time TEXT, end_time TEXT, service TEXT, title TEXT NOT NULL, kind TEXT, people INTEGER NOT NULL DEFAULT 0, kids INTEGER, contact_name TEXT, phone TEXT, email TEXT, space TEXT, menu TEXT, price_pp REAL, deposit REAL, deposit_paid INTEGER NOT NULL DEFAULT 0, deposit_date TEXT, status TEXT NOT NULL DEFAULT 'consulta', allergies TEXT, notes TEXT, final_total REAL, created_by INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP )",
-"CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date)"
+"CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date)",
+"CREATE TABLE IF NOT EXISTS product_suppliers ( product_id INTEGER NOT NULL, supplier_id INTEGER NOT NULL, last_price REAL, last_date TEXT, receipts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (product_id, supplier_id) )"
 ];

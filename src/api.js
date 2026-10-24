@@ -1,5 +1,5 @@
 // API de la aplicación de gestión del restaurante (Cloudflare Workers + D1)
-import { ensureSchema, SCHEMA_VERSION, recomputeStock } from './migrate.js';
+import { ensureSchema, SCHEMA_VERSION, recomputeStock, rebuildProductSuppliers } from './migrate.js';
 import { turnos, publicSchedule } from './turnos.js';
 import { eventos, eventAlerts } from './eventos.js';
 import { push, enqueuePush, pushUsersWith } from './push.js';
@@ -148,13 +148,13 @@ async function settings(env) {
   const { results } = await env.DB.prepare('SELECT key, value FROM settings').all();
   const s = Object.fromEntries(results.map((r) => [r.key, r.value]));
   return { restaurant_name: s.restaurant_name || 'Mi restaurante', iva_pct: Number(s.iva_pct ?? 10), food_cost_target: Number(s.food_cost_target ?? 30),
-    misc_pct: Number(s.misc_pct ?? 3), last_backup: s.last_backup || null, expected_revenue: s.expected_revenue ? Number(s.expected_revenue) : null, qamarero_cols: s.qamarero_carta_cols ? JSON.parse(s.qamarero_carta_cols) : null };
+    misc_pct: Number(s.misc_pct ?? 3), tapa_factor: Number(s.tapa_factor) > 0 ? Number(s.tapa_factor) : 0.33, last_backup: s.last_backup || null, expected_revenue: s.expected_revenue ? Number(s.expected_revenue) : null, qamarero_cols: s.qamarero_carta_cols ? JSON.parse(s.qamarero_carta_cols) : null };
 }
 
 // ---------- consultas reutilizables ----------
 const PRODUCTS_SQL = `
   SELECT p.id, p.name, p.category, p.unit, p.price, p.supplier_id, p.min_stock, p.allergens, p.allergens_checked, p.prep_recipe_id, s.name AS supplier_name,
-         p.stock_cache AS stock
+         p.stock_cache AS stock, p.other_suppliers
   FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id
   WHERE p.active = 1 ORDER BY p.category, p.name`;
 
@@ -328,6 +328,9 @@ async function productsMerge(request, env, user, ctx) {
       }
     }
     for (const t of PRODUCT_REFS) stmts.push(env.DB.prepare(`UPDATE ${t} SET product_id = ? WHERE product_id = ?`).bind(target, s.id));
+    // su proveedor queda como otro proveedor del artículo que se queda (aunque todavía no haya traído nada)
+    if (s.supplier_id) stmts.push(env.DB.prepare('INSERT OR IGNORE INTO product_suppliers (product_id, supplier_id, last_price, last_date, receipts) VALUES (?,?,?,NULL,0)').bind(target, s.supplier_id, s.price || null));
+    stmts.push(env.DB.prepare('DELETE FROM product_suppliers WHERE product_id = ?').bind(s.id));
     stmts.push(env.DB.prepare('DELETE FROM products WHERE id = ?').bind(s.id));
     String(s.allergens || '').split(',').filter(Boolean).forEach((a) => allergens.add(a));
   }
@@ -503,9 +506,16 @@ export async function onRequest({ request, env, params, ctx: wctx }) {
     const res = await route(parts, request.method, request, env, url, ctx);
     if (res.ok && (ctx.afterPrices || (mutating && ['products', 'receipts'].includes(parts[0])))) await refreshPrepCosts(env);
     if (res.ok && mutating && ['orders', 'receipts', 'suppliers'].includes(parts[0])) await env.DB.prepare(`DELETE FROM settings WHERE key = 'sug_alert'`).run().catch(() => null);
+    // proveedores que traen cada artículo: se rehace al cambiar albaranes, fusionar artículos o cambiar el proveedor habitual
+    if (res.ok && mutating && (parts[0] === 'receipts' || (parts[0] === 'products' && ['merge', 'bulk-edit', 'bulk'].includes(parts[1])) || (parts[0] === 'products' && request.method === 'PUT') || parts[0] === 'suppliers'))
+      await rebuildProductSuppliers(env).catch((e) => console.error('proveedores por artículo', e));
     // las ventas ya volcadas se calcularon con los escandallos de entonces: se apunta que han cambiado
-    if (res.ok && mutating && parts[0] === 'recipes' && !(parts[1] === 'bulk-edit'))
+    if (res.ok && mutating && parts[0] === 'recipes' && !(parts[1] === 'bulk-edit')) {
       await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('recipes_changed_at', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run();
+      // y se rehace solo el consumo de las ventas ya volcadas, con los escandallos nuevos (sin que nadie tenga que pulsar nada)
+      const p2 = recalcStaleSales(env, 25).catch((e) => console.error('recalcular ventas', e));
+      if (wctx?.waitUntil) wctx.waitUntil(p2); else await p2;
+    }
     if (mutating && res.ok && ctx.user && ctx.audit !== false) {
       const p = writeAudit(env, ctx, parts, request.method, raw).catch((e) => console.error('auditoría', e));
       if (wctx?.waitUntil) wctx.waitUntil(p); else await p;
@@ -799,7 +809,7 @@ async function route(parts, method, request, env, url, ctx = {}) {
   if (a === 'settings' && method === 'PUT') {
     need(user, 'super');
     const d = await body(request);
-    const stmts = ['restaurant_name', 'iva_pct', 'food_cost_target', 'misc_pct', 'expected_revenue'].filter((k) => k in d)
+    const stmts = ['restaurant_name', 'iva_pct', 'food_cost_target', 'misc_pct', 'expected_revenue', 'tapa_factor'].filter((k) => k in d)
       .map((k) => env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, String(d[k])));
     if (stmts.length) await env.DB.batch(stmts);
     return json({ ok: true });
@@ -832,6 +842,27 @@ async function route(parts, method, request, env, url, ctx = {}) {
   if (a === 'recipes' && b === 'export') return recipesExport(env, user);
   if (a === 'suppliers' && b === 'bulk' && method === 'POST') return suppliersBulk(request, env, user);
   if (a === 'products' && b === 'merge' && method === 'POST') return productsMerge(request, env, user, ctx);
+  if (a === 'products' && b && c === 'suppliers' && method === 'POST') {
+    need(user, 'productos.editar');
+    const d = await body(request);
+    if (!Number(d.supplier_id)) throw new HttpError(400, 'Elige el proveedor');
+    await env.DB.prepare('INSERT OR IGNORE INTO product_suppliers (product_id, supplier_id, last_price, last_date, receipts) VALUES (?,?,NULL,NULL,0)').bind(Number(b), Number(d.supplier_id)).run();
+    await rebuildProductSuppliers(env);
+    ctx.audit = { action: 'modificación', entity: 'artículo', id: b, summary: `Artículo #${b}: añadido otro proveedor (#${d.supplier_id})` };
+    return json({ ok: true });
+  }
+  if (a === 'products' && b && c === 'suppliers' && method === 'DELETE') {
+    need(user, 'productos.editar');
+    const sid = Number(url.searchParams.get('supplier_id'));
+    await env.DB.prepare('DELETE FROM product_suppliers WHERE product_id = ? AND supplier_id = ? AND receipts = 0').bind(Number(b), sid).run();
+    await rebuildProductSuppliers(env);
+    return json({ ok: true });
+  }
+  if (a === 'products' && b && c === 'suppliers' && method === 'GET') {
+    ctx.audit = false;
+    const { results } = await env.DB.prepare(`SELECT ps.*, s.name FROM product_suppliers ps JOIN suppliers s ON s.id = ps.supplier_id WHERE ps.product_id = ? ORDER BY ps.last_date DESC`).bind(b).all();
+    return json(can(user, 'costes.ver') ? results : results.map(({ last_price, ...x }) => x));
+  }
   if (a === 'suppliers' && b === 'merge' && method === 'POST') return suppliersMerge(request, env, user, ctx);
   if (a === 'reset' && method === 'POST') return factoryReset(request, env, user, ctx);
   if (a === 'suppliers' && method === 'POST' && !b) {
@@ -1304,8 +1335,11 @@ async function route(parts, method, request, env, url, ctx = {}) {
     if (b === 'imports' && method === 'DELETE' && c) {
       const old = await env.DB.prepare('SELECT * FROM sales_imports WHERE id = ?').bind(c).first();
       if (old) ctx.audit = { action: 'deshacer', entity: 'ventas', id: c, summary: `Deshecha la importación de ventas ${old.date_from} → ${old.date_to} (${old.revenue} €)`, detail: old };
+      const cut = await stockCutoff(env, true);
+      const frozen = old && cut && String(old.created_at) <= String(cut.at); // su consumo ya está dentro del inventario de arranque
       await env.DB.batch([
-        env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'venta' AND ref_id = ?`).bind(c),
+        frozen ? env.DB.prepare(`UPDATE movements SET ref_type = 'venta_previa' WHERE ref_type = 'venta' AND ref_id = ?`).bind(c)
+          : env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'venta' AND ref_id = ?`).bind(c),
         env.DB.prepare('DELETE FROM sales WHERE import_id = ?').bind(c),
         env.DB.prepare('DELETE FROM sales_imports WHERE id = ?').bind(c),
       ]);
@@ -2057,7 +2091,7 @@ async function alerts(env, user) {
   const st = await settings(env);
   if (can(user, 'ventas.gestionar')) {
     const st2 = await staleSales(env);
-    if (st2.ids.length) add('warn', '🔁', `Has cambiado escandallos después de volcar ventas: recalcula el consumo de ${st2.ids.length} volcado(s) para que el stock cuadre`, '#/ventas?tab=historial');
+    if (st2.ids.length) add('info', '🔁', `Recalculando el consumo de ${st2.ids.length} volcado(s) de ventas con los escandallos nuevos (se hace solo en unos minutos)`, '#/ventas?tab=historial');
   }
   if (can(user, 'turnos.gestionar')) {
     // a partir del jueves, recordar el cuadrante de la semana siguiente
@@ -2481,10 +2515,11 @@ async function recipesBulk(request, env, user) {
 async function salesImport(request, env, user) {
   const d = await body(request);
   if (!isDate(d.date_from) || !isDate(d.date_to)) throw new HttpError(400, 'Indica las fechas del periodo');
+  // primero las ventas (pueden pedir confirmación si ya hay de esas fechas) y después los nombres pendientes
+  const res = (d.rows || []).length ? await importSales(env, user.id, d) : {};
   let saved = 0;
   if (Array.isArray(d.pending) && d.pending.length) saved = await savePending(env, d.pending, d.date_from, d.date_to, d.filename || 'manual');
-  if (!(d.rows || []).length) return json({ pending_saved: saved });
-  return json({ ...(await importSales(env, user.id, d)), pending_saved: saved });
+  return json({ ...res, pending_saved: saved });
 }
 
 async function savePending(env, pending, from, to, source) {
@@ -2510,6 +2545,8 @@ async function matchPosRows(env, rows) {
   const fzmap = {};
   for (const r of recipes) for (const n of [r.name, r.pos_name]) if (n) { const k2 = fz(n); fzmap[k2] = fzmap[k2] === undefined || fzmap[k2] === r.id ? r.id : null; }
   const HALF = /^(1\/2|½|media|medio)\s+(?:(?:racion|rac\.?)\s+)?(?:de\s+)?(.+)$/;
+  const TAPA = /^tapa\s+(?:de\s+)?(.+)$/;
+  const tapaF = Number((await env.DB.prepare(`SELECT value FROM settings WHERE key = 'tapa_factor'`).first())?.value) || 0.33;
   const matched = [], pending = [];
   for (const row of rows) {
     const name = row.name ?? row.pos_name;
@@ -2519,9 +2556,9 @@ async function matchPosRows(env, rows) {
     if (a) { matched.push({ pos_name: name, recipe_id: a.recipe_id, factor: a.factor, pvp: a.pvp, units: row.units, revenue: row.revenue }); continue; }
     if (rmap[k]) { matched.push({ pos_name: name, recipe_id: rmap[k], factor: 1, units: row.units, revenue: row.revenue }); continue; }
     // medias raciones y variantes del nombre: se vinculan solas (y se recuerdan al importar)
-    const h = HALF.exec(k);
-    const id = h ? fzmap[fz(h[2])] : fzmap[fz(k)];
-    if (id) matched.push({ pos_name: name, recipe_id: id, factor: h ? 0.5 : 1, units: row.units, revenue: row.revenue, auto: true });
+    const h = HALF.exec(k), t = !h && TAPA.exec(k);
+    const id = h ? fzmap[fz(h[2])] : t ? fzmap[fz(t[1])] : fzmap[fz(k)];
+    if (id) matched.push({ pos_name: name, recipe_id: id, factor: h ? 0.5 : t ? tapaF : 1, units: row.units, revenue: row.revenue, auto: true });
     else pending.push({ pos_name: name, units: row.units, revenue: row.revenue });
   }
   return { matched, pending };
@@ -2530,6 +2567,20 @@ async function matchPosRows(env, rows) {
 async function importSales(env, userId, d) {
   const rows = (d.rows || []).filter((r) => r.recipe_id && Number(r.units) > 0);
   if (!rows.length) throw new HttpError(400, 'No hay filas asociadas a platos');
+  // no contar dos veces el mismo día: si ya hay ventas de esas fechas, se pregunta si se sustituyen
+  const { results: overlap } = await env.DB.prepare('SELECT id, date_from, date_to, revenue, created_at FROM sales_imports WHERE date_from <= ? AND date_to >= ?').bind(d.date_to, d.date_from).all();
+  if (overlap.length && !d.replace) {
+    const e = new HttpError(409, `Ya hay ventas importadas de esas fechas (${overlap.map((o) => (o.date_from === o.date_to ? o.date_from : o.date_from + ' → ' + o.date_to)).join(', ')}). Si sigues, se sustituyen por las nuevas.`);
+    e.overlap = overlap; throw e;
+  }
+  const cut0 = overlap.length ? await stockCutoff(env, true) : null;
+  if (overlap.length) await runBatch(env, overlap.flatMap((o) => [
+    // si el volcado sustituido es anterior al inventario de arranque, su consumo ya está dentro del recuento: se conserva
+    o.created_at && cut0 && String(o.created_at) <= String(cut0.at)
+      ? env.DB.prepare(`UPDATE movements SET ref_type = 'venta_previa' WHERE ref_type = 'venta' AND ref_id = ?`).bind(o.id)
+      : env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'venta' AND ref_id = ?`).bind(o.id),
+    env.DB.prepare('DELETE FROM sales WHERE import_id = ?').bind(o.id),
+    env.DB.prepare('DELETE FROM sales_imports WHERE id = ?').bind(o.id)]));
   const user = { id: userId };
   const { iva_pct } = await settings(env);
   const div = 1 + iva_pct / 100;
@@ -2569,14 +2620,15 @@ async function importSales(env, userId, d) {
     saleRows.push({ recipe_id: rec.id, units: agg.units, revenue: agg.revenue });
   }
   const { consumption, noRecipe } = await saleConsumption(env, saleRows);
+  const share = stockShare(d.date_from, d.date_to, await stockCutoff(env));
   const imp = await env.DB.prepare(
     `INSERT INTO sales_imports (date_from, date_to, filename, rows, revenue, user_id, calc_at) VALUES (?,?,?,?,?,?, datetime('now')) RETURNING id`
   ).bind(d.date_from, d.date_to, d.filename || null, saleRows.length, r2(totalRevenue), user.id).first();
   const stmts = saleRows.map((s) => env.DB.prepare('INSERT INTO sales (import_id, recipe_id, sale_date, units, revenue) VALUES (?,?,?,?,?)')
     .bind(imp.id, s.recipe_id, d.date_to, s.units, r2(s.revenue)));
-  stmts.push(...saleMovements(env, consumption, imp.id, d.date_from, d.date_to, user.id));
+  stmts.push(...saleMovements(env, consumption, imp.id, d.date_from, d.date_to, user.id, share));
   await runBatch(env, stmts);
-  return { id: imp.id, revenue: r2(totalRevenue), dishes: saleRows.length, without_recipe: noRecipe };
+  return { id: imp.id, revenue: r2(totalRevenue), dishes: saleRows.length, without_recipe: noRecipe, stock_share: share };
 }
 
 // Lo que se ha gastado de cada artículo por unas ventas (raciones × escandallo actual, con mermas de limpieza y cocción)
@@ -2601,20 +2653,49 @@ async function saleConsumption(env, saleRows) {
   }
   return { consumption, noRecipe: recs.filter((r) => !lines.some((l) => l.recipe_id === r.id)).map((r) => r.name) };
 }
-function saleMovements(env, consumption, impId, from, to, userId) {
-  return Object.entries(consumption).map(([pid, c]) => env.DB.prepare(
+// Fecha de corte del stock: el día del último inventario de arranque. Lo vendido hasta ese día ya no estaba en
+// las cámaras cuando se contó, así que esas ventas cuentan para el food cost pero no descuentan almacén.
+async function stockCutoff(env, full = false) {
+  const r = await env.DB.prepare(`SELECT inv_date AS d, created_at AS at FROM inventories WHERE notes = 'Regularización: inventario de arranque' ORDER BY id DESC LIMIT 1`).first();
+  return full ? r || null : r?.d || null;
+}
+// Parte del periodo que sí descuenta almacén (1 = todo, 0 = nada; si el periodo cruza el corte, la parte proporcional de días)
+function stockShare(from, to, cutoff) {
+  if (!cutoff || from > cutoff) return 1;
+  if (to <= cutoff) return 0;
+  const days = (a, b) => Math.round((new Date(b + 'T12:00:00Z') - new Date(a + 'T12:00:00Z')) / 86400000) + 1;
+  return (days(from, to) - days(from, cutoff)) / days(from, to);
+}
+function saleMovements(env, consumption, impId, from, to, userId, share = 1) {
+  if (!(share > 0)) return [];
+  return Object.entries(consumption).filter(([, c]) => Math.abs(c.qty * share) >= 0.0001).map(([pid, c]) => env.DB.prepare(
     `INSERT INTO movements (product_id, type, qty, unit_cost, label, grp, ref_type, ref_id, user_id, mov_date) VALUES (?,?,?,?,?,?,?,?,?,?)`
-  ).bind(Number(pid), 'venta', -r2(c.qty), c.price, `Ventas ${from} → ${to}`, `venta-${impId}`, 'venta', impId, userId, to));
+  ).bind(Number(pid), 'venta', -r2(c.qty * share), c.price, `Ventas ${from} → ${to}`, `venta-${impId}`, 'venta', impId, userId, to));
+}
+// Rehace el consumo de los volcados calculados con escandallos antiguos (los más recientes primero, hasta `limit`)
+async function recalcStaleSales(env, limit = 10) {
+  const st = await staleSales(env);
+  const ids = st.ids.slice(-limit).reverse();
+  for (const id of ids) await recalcSales(env, id, null);
+  return ids.length;
 }
 // Rehace el consumo de un volcado de ventas con los escandallos de hoy (el importe vendido no cambia)
 async function recalcSales(env, impId, userId) {
   const imp = await env.DB.prepare('SELECT * FROM sales_imports WHERE id = ?').bind(impId).first();
   if (!imp) throw new HttpError(404, 'Volcado no encontrado');
   const { results: rows } = await env.DB.prepare('SELECT recipe_id, units FROM sales WHERE import_id = ?').bind(impId).all();
+  const cut = await stockCutoff(env, true);
+  // volcados anteriores al inventario de arranque: el recuento ya los tuvo en cuenta (su consumo estaba restado cuando se
+  // regularizó), así que rehacerlos ahora descuadraría el stock. Se dejan como están.
+  if (cut && String(imp.created_at) <= String(cut.at)) {
+    await env.DB.prepare(`UPDATE sales_imports SET calc_at = datetime('now') WHERE id = ?`).bind(impId).run();
+    return { id: Number(impId), articles: 0, without_recipe: 0, frozen: true };
+  }
   const { consumption, noRecipe } = await saleConsumption(env, rows);
+  const share = stockShare(imp.date_from, imp.date_to, cut?.d || null);
   await runBatch(env, [
     env.DB.prepare(`DELETE FROM movements WHERE ref_type = 'venta' AND ref_id = ?`).bind(impId),
-    ...saleMovements(env, consumption, impId, imp.date_from, imp.date_to, imp.user_id || userId),
+    ...saleMovements(env, consumption, impId, imp.date_from, imp.date_to, imp.user_id || userId, share),
     env.DB.prepare(`UPDATE sales_imports SET calc_at = datetime('now') WHERE id = ?`).bind(impId),
   ]);
   return { id: Number(impId), articles: Object.keys(consumption).length, without_recipe: noRecipe.length };
@@ -3118,4 +3199,4 @@ async function ocrScan(request, env, user) {
   });
 }
 
-export { json, HttpError, body, need, can, runBatch, r2, isDate, settings, localDay, permsOf, uuid, todayStr };
+export { json, HttpError, body, need, can, runBatch, r2, isDate, settings, localDay, permsOf, uuid, todayStr, recalcStaleSales };

@@ -3,7 +3,7 @@
 // Todo es repetible: si algo ya existe, se ignora. Así nunca hay que pegar SQL en la consola.
 import { SCHEMA } from './schema.js';
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 // Columnas añadidas después de la primera versión (para bases de datos ya creadas)
 const COLUMNS = [
@@ -24,6 +24,7 @@ const COLUMNS = [
   ['receipts', 'rec_temp REAL'], ['receipts', 'rec_check INTEGER'],
   ['receipt_lines', 'lot TEXT'], ['receipt_lines', 'expiry TEXT'], ['receipt_lines', 'expiry_done INTEGER NOT NULL DEFAULT 0'],
   ['products', 'stock_cache REAL NOT NULL DEFAULT 0'],
+  ['products', 'other_suppliers TEXT'],
 ];
 
 // Stock guardado en el propio artículo y actualizado al momento con cada movimiento (antes se sumaban todos
@@ -101,9 +102,27 @@ async function migrate(env) {
   // disparadores del stock (después de rehacer tablas, que los borraría) y cálculo inicial
   for (const sql of STOCK_TRIGGERS) await run(env, sql);
   if (v < 11) await recomputeStock(env);
+  if (v < 13) await rebuildProductSuppliers(env);
   // 4) índices (ya con todas las columnas)
   for (const sql of SCHEMA.filter((s) => /^CREATE INDEX/i.test(s))) await run(env, sql);
   // datos
   await run(env, `UPDATE users SET is_super = 1 WHERE role = 'direccion' AND NOT EXISTS (SELECT 1 FROM users WHERE is_super = 1)`);
   await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(String(SCHEMA_VERSION)).run();
+}
+
+// Qué proveedores han traído cada artículo (según los albaranes y facturas), con su último precio.
+// En el artículo se guarda la lista de los que no son el habitual, para no tener que leer los albaranes en cada pantalla.
+export async function rebuildProductSuppliers(env) {
+  await env.DB.batch([
+    // los apuntados a mano (receipts = 0) se conservan mientras exista el artículo; los de los albaranes se rehacen
+    env.DB.prepare('DELETE FROM product_suppliers WHERE receipts > 0 OR product_id NOT IN (SELECT id FROM products) OR supplier_id NOT IN (SELECT id FROM suppliers)'),
+    env.DB.prepare(`INSERT OR REPLACE INTO product_suppliers (product_id, supplier_id, last_price, last_date, receipts)
+      SELECT product_id, supplier_id, price, d, n FROM (
+        SELECT rl.product_id, r.supplier_id, rl.price, r.receipt_date AS d,
+               COUNT(*) OVER (PARTITION BY rl.product_id, r.supplier_id) AS n,
+               ROW_NUMBER() OVER (PARTITION BY rl.product_id, r.supplier_id ORDER BY r.receipt_date DESC, r.id DESC) AS rn
+        FROM receipt_lines rl JOIN receipts r ON r.id = rl.receipt_id WHERE r.supplier_id IS NOT NULL) WHERE rn = 1`),
+    env.DB.prepare(`UPDATE products SET other_suppliers = (SELECT GROUP_CONCAT(ps.supplier_id) FROM product_suppliers ps
+      WHERE ps.product_id = products.id AND ps.supplier_id <> COALESCE(products.supplier_id, 0))`),
+  ]);
 }
