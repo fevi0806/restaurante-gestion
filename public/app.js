@@ -1619,7 +1619,7 @@ VIEWS.escandallos = async (v, id, q) => {
   const cats = [...new Set(S.recipes.map((r) => r.category || 'Sin categoría'))];
   v.innerHTML = `<div class="row between"><h1>Carta y escandallos</h1><div class="row">
       ${can('escandallos.editar') ? '<button id="imp">Importar carta</button><button id="impesc">Importar escandallos</button>' : ''}${canAny('escandallos.editar', 'ventas.gestionar') ? '<button id="exp">⬇ Exportar para Qamarero</button>' : ''}
-      ${can('escandallos.editar') ? `<a class="btn" href="#/escandallos/ia">✨ Escandallos con IA${(() => { const n = S.allRecipes.filter((r) => !r.n_lines).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a><a class="btn" href="#/escandallos/masivo">📋 Escandallar en lista</a><a class="btn" href="#/escandallos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/escandallos/nuevo">+ Nuevo plato</a>` : ''}</div></div>
+      ${can('escandallos.editar') ? `<a class="btn" href="#/escandallos/ia">✨ Escandallos con IA${(() => { const n = S.allRecipes.filter((r) => !r.n_lines).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a><a class="btn" href="#/escandallos/masivo">📋 Escandallar en lista</a><a class="btn" href="#/escandallos/lista">✏️ Editar o eliminar en lista</a><a class="btn primary" href="#/escandallos/nuevo">+ Nuevo plato</a>` : ''}</div></div>
     ${CARTA_TABS('platos')}
     ${showCost ? `<div class="card small">${fx?.pct != null ? `Gastos fijos imputados: <b>${pct(fx.pct)}</b> del precio sin IVA de cada plato (${eur(fx.monthly)}/mes ÷ ${eur(fx.revenue)}/mes de facturación, según ${esc(fx.source)}).` : `Para repartir los gastos fijos entre los platos, indica la <b>facturación mensual prevista</b> en <a href="#/ajustes">Ajustes</a> o importa ventas${fx?.note ? ` (${esc(fx.note)})` : ''}.`} Objetivo de coste de materia prima: ${num(target)} %.</div>` : ''}
     <div class="card"><div class="row"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar plato…"></div>
@@ -1710,6 +1710,16 @@ async function exportCartaQamarero() {
 }
 
 // ---------- Carta: edición en lista ----------
+// Eliminar varios platos de la carta a la vez (sus ventas pasadas se conservan)
+async function bajaRecipes(ids) {
+  if (!ids.length) throw new Error('Marca primero los platos (casilla de la izquierda)');
+  const names = ids.map((id) => recById(id)?.name || S.allRecipes.find((r) => r.id === id)?.name).filter(Boolean);
+  if (!(await confirmModal(`¿Eliminar ${ids.length === 1 ? `"${names[0]}"` : `${ids.length} platos`} de la carta?${ids.length > 1 ? ` (${names.slice(0, 6).join(', ')}${names.length > 6 ? '…' : ''})` : ''} Desaparecen de la carta y de los escandallos; las ventas que ya tienen importadas se conservan.`, 'Eliminar'))) return false;
+  const r = await api('recipes/bulk-delete', { body: { ids } });
+  await reload(true);
+  toast(`${r.deleted} plato(s) eliminados${r.skipped?.length ? ` · no se han borrado ${r.skipped.length} elaboraciones porque las usan otros platos` : ''}`);
+  return true;
+}
 async function cartaLista(v) {
   if (!can('escandallos.editar')) throw new Error('No tienes permiso para editar la carta');
   await reload();
@@ -1722,7 +1732,8 @@ async function cartaLista(v) {
       <div class="row bulkbar"><b id="nsel">0 seleccionados</b>
         <span class="row"><input id="pct" type="number" step="any" placeholder="%" style="width:80px"><select id="rnd" style="width:auto"><option value="0.05">redondear a 0,05</option><option value="0.1">a 0,10</option><option value="0.5">a 0,50</option><option value="1">a 1 €</option><option value="0">sin redondeo</option></select><button type="button" id="apct">Cambiar PVP %</button></span>
         ${showCost ? '<button type="button" id="arec">Poner PVP recomendado</button>' : ''}
-        <span class="row"><input id="ncat" list="dl-rcat" placeholder="Categoría" style="width:150px"><button type="button" id="acat">Poner categoría</button></span></div>
+        <span class="row"><input id="ncat" list="dl-rcat" placeholder="Categoría" style="width:150px"><button type="button" id="acat">Poner categoría</button></span>
+        <button type="button" class="danger" id="bdel">🗑 Eliminar marcados</button></div>
       <div class="table-wrap"><table class="grid-edit"><thead><tr><th><input type="checkbox" id="all"></th><th>Plato</th><th>Categoría</th><th class="num">Raciones</th><th class="num">PVP con IVA</th>${showCost ? '<th class="num">Coste MP</th><th class="num">PVP recomendado</th><th class="num">% coste</th><th class="num">Beneficio neto</th>' : ''}</tr></thead><tbody>
       ${rows.map((r, i) => `<tr data-i="${i}" data-n="${esc(norm(r.name))}" data-c="${esc(r.category || '')}"><td><input type="checkbox" data-sel></td>
         <td><input data-k="name" value="${esc(r.name)}"></td><td><input data-k="category" list="dl-rcat" value="${esc(r.category || '')}"></td>
@@ -1761,6 +1772,10 @@ async function cartaLista(v) {
     need().forEach((i) => { const r = rows[i]; if (!r.n_lines) return; const x = (r.cost / (target / 100)) * ivaDiv(); setVal(i, 'pvp', Math.round(Math.ceil(x / step) * step * 100) / 100); }); status();
   });
   $('#acat').onclick = () => act(null, async () => { const c = $('#ncat').value.trim(); if (!c) throw new Error('Escribe la categoría'); need().forEach((i) => setVal(i, 'category', c)); status(); });
+  $('#bdel').onclick = (e) => act(e.target, async () => {
+    if (changed().length && !(await confirmModal('Tienes cambios sin guardar en la lista: se perderán. ¿Seguir?', 'Seguir'))) return;
+    if (await bajaRecipes(need().map((i) => rows[i].id))) route();
+  });
   $('#save').onclick = (e) => act(e.target, async () => {
     const items = changed().map(([r]) => { const o = { id: r.id }; ['name', 'category', 'portions', 'pvp'].forEach((k) => { if (String(r[k] ?? '') !== String(r._o[k] ?? '')) o[k] = r[k]; }); return o; });
     await api('recipes/bulk-edit', { method: 'PUT', body: { items } });
@@ -1846,6 +1861,7 @@ async function escandallarLista(v) {
           <button type="button" class="primary" id="badd">Añadir a los marcados</button></span>
         <span class="row" style="gap:6px"><select id="csrc" style="max-width:240px"></select>
           <input id="cf" class="qty" type="number" step="any" min="0" value="1" title="Proporción: 0,5 para media ración" style="width:70px"><button type="button" id="ccopy">Copiar a los marcados</button></span>
+        <button type="button" class="danger" id="mdel">🗑 Eliminar marcados</button>
       </div>
       <div class="table-wrap"><table class="nosort"><thead><tr><th><input type="checkbox" id="all" aria-label="Marcar todos"></th><th>Plato</th><th class="num">Escandallo</th>${showCost ? '<th class="num">Coste</th><th class="num">PVP</th><th class="num">FC</th>' : ''}</tr></thead><tbody id="rows"></tbody></table></div>
       ${ingOpts()}
@@ -1926,6 +1942,7 @@ async function escandallarLista(v) {
     [...sel].forEach((id) => delete open[id]);
     await afterSave([]);
   });
+  $('#mdel', v).onclick = (e) => act(e.target, async () => { if (await bajaRecipes([...sel])) { [...sel].forEach((id) => { sel.delete(id); delete open[id]; }); drawRows(); } });
   $('#ccopy', v).onclick = (e) => act(e.target, async () => {
     if (!sel.size) throw new Error('Marca primero los platos');
     const src = Number($('#csrc', v).value); if (!src) throw new Error('Elige el plato del que copiar');
@@ -2757,6 +2774,10 @@ async function existenciasLista(v) {
   const need = () => { const s2 = sel(); if (!s2.length) throw new Error('Marca primero los artículos (casilla de la izquierda)'); return s2; };
   $('#apct').onclick = () => act(null, async () => { const p2 = Number($('#pct').value); if (!p2) throw new Error('Indica el % (por ejemplo 5 o −3)'); need().forEach((i) => setVal(i, 'price', Math.round(rows[i].price * (1 + p2 / 100) * 10000) / 10000)); status(); });
   $('#acat').onclick = () => act(null, async () => { const c = $('#ncat').value.trim(); if (!c) throw new Error('Escribe la categoría'); need().forEach((i) => setVal(i, 'category', c)); status(); });
+  $('#bdel').onclick = (e) => act(e.target, async () => {
+    if (changed().length && !(await confirmModal('Tienes cambios sin guardar en la lista: se perderán. ¿Seguir?', 'Seguir'))) return;
+    if (await bajaRecipes(need().map((i) => rows[i].id))) route();
+  });
   $('#asup').onclick = () => act(null, async () => { const sp = $('#nsup').value; need().forEach((i) => setVal(i, 'supplier_id', sp)); status(); });
   const noPending = () => { if (changed().length) throw new Error('Primero guarda (o descarta recargando) los cambios que has hecho en la lista'); };
   $('#amerge').onclick = (e) => act(e.target, async () => { noPending(); if (await mergeDialog('products', need().map((i) => rows[i]))) route(); });

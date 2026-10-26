@@ -842,6 +842,27 @@ async function route(parts, method, request, env, url, ctx = {}) {
   // escandallar en lista: cambiar solo los ingredientes de un plato, o añadir uno a varios platos a la vez
   if (a === 'recipes' && b && c === 'lines' && method === 'PUT') return recipeLinesSet(request, env, user, Number(b), ctx);
   if (a === 'recipes' && b === 'add-line' && method === 'POST') return recipesAddLine(request, env, user, ctx);
+  if (a === 'recipes' && b === 'bulk-delete' && method === 'POST') {
+    need(user, 'escandallos.editar');
+    const d = await body(request);
+    const ids = [...new Set((d.ids || []).map(Number).filter(Boolean))];
+    if (!ids.length) throw new HttpError(400, 'Marca los platos que quieres eliminar');
+    const { results: recs } = await allIn(env, 'SELECT id, name, kind, product_id FROM recipes WHERE id IN (??) AND active = 1', ids);
+    // las elaboraciones que siguen usándose en algún plato que no se borra, no se tocan
+    const kept = [], skipped = [];
+    for (const r of recs) {
+      if (r.kind === 'elaboracion' && r.product_id) {
+        const used = await env.DB.prepare(`SELECT r.name FROM recipe_lines rl JOIN recipes r ON r.id = rl.recipe_id AND r.active = 1 WHERE rl.product_id = ? LIMIT 50`).bind(r.product_id).all();
+        if (used.results.some((u) => !recs.some((x) => x.name === u.name))) { skipped.push(r.name); continue; }
+      }
+      kept.push(r);
+    }
+    const stmts = kept.map((r) => env.DB.prepare('UPDATE recipes SET active = 0 WHERE id = ?').bind(r.id));
+    kept.filter((r) => r.kind === 'elaboracion' && r.product_id).forEach((r) => stmts.push(env.DB.prepare('UPDATE products SET active = 0 WHERE id = ?').bind(r.product_id)));
+    if (stmts.length) await runBatch(env, stmts);
+    ctx.audit = { action: 'baja', entity: 'plato', summary: `Baja de ${kept.length} plato(s): ${kept.map((r) => r.name).join(', ').slice(0, 300)}`, detail: kept };
+    return json({ ok: true, deleted: kept.length, skipped });
+  }
   if (a === 'recipes' && b === 'export') return recipesExport(env, user);
   if (a === 'suppliers' && b === 'bulk' && method === 'POST') return suppliersBulk(request, env, user);
   if (a === 'products' && b === 'merge' && method === 'POST') return productsMerge(request, env, user, ctx);
