@@ -407,3 +407,8 @@ button.ghost { background: none; border: none; box-shadow: none; padding: 2px 4p
 .login { background: radial-gradient(circle at 20% 10%, var(--t-dia), transparent 40%), radial-gradient(circle at 85% 90%, var(--t-compras), transparent 45%), var(--bg); }
 .login .card { padding: 26px; border-radius: 20px; }
 .login h1 { font-size: 1.4rem; }
+
+/* en el móvil, los botones fijos de abajo (Guardar, Guardar mi zona…) quedan encima de la barra de accesos, no debajo */
+@media (max-width: 860px) {
+  .sticky-foot { bottom: calc(66px + env(safe-area-inset-bottom)); z-index: 24; box-shadow: 0 -4px 14px rgba(38, 53, 46, .08); }
+}
