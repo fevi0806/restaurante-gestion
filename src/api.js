@@ -842,6 +842,25 @@ async function route(parts, method, request, env, url, ctx = {}) {
   // escandallar en lista: cambiar solo los ingredientes de un plato, o añadir uno a varios platos a la vez
   if (a === 'recipes' && b && c === 'lines' && method === 'PUT') return recipeLinesSet(request, env, user, Number(b), ctx);
   if (a === 'recipes' && b === 'add-line' && method === 'POST') return recipesAddLine(request, env, user, ctx);
+  // categorías (de la carta o de existencias): renombrar, juntar con otra o eliminar
+  if ((a === 'recipes' || a === 'products') && b === 'category' && method === 'POST') {
+    need(user, a === 'recipes' ? 'escandallos.editar' : 'productos.editar');
+    const d = await body(request);
+    const from = String(d.from ?? '').trim(), to = d.to == null ? null : String(d.to).trim() || null;
+    const table = a, kindSql = a === 'recipes' ? ` AND COALESCE(kind, 'plato') = 'plato'` : ' AND prep_recipe_id IS NULL';
+    const where = `active = 1${kindSql} AND ${from && from !== 'Sin categoría' ? 'category = ?' : "(category IS NULL OR category = '')"}`;
+    const binds = from && from !== 'Sin categoría' ? [from] : [];
+    if (d.action === 'delete_items') {
+      if (a !== 'recipes') throw new HttpError(400, 'Los artículos no se borran desde aquí: pásalos a otra categoría');
+      const { results } = await env.DB.prepare(`SELECT id, name FROM recipes WHERE ${where}`).bind(...binds).all();
+      await env.DB.prepare(`UPDATE recipes SET active = 0 WHERE ${where}`).bind(...binds).run();
+      ctx.audit = { action: 'baja', entity: 'plato', summary: `Eliminada la categoría "${from}" con sus ${results.length} plato(s)`, detail: results };
+      return json({ ok: true, n: results.length });
+    }
+    const r = await env.DB.prepare(`UPDATE ${table} SET category = ? WHERE ${where}`).bind(to, ...binds).run();
+    ctx.audit = { action: 'modificación', entity: a === 'recipes' ? 'plato' : 'artículo', summary: `Categoría "${from}" → ${to ? `"${to}"` : 'sin categoría'} (${r.meta?.changes ?? 0})` };
+    return json({ ok: true, n: r.meta?.changes ?? 0 });
+  }
   if (a === 'recipes' && b === 'bulk-delete' && method === 'POST') {
     need(user, 'escandallos.editar');
     const d = await body(request);

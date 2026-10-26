@@ -1619,7 +1619,7 @@ VIEWS.escandallos = async (v, id, q) => {
   const cats = [...new Set(S.recipes.map((r) => r.category || 'Sin categoría'))];
   v.innerHTML = `<div class="row between"><h1>Carta y escandallos</h1><div class="row">
       ${can('escandallos.editar') ? '<button id="imp">Importar carta</button><button id="impesc">Importar escandallos</button>' : ''}${canAny('escandallos.editar', 'ventas.gestionar') ? '<button id="exp">⬇ Exportar para Qamarero</button>' : ''}
-      ${can('escandallos.editar') ? `<a class="btn" href="#/escandallos/ia">✨ Escandallos con IA${(() => { const n = S.allRecipes.filter((r) => !r.n_lines).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a><a class="btn" href="#/escandallos/masivo">📋 Escandallar en lista</a><a class="btn" href="#/escandallos/lista">✏️ Editar o eliminar en lista</a><a class="btn primary" href="#/escandallos/nuevo">+ Nuevo plato</a>` : ''}</div></div>
+      ${can('escandallos.editar') ? `<a class="btn" href="#/escandallos/ia">✨ Escandallos con IA${(() => { const n = S.allRecipes.filter((r) => !r.n_lines).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a><a class="btn" href="#/escandallos/masivo">📋 Escandallar en lista</a><a class="btn" href="#/escandallos/lista">✏️ Editar o eliminar en lista</a><button type="button" id="cats">🏷️ Categorías</button><a class="btn primary" href="#/escandallos/nuevo">+ Nuevo plato</a>` : ''}</div></div>
     ${CARTA_TABS('platos')}
     ${showCost ? `<div class="card small">${fx?.pct != null ? `Gastos fijos imputados: <b>${pct(fx.pct)}</b> del precio sin IVA de cada plato (${eur(fx.monthly)}/mes ÷ ${eur(fx.revenue)}/mes de facturación, según ${esc(fx.source)}).` : `Para repartir los gastos fijos entre los platos, indica la <b>facturación mensual prevista</b> en <a href="#/ajustes">Ajustes</a> o importa ventas${fx?.note ? ` (${esc(fx.note)})` : ''}.`} Objetivo de coste de materia prima: ${num(target)} %.</div>` : ''}
     <div class="card"><div class="row"><div class="field" style="flex:2 1 240px;margin:0"><input id="search" placeholder="Buscar plato…"></div>
@@ -1635,6 +1635,7 @@ VIEWS.escandallos = async (v, id, q) => {
   const filt = () => { const q2 = norm($('#search').value), c = $('#fcat').value; $$('tr[data-n]', v).forEach((tr) => tr.classList.toggle('hidden', !!((q2 && !tr.dataset.n.includes(q2)) || (c && tr.dataset.c !== c)))); };
   $('#search').oninput = filt; $('#fcat').onchange = filt;
   if ($('#exp')) $('#exp').onclick = (e) => act(e.target, exportCartaQamarero);
+  if ($('#cats')) $('#cats').onclick = () => categoriasDialog('recipes');
   if ($('#impesc')) $('#impesc').onclick = () => escandallosImport();
   if ($('#imp')) $('#imp').onclick = () => importWizard({
     title: 'Importar carta (platos y precios)', sheetHint: ['carta', 'plato'],
@@ -1719,6 +1720,51 @@ async function bajaRecipes(ids) {
   await reload(true);
   toast(`${r.deleted} plato(s) eliminados${r.skipped?.length ? ` · no se han borrado ${r.skipped.length} elaboraciones porque las usan otros platos` : ''}`);
   return true;
+}
+// Gestor de categorías de la carta (kind = 'recipes') o de existencias ('products'): renombrar, juntar o eliminar
+async function categoriasDialog(kind) {
+  const isR = kind === 'recipes';
+  const items = isR ? S.recipes : S.products.filter((p) => !p.prep_recipe_id);
+  const counts = {};
+  items.forEach((x) => { const c = x.category || 'Sin categoría'; counts[c] = (counts[c] || 0) + 1; });
+  const cats = Object.keys(counts).sort(collator.compare);
+  const what = isR ? 'platos' : 'artículos';
+  const r = await modal(`<h2>Categorías ${isR ? 'de la carta' : 'de existencias'}</h2>
+    <p class="small muted">Cambia el nombre y pulsa ✔ para renombrarla. Si escribes el nombre de otra que ya existe, se juntan. 🗑 la elimina y te pregunto qué hacer con sus ${what}.</p>
+    <div style="max-height:55vh;overflow:auto">${cats.map((c) => `<div class="row" style="flex-wrap:nowrap;gap:6px;margin:4px 0" data-cat="${esc(c)}">
+      <input value="${esc(c)}" data-name ${c === 'Sin categoría' ? 'disabled' : ''} list="dl-catlist" style="flex:1">
+      <span class="small muted" style="min-width:70px;text-align:right">${counts[c]} ${what}</span>
+      ${c === 'Sin categoría' ? '' : `<button type="button" class="sm" data-ren title="Renombrar">✔</button><button type="button" class="sm danger" data-delc title="Eliminar categoría">🗑</button>`}</div>`).join('')}</div>
+    <datalist id="dl-catlist">${cats.filter((c) => c !== 'Sin categoría').map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
+    <div class="actions"><button class="primary" value="ok">Cerrar</button></div>`, {
+    onOpen: (f) => {
+      f.onclick = (e) => {
+        const row = e.target.closest('[data-cat]'); if (!row) return;
+        const from = row.dataset.cat;
+        if (e.target.closest('[data-ren]')) act(e.target, async () => {
+          const to = $('[data-name]', row).value.trim();
+          if (!to || to === from) return;
+          const merge = cats.includes(to);
+          if (merge && !(await confirmModal(`"${to}" ya existe: los ${counts[from]} ${what} de "${from}" pasan a "${to}" y "${from}" desaparece. ¿Juntarlas?`, 'Juntar'))) return categoriasDialog(kind);
+          await api(`${kind}/category`, { body: { from, to } });
+          await reload(true); toast(merge ? `Categorías juntadas en "${to}"` : `Categoría renombrada a "${to}"`); route(); categoriasDialog(kind);
+        });
+        if (e.target.closest('[data-delc]')) act(e.target, async () => {
+          const others = cats.filter((c) => c !== from && c !== 'Sin categoría');
+          const r2 = await modal(`<h2>Eliminar la categoría "${esc(from)}"</h2><p>Tiene <b>${counts[from]} ${what}</b>. ¿Qué hago con ellos?</p>
+            <label class="check"><input type="radio" name="what" value="move" checked> <span>Pasarlos a <select id="tocat" style="width:auto;min-height:34px;padding:3px 6px"><option value="">Sin categoría</option>${others.map((c) => `<option>${esc(c)}</option>`).join('')}</select></span></label>
+            ${isR ? `<label class="check"><input type="radio" name="what" value="del"> <span><b>Eliminarlos también</b> de la carta (las ventas ya importadas se conservan)</span></label>` : ''}
+            <div class="actions"><button data-close>Cancelar</button><button class="primary danger" value="ok">Eliminar categoría</button></div>`);
+          if (!r2) return categoriasDialog(kind);
+          const mf = $('#modal-form'), how = $('[name=what]:checked', mf).value;
+          if (how === 'del') await api(`${kind}/category`, { body: { from, action: 'delete_items' } });
+          else await api(`${kind}/category`, { body: { from, to: $('#tocat', mf).value || null } });
+          await reload(true); toast(`Categoría "${from}" eliminada`); route(); categoriasDialog(kind);
+        });
+      };
+    },
+  });
+  return r;
 }
 async function cartaLista(v) {
   if (!can('escandallos.editar')) throw new Error('No tienes permiso para editar la carta');
@@ -2688,7 +2734,7 @@ VIEWS.productos = async (v, id, q) => {
   if (id === 'repetidos') return repetidos(v, 'products');
   if (id === 'mismo') return repetidos(v, 'products', 'cross');
   if (id) return productoEdit(v, id);
-  v.innerHTML = `<div class="row between"><h1>Existencias</h1><div class="row"><button id="imp">Importar Excel</button><a class="btn" href="#/productos/alergenos">🧠 Revisar alérgenos${S.products.filter((p) => !p.allergens_checked).length ? ` <span class="badge-count">${S.products.filter((p) => !p.allergens_checked).length}</span>` : ''}</a>${can('productos.editar') ? `<a class="btn" href="#/productos/repetidos">🔁 Repetidos${(() => { const n = dupGroups(S.products.filter((p) => !p.prep_recipe_id), (p) => [dupKey(p.name)]).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a>` : ''}<a class="btn" href="#/productos/lista">✏️ Editar en lista</a><a class="btn primary" href="#/productos/nuevo">+ Nuevo artículo</a></div></div>
+  v.innerHTML = `<div class="row between"><h1>Existencias</h1><div class="row"><button id="imp">Importar Excel</button><a class="btn" href="#/productos/alergenos">🧠 Revisar alérgenos${S.products.filter((p) => !p.allergens_checked).length ? ` <span class="badge-count">${S.products.filter((p) => !p.allergens_checked).length}</span>` : ''}</a>${can('productos.editar') ? `<a class="btn" href="#/productos/repetidos">🔁 Repetidos${(() => { const n = dupGroups(S.products.filter((p) => !p.prep_recipe_id), (p) => [dupKey(p.name)]).length; return n ? ` <span class="badge-count">${n}</span>` : ''; })()}</a>` : ''}<a class="btn" href="#/productos/lista">✏️ Editar en lista</a>${can('productos.editar') ? '<button type="button" id="pcats">🏷️ Categorías</button>' : ''}<a class="btn primary" href="#/productos/nuevo">+ Nuevo artículo</a></div></div>
     <p class="small muted" style="margin-top:-6px">Existencias es todo lo que se compra a proveedores y se guarda en almacén: ingredientes, bebidas, limpieza… Lo que se vende está en <a href="#/escandallos">Carta</a>.</p>
     <div class="card"><div class="field"><input id="search" placeholder="Buscar…"></div>${(() => { const cs = [...new Set(S.products.map((p) => p.category || 'Sin categoría'))].sort(collator.compare); return catChipsHtml(cs, Object.fromEntries(cs.map((c) => [c, S.products.filter((p) => (p.category || 'Sin categoría') === c).length]))); })()}<div class="table-wrap"><table><thead><tr><th>Artículo</th><th>Categoría</th><th>Proveedor</th><th>Control</th><th>Formatos</th><th class="num">Precio</th><th class="num">Mínimo</th><th>Alérgenos</th></tr></thead><tbody>
     ${S.products.map((p) => `<tr class="click" data-c="${esc(p.category || 'Sin categoría')}" data-h="${p.prep_recipe_id ? '#/escandallos/' + p.prep_recipe_id : '#/productos/' + p.id}" data-n="${esc(norm(p.name + ' ' + (p.category || '') + ' ' + (p.supplier_name || '')))}"><td>${esc(p.name)}${p.prep_recipe_id ? ' <span class="pill">elaboración</span>' : ''}</td><td>${esc(p.category || '')}</td><td>${esc(p.supplier_name || '')}</td><td>${esc(p.unit)}</td><td class="small">${fmtsOf(p).map((f) => esc(f.name)).join(', ') || '<span class="muted">—</span>'}</td><td class="num">${eur(p.price)} / ${esc(p.unit)}</td><td class="num">${num(p.min_stock)}</td><td>${p.allergens_checked ? algIcons(splitList(p.allergens)) || '<span class="small muted">ninguno</span>' : '<span class="pill warn">sin revisar</span>'}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">Sin artículos. Impórtalos desde un Excel con tus tarifas de proveedor o créalos uno a uno.</td></tr>'}
@@ -2701,6 +2747,7 @@ VIEWS.productos = async (v, id, q) => {
   if (q?.get('q')) { $('#search').value = q.get('q'); fcatE.set(''); }
   filtE();
   $('#search').oninput = filtE;
+  if ($('#pcats')) $('#pcats').onclick = () => categoriasDialog('products');
   $('#imp').onclick = () => importWizard({
     title: 'Importar existencias', sheetHint: ['articul', 'existencia', 'producto', 'catalogo'],
     help: 'Sube un Excel o CSV con tus artículos (por ejemplo, la tarifa de un proveedor). Los que ya existan con el mismo nombre se actualizan. Si la tarifa trae formato (Caja 24, Saco 25 kg…) indícalo y se crea el formato.',
